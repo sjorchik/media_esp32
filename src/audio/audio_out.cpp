@@ -10,6 +10,23 @@ namespace {
 constexpr const char* TAG = "audio";
 constexpr i2s_port_t kPort = I2S_NUM_0;
 
+// Рівень на GPIO27: PCM5102 XSMT (HIGH=звук) або UDA1334A MUTE (HIGH=мʼют)
+constexpr int levelFor(bool unmuted) {
+#if DAC_MUTE_ACTIVE_HIGH
+  return unmuted ? LOW : HIGH;
+#else
+  return unmuted ? HIGH : LOW;
+#endif
+}
+
+// Запит на мʼют: write() негайно віддає мʼютекс. Без цього задача audio (вищий пріоритет) знову
+// захоплює мʼютекс у кожному write(), і mute() з app-задачі чекав секундами.
+volatile bool s_abortWrite = false;
+struct AbortGuard {
+  AbortGuard() { s_abortWrite = true; }
+  ~AbortGuard() { s_abortWrite = false; }
+};
+
 struct Lock {
   SemaphoreHandle_t m;
   bool ok;
@@ -19,11 +36,12 @@ struct Lock {
 }  // namespace
 
 void AudioOut::earlyMute() {
+  digitalWrite(PIN_XSMT, levelFor(false));  // рівень мʼюту до вмикання виходу
   pinMode(PIN_XSMT, OUTPUT);
-  digitalWrite(PIN_XSMT, LOW);
+  digitalWrite(PIN_XSMT, levelFor(false));
 }
 
-void AudioOut::setXsmt(bool unmuted) { digitalWrite(PIN_XSMT, unmuted ? HIGH : LOW); }
+void AudioOut::setXsmt(bool unmuted) { digitalWrite(PIN_XSMT, levelFor(unmuted)); }
 
 void AudioOut::computeStep() {
   uint32_t n = rate_ * kFadeMs / 1000;
@@ -50,7 +68,7 @@ bool AudioOut::begin() {
     return false;
   }
   i2s_pin_config_t pins = {};
-  pins.mck_io_num = I2S_PIN_NO_CHANGE;   // PCM5102: SCK на GND (внутрішній PLL)
+  pins.mck_io_num = I2S_PIN_NO_CHANGE;   // PCM5102/UDA1334A: MCLK не потрібен
   pins.bck_io_num = PIN_I2S_BCK;
   pins.ws_io_num = PIN_I2S_WS;
   pins.data_out_num = PIN_I2S_DOUT;
@@ -61,11 +79,14 @@ bool AudioOut::begin() {
   computeStep();
   ready_ = true;
   muted_ = true;
-  LOGI(TAG, "I2S готовий (%u Гц 16 біт стерео), DAC замʼючено", (unsigned)rate_);
+  LOGI(TAG, "I2S готовий (%u Гц 16 біт стерео), DAC замʼючено; мʼют: %s%s", (unsigned)rate_,
+       DAC_MUTE_ACTIVE_HIGH ? "HIGH=мʼют (UDA1334A)" : "LOW=мʼют (PCM5102)",
+       HAVE_DAC ? "" : "; DAC відсутній");
   return true;
 }
 
 void AudioOut::mute() {
+  AbortGuard ag;                        // оголошено до Lock: скидається після відпускання мʼютекса
   Lock l(mtx_, portMAX_DELAY);
   if (!ready_) return;
   if (!muted_) {
@@ -123,14 +144,15 @@ bool AudioOut::setFormat(uint32_t rate, uint8_t bits, uint8_t channels) {
 
 size_t AudioOut::write(const void* data, size_t bytes, uint32_t timeoutMs) {
   if (!ready_ || bytes == 0) return 0;
-  if (muted_) return bytes;           // замʼючено — відкидаємо
+  if (muted_ || s_abortWrite) return bytes;   // замʼючено або йде мʼют — відкидаємо
   Lock l(mtx_, pdMS_TO_TICKS(timeoutMs));
   if (!l.ok) return 0;
-  if (muted_) return bytes;
+  if (muted_ || s_abortWrite) return bytes;
 
   const int16_t* in = (const int16_t*)data;
   size_t fb = (size_t)ch_ * 2, frames = bytes / fb, consumed = 0;
   while (frames) {
+    if (s_abortWrite) return bytes;           // між порціями віддаємо мʼютекс для mute()
     size_t n = frames < kChunkFrames ? frames : kChunkFrames;
     for (size_t i = 0; i < n; i++) {
       int32_t lv, rv;

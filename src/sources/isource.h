@@ -27,7 +27,8 @@ class ISource {
   virtual void setRepeat(uint8_t mode) = 0;
   virtual void setShuffle(bool on) = 0;
   virtual SourceStatus status() const = 0;
-  virtual void loop(uint32_t nowMs) = 0;  // викликається щоітерації app
+  virtual void loop(uint32_t nowMs) = 0;  // викликається щоітерації app, коли джерело активне
+  virtual void idleLoop(uint32_t) {}      // щоітерації, коли джерело НЕактивне (фонові події)
   virtual void emitInfo() = 0;            // TRACK, FOLDER, META, TIME для GET/HELLO
   virtual Res refreshMedia() { return Res::Ok; }  // після зміни носіїв
 };

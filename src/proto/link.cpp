@@ -1,6 +1,7 @@
 #include "proto/link.h"
 
 #include <Arduino.h>
+#include <string.h>
 
 #include "config.h"
 #include "core/router.h"
@@ -25,9 +26,15 @@ StaticQueue_t s_hiCtl, s_loCtl;
 QueueHandle_t s_hi = nullptr, s_lo = nullptr;
 TaskHandle_t s_txTask = nullptr, s_rxTask = nullptr;
 
+// Слот TIME (лише останнє значення)
+portMUX_TYPE s_timeMux = portMUX_INITIALIZER_UNLOCKED;
+TxItem s_timeItem;
+bool s_timePending = false;
+
 volatile uint32_t s_lastValid = 0;
 volatile bool s_everRx = false;
-volatile uint32_t s_dropped = 0;
+volatile uint32_t s_lostHi = 0, s_lostLo = 0, s_timeCoalesced = 0;
+volatile uint32_t s_txMaxUs = 0, s_mirrorMaxUs = 0, s_txItems = 0;
 
 void onFrame(char* body, size_t, void*) {
   s_lastValid = millis();
@@ -41,8 +48,26 @@ bool aliveNow(uint32_t now) {
 }
 
 void sendItem(const TxItem& it) {
+  uint32_t t0 = micros();
   Serial1.write((const uint8_t*)it.data, it.len);
+  uint32_t t1 = micros();
   Log::line("TX ", it.data + 1, it.len - 5);  // дзеркало в UART0 без '$' і '*XX'
+  uint32_t t2 = micros();
+  if (t2 - t0 > s_txMaxUs) s_txMaxUs = t2 - t0;
+  if (t2 - t1 > s_mirrorMaxUs) s_mirrorMaxUs = t2 - t1;
+  s_txItems++;
+}
+
+bool takeTime(TxItem& out) {
+  bool had = false;
+  portENTER_CRITICAL(&s_timeMux);
+  if (s_timePending) {
+    out = s_timeItem;
+    s_timePending = false;
+    had = true;
+  }
+  portEXIT_CRITICAL(&s_timeMux);
+  return had;
 }
 
 void sendHb(uint16_t seq) {
@@ -79,7 +104,7 @@ void txTaskFn(void*) {
       }
     }
     TxItem it;
-    if (xQueueReceive(s_hi, &it, 0) == pdTRUE || xQueueReceive(s_lo, &it, 0) == pdTRUE) {
+    if (xQueueReceive(s_hi, &it, 0) == pdTRUE || xQueueReceive(s_lo, &it, 0) == pdTRUE || takeTime(it)) {
       sendItem(it);
       continue;
     }
@@ -118,21 +143,53 @@ void Link::begin() {
   LOGI(TAG, "UART1 %u 8N1 RX=%d TX=%d", (unsigned)kLinkBaud, PIN_LINK_RX, PIN_LINK_TX);
 }
 
-void Link::send(const char* frame, size_t len, bool high) {
+void Link::send(const char* frame, size_t len, Pri pri) {
   if (!s_hi || !s_txTask || len == 0 || len > proto::kMaxFrame) return;
+
+  if (pri == Pri::Time) {  // слот: лишається останнє значення, не блокує
+    portENTER_CRITICAL(&s_timeMux);
+    if (s_timePending) s_timeCoalesced++;
+    s_timeItem.len = (uint16_t)len;
+    memcpy(s_timeItem.data, frame, len);
+    s_timePending = true;
+    portEXIT_CRITICAL(&s_timeMux);
+    xTaskNotifyGive(s_txTask);
+    return;
+  }
+
   TxItem it;
   it.len = (uint16_t)len;
   memcpy(it.data, frame, len);
-  QueueHandle_t q = high ? s_hi : s_lo;
-  if (xQueueSend(q, &it, 0) != pdTRUE) {  // черга повна: викинути найстаріший
+  QueueHandle_t q = (pri == Pri::Hi) ? s_hi : s_lo;
+  if (xQueueSend(q, &it, pdMS_TO_TICKS(kTxWaitMs)) != pdTRUE) {
+    // Місця не з'явилось за kTxWaitMs: витісняємо найстаріше, рахуємо втрату
     TxItem junk;
     xQueueReceive(q, &junk, 0);
-    s_dropped++;
+    if (pri == Pri::Hi) s_lostHi++;
+    else s_lostLo++;
     xQueueSend(q, &it, 0);
   }
   xTaskNotifyGive(s_txTask);
 }
 
 Link::Stats Link::stats() {
-  return Stats{s_parser.good(), s_parser.bad(), s_dropped, aliveNow(millis())};
+  Stats s;
+  s.good = s_parser.good();
+  s.bad = s_parser.bad();
+  s.lostHi = s_lostHi;
+  s.lostLo = s_lostLo;
+  s.dropped = s_lostHi + s_lostLo;
+  s.timeCoalesced = s_timeCoalesced;
+  s.txMaxUs = s_txMaxUs;
+  s.mirrorMaxUs = s_mirrorMaxUs;
+  s.txItems = s_txItems;
+  s.alive = aliveNow(millis());
+  return s;
+}
+
+void Link::resetTxStats() {
+  s_txMaxUs = 0;
+  s_mirrorMaxUs = 0;
+  s_txItems = 0;
+  s_lostHi = s_lostLo = s_timeCoalesced = 0;
 }

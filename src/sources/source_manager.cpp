@@ -49,7 +49,7 @@ Res SourceManager::select(SrcId id) {
   ISource* prev = src_[(int)cur_];
   if (prev) {
     LOGI(TAG, "deactivate %s", srcName(cur_));
-    prev->deactivate();  // завершується до activate() нового
+    prev->deactivate();  // завершується до activate() нового (BT: AVRCP pause, прийом PCM вимкнено)
   }
   cur_ = id;
   Res r = Res::Ok;
@@ -60,7 +60,7 @@ Res SourceManager::select(SrcId id) {
     LOGI(TAG, "activate %s", srcName(id));
     r = nx->activate();
   } else {
-    LOGI(TAG, "src=off: DAC замʼючено");  // BT: вхідний A2DP відкидається, AVRCP pause (етап 3)
+    LOGI(TAG, "src=off: DAC замʼючено");
   }
   if (id != SrcId::Off) saveLast(id);
   Diag::logHeap("src");
@@ -160,6 +160,9 @@ void SourceManager::handle(const Cmd& c) {
 }
 
 void SourceManager::loop(uint32_t nowMs) {
+  for (int i = 1; i <= 3; i++) {  // фонові події неактивних джерел (BT: звʼязок, реконект)
+    if ((SrcId)i != cur_ && src_[i]) src_[i]->idleLoop(nowMs);
+  }
   ISource* s = src_[(int)cur_];
   if (s) s->loop(nowMs);
   publish(false);  // STATE після TRACK/FOLDER/META/TIME, які породив loop()

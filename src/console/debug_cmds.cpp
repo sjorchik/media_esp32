@@ -28,6 +28,9 @@ void help() {
   LOGI(TAG, "DBG,help | DBG,heap | DBG,tasks | DBG,state");
   LOGI(TAG, "DBG,tone[,Гц[,мс]] — тест-тон (лише при src=off), типово 440 Гц 1500 мс");
   LOGI(TAG, "DBG,media,<sd>,<usb> — імітація hot-plug носіїв (0/1)");
+  LOGI(TAG, "DBG,bt — стан BT, кодек, частота, лічильники PCM, метадані");
+  LOGI(TAG, "DBG,bt,pair — вікно видимості 120 с | DBG,bt,forget — забути телефон | DBG,bt,reset — скинути лічильники");
+  LOGI(TAG, "DBG,link[,reset] — втрати черг, злиті TIME, час відправки кадру (UART1+дзеркало)");
 }
 
 }  // namespace
@@ -68,6 +71,22 @@ void DebugCmds::handle(const proto::Msg& m) {
       return;
     }
     Router::post(Cmd{proto::CmdId::DbgMedia, (int16_t)(sd | (usb << 1)), Origin::Console});
+  } else if (!strcasecmp(c, "bt")) {
+    if (m.argc == 1) g_bt.dump();
+    else if (!strcasecmp(m.args[1], "pair")) g_bt.requestPair();
+    else if (!strcasecmp(m.args[1], "forget")) g_bt.requestForget();
+    else if (!strcasecmp(m.args[1], "reset")) g_bt.resetStats();
+    else LOGW(TAG, "DBG,bt[,pair|forget|reset]");
+  } else if (!strcasecmp(c, "link")) {
+    if (m.argc >= 2 && !strcasecmp(m.args[1], "reset")) {
+      Link::resetTxStats();
+      LOGI(TAG, "лічильники лінку скинуто");
+      return;
+    }
+    Link::Stats s = Link::stats();
+    LOGI(TAG, "link: tx=%u втрати hi=%u lo=%u | TIME злито=%u | макс. відправка=%u мкс, з них дзеркало UART0=%u мкс",
+         (unsigned)s.txItems, (unsigned)s.lostHi, (unsigned)s.lostLo, (unsigned)s.timeCoalesced,
+         (unsigned)s.txMaxUs, (unsigned)s.mirrorMaxUs);
   } else {
     LOGW(TAG, "невідома DBG-команда '%s' (DBG,help)", c);
   }

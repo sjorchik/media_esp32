@@ -6,3 +6,7 @@
 .vscode/launch.json
 .vscode/ipch
 compile_commands.json
+project_dump.txt
+git_cheat_sheet.txt
+help.txt
+_dumps/
