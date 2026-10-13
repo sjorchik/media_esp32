@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "BluetoothA2DPSink.h"
 #include "esp_gap_bt_api.h"
@@ -539,6 +540,7 @@ void BtSource::service(uint32_t now) {
   }
   if (sn.meta) {
     memcpy(pT_, sn.title, sizeof pT_);
+    if (!strcasecmp(pT_, "Not Provided")) pT_[0] = 0;  // телефон так позначає відсутню назву → порожнє поле
     memcpy(pA_, sn.artist, sizeof pA_);
     memcpy(pAl_, sn.album, sizeof pAl_);
     pendDurMs_ = sn.durMs;

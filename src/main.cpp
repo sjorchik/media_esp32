@@ -10,7 +10,9 @@
 #include "core/device_state.h"
 #include "core/events.h"
 #include "core/router.h"
+#include "media/sd_media.h"
 #include "proto/link.h"
+#include "sources/sd_source.h"
 #include "sources/stub_source.h"
 #include "storage/nvs_store.h"
 #include "util/diag.h"
@@ -24,7 +26,9 @@ AudioOut g_audio;
 SourceManager g_sources;
 BtSource g_bt;
 
-static StubSource s_sd(SrcId::SD), s_usb(SrcId::USB);
+static SdMedia s_sdMedia;
+SdSource g_sd(s_sdMedia);  // SD: hot-plug, скан, плейлист (M3a)
+static StubSource s_usb(SrcId::USB);
 static QueueHandle_t s_cmdQ = nullptr;
 
 void setup() {
@@ -44,7 +48,7 @@ void setup() {
 
   s_cmdQ = xQueueCreate(kCmdQueueDepth, sizeof(Cmd));
   Router::init(s_cmdQ);
-  g_sources.begin(&g_audio, &g_bt, &s_sd, &s_usb);
+  g_sources.begin(&g_audio, &g_bt, &g_sd, &s_usb);
 
   Link::begin();
   Console::begin();

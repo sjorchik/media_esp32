@@ -15,7 +15,7 @@
 //  BT-колбеки (інші задачі) лише кладуть події в Inbox під spinlock; решту робить app.
 // ============================================================
 
-#define FW_VERSION "0.2.2"
+#define FW_VERSION "0.3.0"
 inline constexpr int kProtoVer = 1;
 
 // ---- Прапорці збірки ----
@@ -36,7 +36,7 @@ inline constexpr int kProtoVer = 1;
 #endif
 #define MIRROR_HB 0            // 1: дзеркалити HB в UART0
 #define RELEASE_BLE_MEM 1      // esp_bt_controller_mem_release(ESP_BT_MODE_BLE) на старті
-#define STUB_SD_PRESENT 1      // початковий стан «носій є» для заглушок
+#define STUB_SD_PRESENT 0      // SD тепер справжній: старт без картки, далі hot-plug (SdMedia)
 #define STUB_USB_PRESENT 1
 
 // ---- Консоль / лог (UART0) ----
@@ -95,6 +95,30 @@ inline constexpr size_t   kBtMetaMax = 96;                  // байтів UTF-
 inline constexpr uint32_t kBtPosNotifS = 2;                 // період AVRCP-повідомлень позиції, с
 inline constexpr uint32_t kBtInactivePauseGapMs = 5000;     // мін. інтервал повторного AVRCP pause
 inline constexpr uint32_t kPairWindowMs = 120000;           // вікно DBG,bt,pair
+
+// ---- SD (M3a) ----
+#ifndef SD_CD_ACTIVE_LOW
+#define SD_CD_ACTIVE_LOW 1             // 1: при вставленій картці контакт CD замкнений на GND
+#endif
+inline constexpr uint8_t  kSdSpiMhz[] = {20, 10, 4};   // сходинки частоти VSPI (відкат при помилках)
+inline constexpr uint8_t  kSdSpiSteps = sizeof(kSdSpiMhz);
+inline constexpr uint8_t  kSdErrStepDown = 2;          // кожні N помилок підряд — сходинка вниз (2→10, 4→4 МГц)
+inline constexpr uint8_t  kSdErrUnmount = 5;           // помилок підряд — відмонтування
+inline constexpr uint32_t kSdDebounceMs = 100;         // антидребезг card-detect
+inline constexpr uint32_t kSdPollMs = 500;             // опитування присутності, коли SD_CD_PIN < 0
+inline constexpr uint8_t  kSdPollFails = 2;            // невдалих проб підряд = картку вийнято
+inline constexpr uint32_t kSdRemountMs = 3000;         // пауза між невдалими mount, поки CD каже «картка є»
+inline constexpr uint8_t  kSdScanRetries = 2;          // автоповтори скану після помилки читання
+
+inline constexpr size_t   kPlaylistArenaBytes = 16384; // ОДНА статична арена плейлиста (кратна 4, ≤ 65535)
+inline constexpr int      kScanMaxDepth = 3;           // корінь = рівень 0; глибші каталоги ігноруються
+inline constexpr size_t   kMediaNameMax = 256;         // буфер імені запису (UTF-8 + NUL)
+inline constexpr size_t   kScanPathMax = 256;          // буфер шляху під час скану
+inline constexpr uint32_t kScanSliceMs = 15;           // порція скану за ітерацію loopTask
+inline constexpr uint32_t kReadSliceMs = 15;           // порція DBG,sdread
+inline constexpr size_t   kSdReadBuf = 2048;           // статичний буфер DBG,sdread
+inline constexpr size_t   kEvFolderNameMax = 48;       // макс. байтів назви папки в події FOLDER
+inline constexpr int      kDbgListDefault = 20;        // DBG,list без аргументу
 
 // ---- Задачі ----
 inline constexpr int kCoreProto = 0;
