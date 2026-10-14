@@ -7,9 +7,13 @@
 //  Ядро 0 (PRO): BT-стек (контролер + Bluedroid; задачі BTC_TASK/BTU_TASK/BtAppT
 //                створює SDK/бібліотека A2DP), link_tx (prio 3), link_rx (prio 3),
 //                console (prio 2)
-//  Ядро 1 (APP): audio (prio 6; тон, помпа PCM з кільця BT → AudioOut, на етапах 3–4 декодер),
+//  Ядро 1 (APP): audio (prio 6; тон, помпа PCM з кільця BT → AudioOut),
+//                mp3 (prio 5; декодер minimp3 для SD: читає файл, декодує кадр і пише в AudioOut::write();
+//                блокується на notify (Idle/Pause) або на i2s_write (Run); стек статичний, у PcmArena),
 //                loopTask «app» (prio 1: виконання всіх команд, SourceManager::loop,
-//                BtSource::service, читання SD/USB на етапах 3–4)
+//                BtSource::service, скан SD; під час відтворення SD файл читає лише mp3)
+//  SdFat не потокобезпечний: усі виклики SdFat серіалізує мʼютекс у sd_media.cpp; присутність картки під час
+//  відтворення визначається по SD_CD_PIN (без SPI).
 //  Команди з UART0 і UART1 не виконуються в своїх задачах: роутер лише валідує
 //  і кладе Cmd у чергу, виконує loopTask → немає гонок за станом.
 //  BT-колбеки (інші задачі) лише кладуть події в Inbox під spinlock; решту робить app.
@@ -72,6 +76,19 @@ inline constexpr size_t   kPumpBytes = 1024;        // порція читанн
 inline constexpr uint32_t kPcmWriteTimeoutMs = 40;  // ліміт блокування AudioOut::write
 inline constexpr uint32_t kPumpIdleMs = 10;         // таймаут очікування в задачі audio
 
+// ---- Спільна область PCM/MP3 (M3b): розкладка і розрахунок — pcm_arena.h, mp3_player.cpp ----
+inline constexpr size_t   kDecStackBytes = 20480;   // статичний стек задачі mp3 (scratch minimp3 ≈ 16,3 КБ + запас)
+inline constexpr size_t   kDecInBytes = 6144;       // вхідний буфер читання файлу
+inline constexpr size_t   kDecInRefill = 3072;      // докачувати, коли лишилось менше (≥ 2 макс. кадрів 2×1441 Б)
+inline constexpr size_t   kPcmArenaBytes = 38400;   // ≥ sizeof(SdSet) = 37904 (static_assert у mp3_player.cpp)
+static_assert(kPcmArenaBytes >= kBtRingBytes, "область має вміщати BT-кільце");
+inline constexpr uint32_t kDmaFrames = (uint32_t)kI2sDmaCount * kI2sDmaLen;  // глибина DMA, кадрів (≈23 мс при 44,1 кГц)
+inline constexpr uint32_t kUnderTolUs = 1000;       // допуск оцінки underrun, мкс
+inline constexpr uint32_t kDecStopWaitMs = 1500;    // скільки app чекає відповіді задачі mp3 (Stop/Pause)
+inline constexpr uint32_t kDecJunkMax = 131072;     // байтів без жодного кадру → decode_fail
+inline constexpr uint32_t kDecBadRunMax = 256;      // недекодованих проходів підряд → decode_fail
+inline constexpr uint32_t kTimeEventMs = 1000;      // період події TIME під час play
+
 // ---- Bluetooth ----
 inline constexpr const char* kBtDeviceName = "Media Module";
 #ifndef BT_DISCONNECT_ON_DEACTIVATE
@@ -109,6 +126,7 @@ inline constexpr uint32_t kSdPollMs = 500;             // опитування �
 inline constexpr uint8_t  kSdPollFails = 2;            // невдалих проб підряд = картку вийнято
 inline constexpr uint32_t kSdRemountMs = 3000;         // пауза між невдалими mount, поки CD каже «картка є»
 inline constexpr uint8_t  kSdScanRetries = 2;          // автоповтори скану після помилки читання
+inline constexpr uint32_t kSdLockWaitMs = 1000;        // очікування мʼютекса SdFat у poll()/mount (читання ≤ ~300 мс)
 
 inline constexpr size_t   kPlaylistArenaBytes = 16384; // ОДНА статична арена плейлиста (кратна 4, ≤ 65535)
 inline constexpr int      kScanMaxDepth = 3;           // корінь = рівень 0; глибші каталоги ігноруються
@@ -116,7 +134,7 @@ inline constexpr size_t   kMediaNameMax = 256;         // буфер імені 
 inline constexpr size_t   kScanPathMax = 256;          // буфер шляху під час скану
 inline constexpr uint32_t kScanSliceMs = 15;           // порція скану за ітерацію loopTask
 inline constexpr uint32_t kReadSliceMs = 15;           // порція DBG,sdread
-inline constexpr size_t   kSdReadBuf = 2048;           // статичний буфер DBG,sdread
+inline constexpr size_t   kSdReadBuf = 2048;           // (не використовується з M3b: DBG,sdread бере вхідний буфер PcmArena)
 inline constexpr size_t   kEvFolderNameMax = 48;       // макс. байтів назви папки в події FOLDER
 inline constexpr int      kDbgListDefault = 20;        // DBG,list без аргументу
 
@@ -130,6 +148,8 @@ inline constexpr uint32_t kStackAudio = 4096;
 inline constexpr int kPrioLink = 3;
 inline constexpr int kPrioConsole = 2;
 inline constexpr int kPrioAudio = 6;
+inline constexpr int kPrioDecoder = 5;   // нижче за audio (6), вище за app (1)
 
 // ---- Діагностика ----
 inline constexpr uint32_t kDiagPeriodMs = 60000;
+

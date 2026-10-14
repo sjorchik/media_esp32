@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "audio/pcm_arena.h"
 #include "config.h"
 #include "core/app.h"
 #include "core/device_state.h"
@@ -19,8 +20,9 @@ constexpr const char* TAG = "sdsrc";
 constexpr const char* kErrTooMany = "too_many_files";
 constexpr int kListPerSlice = 12;
 
-alignas(4) uint8_t s_rdBuf[kSdReadBuf];
 portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
+
+inline bool due(uint32_t now, uint32_t t) { return (int32_t)(now - t) >= 0; }
 
 const char* scanStName(Scanner::St s) {
   switch (s) {
@@ -37,6 +39,7 @@ const char* scanStName(Scanner::St s) {
 // ============================================================ життєвий цикл
 
 bool SdSource::begin() {
+  dec_.init(g_audio, media_.reader());
   bool ok = media_.begin();
   media_.poll(millis());  // початковий mount; події не шлемо — MEDIA піде з HELLO/GET
   DeviceState::setMedia(media_.mounted(), DeviceState::usb());
@@ -45,6 +48,11 @@ bool SdSource::begin() {
 }
 
 Res SdSource::activate() {
+  if (!PcmArena::acquire(PcmArena::Owner::Sd)) return Res::BadState;  // область ще у BT: порядок порушено
+  if (!dec_.start()) {                                                // задача mp3 (створюється один раз)
+    PcmArena::release(PcmArena::Owner::Sd);
+    return Res::DecodeFail;
+  }
   active_ = true;
   scanRetry_ = 0;
   if (!media_.mounted()) {
@@ -57,14 +65,18 @@ Res SdSource::activate() {
 }
 
 void SdSource::deactivate() {
-  stopJobs();  // безпечно зупиняє скан і читання
+  g_audio.mute();  // мʼют ДО зупинки (ідемпотентно: менеджер уже мʼютив) — без клацань і «хвостів»
+  stopJobs();      // скан, DBG-читання, сесія декодера; після цього файл закрито
   active_ = false;
   st_ = PlayState::Idle;
+  PcmArena::release(PcmArena::Owner::Sd);  // область вільна для BT
 }
 
 void SdSource::loop(uint32_t now) {
   service(now);
-  if (active_ && st_ == PlayState::Scan) scanStep();
+  if (!active_) return;
+  if (st_ == PlayState::Scan) scanStep();
+  else if (st_ == PlayState::Play || st_ == PlayState::Pause) pollPlayer(now);
 }
 
 void SdSource::service(uint32_t now) {
@@ -100,9 +112,23 @@ Res SdSource::refreshMedia() {
 
 void SdSource::stopJobs() {
   scanner_.abort();
-  if (rdOpen_) media_.reader().close();
+  endSession();  // зупиняє декодер і закриває файл (це ж закриває й DBG,sdread)
   rdOpen_ = false;
   job_ = Dbg::None;
+}
+
+void SdSource::endSession() {
+  if (dec_.sessionActive()) {
+    g_audio.mute();  // тиша до зупинки продюсера
+    dec_.stopSession();
+  }
+  dec_.takeEvent();
+  if (media_.reader().isOpen()) media_.reader().close();
+}
+
+SourceStatus SdSource::status() const {
+  bool pl = st_ == PlayState::Play || st_ == PlayState::Pause;
+  return SourceStatus{st_, pl ? dec_.posMs() / 1000 : 0, pl ? dec_.durMs() / 1000 : 0};
 }
 
 // ============================================================ скан
@@ -160,22 +186,117 @@ void SdSource::emitTrackFolder() {
 }
 
 void SdSource::emitInfo() {
-  if (active_ && st_ == PlayState::Stop && pl_.tracks()) emitTrackFolder();
+  if (!active_ || !pl_.tracks()) return;
+  if (st_ == PlayState::Stop || st_ == PlayState::Play || st_ == PlayState::Pause) emitTrackFolder();
+  if (st_ == PlayState::Play || st_ == PlayState::Pause) sendTime();
 }
 
-// ============================================================ команди (M3c зробить відтворення)
+// ============================================================ відтворення (M3b)
 
-Res SdSource::nav() {
+Res SdSource::nav() {  // NEXT/PREV/FNEXT/FPREV — M3c
   if (st_ == PlayState::Scan) return Res::BadState;
   if (st_ == PlayState::Idle) return media_.mounted() ? Res::BadState : Res::NoMedia;
   return Res::NotImpl;
 }
 
-Res SdSource::play() { return nav(); }
+void SdSource::sendTime() { Events::position(dec_.posMs() / 1000, dec_.durMs() / 1000); }
 
-Res SdSource::pause() { return Res::BadState; }
+// ХУК M3c: тут буде перехід на наступний трек / repeat. Зараз порожній (state вже stop).
+void SdSource::onTrackEnd() {}
 
-Res SdSource::stop() { return st_ == PlayState::Scan ? Res::BadState : Res::Ok; }
+// Відкриває файл і запускає сесію. Викликається з app, коли сесії декодера немає або вона зупиняється тут.
+Res SdSource::startTrack(uint16_t n) {
+  if (!active_ || !media_.mounted()) return Res::NoMedia;
+  if (n >= pl_.tracks()) return Res::BadArg;
+  char path[kScanPathMax + kMediaNameMax + 8];
+  if (!pl_.trackPath(n, path, sizeof path)) return Res::BadArg;
+  if (rdOpen_) {  // DBG,sdread не має ділити читач із відтворенням
+    media_.reader().close();
+    rdOpen_ = false;
+    if (job_ == Dbg::Read) job_ = Dbg::None;
+  }
+  endSession();  // Play→Play: мʼют, зупинка, закриття; з Stop/Pause — просто закриття
+  if (!media_.reader().open(path)) {
+    st_ = PlayState::Stop;
+    LOGW(TAG, "play: не відкрито #%u", (unsigned)n + 1);
+    return media_.mounted() ? Res::ReadFail : Res::NoMedia;
+  }
+  if (n != cur_) {
+    cur_ = n;
+    emitTrackFolder();
+  }
+  LOGI(TAG, "play #%u %s (%u Б)", (unsigned)n + 1, path, (unsigned)media_.reader().size());
+  dec_.startSession();
+  st_ = PlayState::Play;
+  nextTimeAt_ = millis() + kTimeEventMs;
+  infoSeq_ = dec_.infoSeq();
+  // state==play ⇒ DAC має звучати. Менеджер розмʼючує при зміні STATE, але для Play→Play STATE не міняється.
+  g_audio.unmute();
+  return Res::Ok;
+}
+
+Res SdSource::play() {
+  if (st_ == PlayState::Scan) return Res::BadState;
+  if (st_ == PlayState::Idle) return media_.mounted() ? Res::BadState : Res::NoMedia;
+  if (st_ == PlayState::Play) return Res::Ok;
+  if (st_ == PlayState::Pause) {  // позиція збережена: файл відкрито, задача чекає
+    dec_.resume();                // розмʼют DAC зробить менеджер після повернення (задача його дочекається)
+    st_ = PlayState::Play;
+    nextTimeAt_ = millis() + kTimeEventMs;
+    return Res::Ok;
+  }
+  return startTrack(cur_);        // Stop: поточний трек (на старті — перший)
+}
+
+Res SdSource::pause() {
+  if (st_ == PlayState::Pause) return Res::Ok;
+  if (st_ != PlayState::Play) return Res::BadState;
+  g_audio.mute();  // спершу тиша, потім зупинка продюсера
+  bool ok = dec_.pause();
+  st_ = PlayState::Pause;
+  if (ok) sendTime();  // один раз при паузі (якщо сесія вже скінчилась — подію кінця обробить pollPlayer)
+  return Res::Ok;
+}
+
+Res SdSource::stop() {
+  if (st_ == PlayState::Scan) return Res::BadState;
+  if (st_ == PlayState::Play || st_ == PlayState::Pause) {
+    endSession();
+    st_ = PlayState::Stop;
+  }
+  return Res::Ok;
+}
+
+// Події задачі mp3 (кінець треку/помилка) і TIME раз на kTimeEventMs.
+void SdSource::pollPlayer(uint32_t now) {
+  Mp3Player::Ev ev = dec_.takeEvent();
+  if (ev != Mp3Player::Ev::None) {
+    if (media_.reader().isOpen()) media_.reader().close();
+    st_ = PlayState::Stop;  // менеджер у publish() замʼютить DAC і надішле STATE
+    switch (ev) {
+      case Mp3Player::Ev::Eof:
+        LOGI(TAG, "кінець треку #%u", (unsigned)cur_ + 1);
+        onTrackEnd();
+        break;
+      case Mp3Player::Ev::ReadFail:
+        LOGW(TAG, "помилка читання під час відтворення");
+        Events::err(proto::errc::kReadFail, "play");
+        break;
+      default:
+        LOGW(TAG, "помилка декодування");
+        Events::err(proto::errc::kDecodeFail, "play");
+        break;
+    }
+    return;
+  }
+  if (st_ != PlayState::Play) return;
+  uint32_t seq = dec_.infoSeq();
+  if (seq != infoSeq_ || due(now, nextTimeAt_)) {  // одразу, коли зʼявилась тривалість, далі раз на секунду
+    infoSeq_ = seq;
+    nextTimeAt_ = now + kTimeEventMs;
+    sendTime();
+  }
+}
 
 // ============================================================ DBG
 
@@ -212,6 +333,8 @@ void SdSource::runDbg() {
     case Dbg::Scan: dbgScan(); job_ = Dbg::None; break;
     case Dbg::List: dbgList(); break;
     case Dbg::Read: dbgRead(); break;
+    case Dbg::Play: dbgPlay(); job_ = Dbg::None; break;
+    case Dbg::Decode: dbgDecode(); job_ = Dbg::None; break;
     default: job_ = Dbg::None; break;
   }
 }
@@ -265,6 +388,11 @@ void SdSource::dbgRead() {
   if (!rdOpen_) {
     if (scanner_.state() == Scanner::St::Running) { LOGW(TAG, "sdread: триває скан"); job_ = Dbg::None; return; }
     if (!media_.mounted()) { LOGW(TAG, "sdread: носія немає"); job_ = Dbg::None; return; }
+    if (!active_ || st_ != PlayState::Stop) {  // буфер читання — вхідний буфер PcmArena, власник Sd
+      LOGW(TAG, "sdread: потрібен src=sd у стані stop (область PCM належить SD, сесії немає)");
+      job_ = Dbg::None;
+      return;
+    }
     if (arg_ < 1 || arg_ > (int)pl_.tracks()) {
       LOGW(TAG, "sdread: номер 1..%u (спершу SRC,sd для скану)", (unsigned)pl_.tracks());
       job_ = Dbg::None;
@@ -282,10 +410,12 @@ void SdSource::dbgRead() {
     rdBusyUs_ = 0;
     rdT0_ = millis();
   }
+  size_t cap = 0;
+  uint8_t* buf = dec_.scratch(cap);
   uint32_t t = millis();
   do {
     uint32_t a = micros();
-    size_t n = rd.read(s_rdBuf, sizeof s_rdBuf);
+    size_t n = rd.read(buf, cap);
     rdBusyUs_ += micros() - a;
     if (n == 0) {
       uint32_t wall = millis() - rdT0_;
@@ -300,4 +430,40 @@ void SdSource::dbgRead() {
     }
     rdBytes_ += n;
   } while ((uint32_t)(millis() - t) < kReadSliceMs);
+}
+
+
+// DBG,play,<n>: відтворити трек n із DBG,list (з будь-якого стану SD, окрім скану/idle).
+void SdSource::dbgPlay() {
+  if (!active_ || st_ == PlayState::Scan || st_ == PlayState::Idle) {
+    LOGW(TAG, "play: потрібен src=sd зі скануванням, що завершилось (state=%s)", stateName(st_));
+    return;
+  }
+  if (arg_ < 1 || arg_ > (int)pl_.tracks()) {
+    LOGW(TAG, "play: номер 1..%u", (unsigned)pl_.tracks());
+    return;
+  }
+  Res r = startTrack((uint16_t)(arg_ - 1));
+  if (r != Res::Ok) Events::err(resCode(r), "dbgplay");
+}
+
+void SdSource::dbgDecode() {
+  Mp3Stats s;
+  dec_.stats(s);
+  uint32_t posS = dec_.posMs() / 1000, durS = dec_.durMs() / 1000;
+  LOGI(TAG, "decode: state=%s сесія=%d поз=%u с трив=%u с%s | %u Гц %u кан %u кбіт/с", stateName(st_),
+       (int)dec_.state(), (unsigned)posS, (unsigned)durS, dec_.durEstimated() ? " (оцінка)" : "", (unsigned)s.hz,
+       (unsigned)s.ch, (unsigned)s.kbps);
+  LOGI(TAG, "decode: кадрів=%u пропущено=%u ресинхр.=%u | underrun=%u overrun=н/д (кільця немає) write_timeout=%u paced=%u",
+       (unsigned)s.frames, (unsigned)s.skipped, (unsigned)s.resyncs, (unsigned)s.underruns, (unsigned)s.writeTimeouts,
+       (unsigned)s.paced);
+  LOGI(TAG, "decode: час кадру сер.=%u макс.=%u мкс; тривалість кадру сер.=%u мкс; навантаження сер.=%u.%u%% макс.=%u.%u%%",
+       (unsigned)s.decAvgUs, (unsigned)s.decMaxUs, (unsigned)s.frameAvgUs, (unsigned)(s.loadAvgPm / 10),
+       (unsigned)(s.loadAvgPm % 10), (unsigned)(s.loadMaxPm / 10), (unsigned)(s.loadMaxPm % 10));
+  uint32_t kbs = s.rdBusyUs ? (uint32_t)((uint64_t)s.rdBytes * 1000000ULL / 1024 / s.rdBusyUs) : 0;
+  LOGI(TAG, "decode: вхід %u/%u Б, PCM-кадр %u Б; читання %u КБ, %u КБ/с (у читанні), макс. виклик %u мкс",
+       (unsigned)s.inFill, (unsigned)s.inCap, (unsigned)s.pcmBytes, (unsigned)(s.rdBytes / 1024), (unsigned)kbs,
+       (unsigned)s.rdMaxUs);
+  LOGI(TAG, "decode: область PCM: власник=%s, %u Б", PcmArena::ownerName(PcmArena::owner()), (unsigned)kPcmArenaBytes);
+  Diag::logHeap("decode");
 }

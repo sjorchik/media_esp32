@@ -1,14 +1,16 @@
 #pragma once
+#include "audio/mp3_player.h"
 #include "media/imedia.h"
 #include "media/playlist.h"
 #include "media/scanner.h"
 #include "sources/isource.h"
 
-// SD-джерело (M3a): hot-plug, скан, плейлист. Відтворення — M3c (play/next/… → NotImpl).
+// SD-джерело: hot-plug, скан, плейлист (M3a) і відтворення MP3 (M3b): PLAY/PAUSE/TOGGLE/STOP, TIME.
+// Навігація (NEXT/PREV/FNEXT/FPREV), repeat/shuffle — M3c (поки NotImpl). Кінець треку → state=stop + onTrackEnd().
 // Працює через IMedia&, тому про SD не знає. Усе (скан, DBG-завдання) виконується в задачі app порціями.
 class SdSource : public ISource {
  public:
-  enum class Dbg : uint8_t { None, Info, Scan, List, Read };
+  enum class Dbg : uint8_t { None, Info, Scan, List, Read, Play, Decode };
 
   explicit SdSource(IMedia& media) : media_(media) {}
   SrcId id() const override { return SrcId::SD; }
@@ -24,7 +26,7 @@ class SdSource : public ISource {
   Res fprev() override { return nav(); }
   void setRepeat(uint8_t) override {}
   void setShuffle(bool) override {}
-  SourceStatus status() const override { return SourceStatus{st_, 0, 0}; }
+  SourceStatus status() const override;
   void loop(uint32_t nowMs) override;
   void idleLoop(uint32_t nowMs) override { service(nowMs); }
   void emitInfo() override;
@@ -45,6 +47,14 @@ class SdSource : public ISource {
   void dbgScan();
   void dbgList();
   void dbgRead();
+  void dbgPlay();
+  void dbgDecode();
+  // відтворення
+  Res startTrack(uint16_t n);   // відкриває файл, запускає сесію декодера; state=play
+  void endSession();            // мʼют → зупинка сесії → закриття файлу (ідемпотентно)
+  void pollPlayer(uint32_t now);
+  void sendTime();
+  void onTrackEnd();            // ХУК для M3c (порожній): викликається після state=stop при природному кінці треку
   void emitTrackFolder();
   Res nav();
 
@@ -55,6 +65,8 @@ class SdSource : public ISource {
   bool active_ = false, scanned_ = false;
   uint8_t scanRetry_ = 0;
   uint16_t cur_ = 0;
+  Mp3Player dec_;
+  uint32_t nextTimeAt_ = 0, infoSeq_ = 0;
 
   // DBG-завдання
   volatile Dbg pend_ = Dbg::None;
@@ -65,3 +77,4 @@ class SdSource : public ISource {
   bool rdOpen_ = false;
   uint32_t rdBytes_ = 0, rdBusyUs_ = 0, rdT0_ = 0;
 };
+

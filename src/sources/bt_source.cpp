@@ -10,6 +10,7 @@
 #include "esp_gap_bt_api.h"
 
 #include "audio/audio_task.h"
+#include "audio/pcm_arena.h"
 #include "audio/pcm_ring.h"
 #include "core/device_state.h"
 #include "core/events.h"
@@ -27,8 +28,9 @@ constexpr uint8_t kAvrcUnknown = 0xFE;
 constexpr size_t kNameScanMax = 249;          // макс. довжина BT-імені + 1
 constexpr int32_t kPosDeadZoneMs = 1500;      // розбіжність позиції, яку не коригуємо
 
-alignas(4) uint8_t s_ringBuf[kBtRingBytes];
-PcmRing s_ring(s_ringBuf, sizeof s_ringBuf);
+// Кільце живе в спільній області PcmArena (перші kBtRingBytes); власник Bt лише поки BT активне.
+PcmRing s_ring(g_pcmArena, kBtRingBytes);
+volatile uint8_t s_cbBusy = 0;  // 1, поки колбек A2DP пише в кільце (для безпечної передачі області SD)
 BluetoothA2DPSink* s_a2dp = nullptr;
 
 // Діагностика затримки реакції телефона на команди AVRCP
@@ -85,9 +87,23 @@ void takeInbox(Snap& s) {
 // ---- колбеки бібліотеки (контекст BT-задач: коротко, без логів і блокувань) ----
 void cbPcm(const uint8_t* d, uint32_t n) {
   s_ring.inBytes += n;
-  if (!s_ring.accepting()) { s_ring.dropInactive += n; return; }
+  __atomic_store_n(&s_cbBusy, (uint8_t)1, __ATOMIC_SEQ_CST);  // спершу «зайнято», потім перевірка accepting
+  if (!s_ring.accepting()) {
+    s_ring.dropInactive += n;
+    __atomic_store_n(&s_cbBusy, (uint8_t)0, __ATOMIC_RELEASE);
+    return;
+  }
   s_ring.write(d, n);
   AudioTask::wake();
+  __atomic_store_n(&s_cbBusy, (uint8_t)0, __ATOMIC_RELEASE);
+}
+
+// Після setAccepting(false): чекаємо завершення колбека, що вже встиг увійти (≤ кілька мс),
+// щоб він не дописав у область, яку забирає SD.
+void quiesceRing() {
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  for (int i = 0; i < 20 && __atomic_load_n(&s_cbBusy, __ATOMIC_ACQUIRE); i++) vTaskDelay(1);
+  if (__atomic_load_n(&s_cbBusy, __ATOMIC_ACQUIRE)) LOGW("bt", "колбек PCM не завершився за 20 мс");
 }
 
 void cbRate(uint16_t hz) {
@@ -262,6 +278,11 @@ void BtSource::startStack() {
 Res BtSource::activate() {
   active_ = true;
   uint32_t now = millis();
+  if (!PcmArena::acquire(PcmArena::Owner::Bt)) {   // область має бути вільна: SD віддає її в deactivate()
+    Events::err(proto::errc::kBtFail, "arena");
+    st_ = PlayState::Idle;
+    return Res::Ok;
+  }
   if (!started_) {
     Events::err(proto::errc::kBtFail, "not_started");
     st_ = PlayState::Idle;
@@ -272,6 +293,7 @@ Res BtSource::activate() {
   tries_ = 0;
   nextTryAt_ = now;                                 // нова серія спроб реконекту
   s_ring.setPendingRate(rate_ ? rate_ : (uint16_t)kDefaultRate);  // гарантуємо правильний формат I2S
+  s_ring.flush();                                   // після SD в області сміття: індекси — на порожнє кільце
   s_ring.setAccepting(true);
   applyScanMode(now, true);
   st_ = derive();
@@ -285,6 +307,7 @@ void BtSource::deactivate() {
   active_ = false;
   optPause_ = false;
   s_ring.setAccepting(false);                       // вхідний A2DP-звук відкидається
+  quiesceRing();
   uint32_t now = millis();
   if (started_ && conn_) {
     if (st_ == PlayState::Play || audioStarted_) {
@@ -299,6 +322,7 @@ void BtSource::deactivate() {
 #endif
   }
   applyScanMode(now, true);                         // не discoverable
+  PcmArena::release(PcmArena::Owner::Bt);           // область вільна для SD (audio-задача кільце більше не читає)
 }
 
 // ============================================================ команди (AVRCP passthrough)
@@ -694,3 +718,4 @@ void BtSource::dump() const {
        suppress_);
   LOGI(TAG, "meta: артист='%s' назва='%s' альбом='%s' трив=%u с", artist_, title_, album_, (unsigned)durS_);
 }
+

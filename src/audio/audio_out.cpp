@@ -41,6 +41,8 @@ void AudioOut::earlyMute() {
   digitalWrite(PIN_XSMT, levelFor(false));
 }
 
+bool AudioOut::aborting() const { return s_abortWrite; }
+
 void AudioOut::setXsmt(bool unmuted) { digitalWrite(PIN_XSMT, levelFor(unmuted)); }
 
 void AudioOut::computeStep() {

@@ -3,6 +3,9 @@
 #include <Arduino.h>
 #include <SPI.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
 #include "SdFat.h"
 #include "config.h"
 #include "pins.h"
@@ -26,7 +29,7 @@ FsFile s_file;
 
 bool s_mounted = false, s_present = false;
 bool s_blocked = false;      // після відмонтування через помилки: чекати фізичного виймання картки
-bool s_lostPending = false;  // подія Removed ще не видана
+volatile bool s_lostPending = false;  // подія Removed ще не видана (ставить і задача mp3 через noteError)
 uint8_t s_speed = 0;         // індекс у kSdSpiMhz
 uint8_t s_errStreak = 0;
 uint32_t s_errTotal = 0;
@@ -39,6 +42,18 @@ bool s_mountFailLogged = false;
 // опитування (SD_CD_PIN < 0)
 uint32_t s_pollAt = 0;
 uint8_t s_pollFails = 0;
+
+// SdFat не потокобезпечний: усі звернення до s_sd/s_file/s_dirs та SPI — під цим рекурсивним мʼютексом.
+// Власники: app (скан, mount, poll-probe) і задача mp3 (читання файлу під час відтворення).
+SemaphoreHandle_t s_mtx = nullptr;
+constexpr TickType_t kLockTicks = pdMS_TO_TICKS(kSdLockWaitMs);
+struct Guard {
+  bool ok;
+  explicit Guard(TickType_t t = kLockTicks) : ok(s_mtx && xSemaphoreTakeRecursive(s_mtx, t) == pdTRUE) {}
+  ~Guard() { if (ok) xSemaphoreGiveRecursive(s_mtx); }
+  Guard(const Guard&) = delete;
+  Guard& operator=(const Guard&) = delete;
+};
 
 inline bool due(uint32_t now, uint32_t t) { return (int32_t)(now - t) >= 0; }
 inline bool cdActive() { return digitalRead(SD_CD_PIN) == (SD_CD_ACTIVE_LOW ? LOW : HIGH); }
@@ -129,6 +144,8 @@ void okOp() {
 // ============================================================ SdMedia
 
 bool SdMedia::begin() {
+  if (!s_mtx) s_mtx = xSemaphoreCreateRecursiveMutex();
+  if (!s_mtx) { LOGE(TAG, "не вдалося створити мʼютекс SdFat"); return false; }
   s_spi.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
   if constexpr (SD_CD_PIN >= 0) {
     pinMode(SD_CD_PIN, INPUT_PULLUP);
@@ -139,9 +156,19 @@ bool SdMedia::begin() {
 
 bool SdMedia::mounted() const { return s_mounted; }
 bool SdMedia::present() const { return s_present; }
-bool SdMedia::mount() { return mountInternal(); }
-void SdMedia::unmount() { unmountInternal(false); }
 
+bool SdMedia::mount() {
+  Guard g;
+  return g.ok && mountInternal();
+}
+
+void SdMedia::unmount() {
+  Guard g;
+  if (g.ok) unmountInternal(false);
+}
+
+// Під час відтворення poll() не торкається SPI: з CD-піном присутність — по GPIO; без нього probe()
+// виконується лише коли немає активності (читання файлу оновлює s_lastOkAt) і під мʼютексом.
 MediaEvent SdMedia::poll(uint32_t now) {
   if (s_lostPending) {  // відмонтування через помилки
     s_lostPending = false;
@@ -157,11 +184,17 @@ MediaEvent SdMedia::poll(uint32_t now) {
     }
     if (!s_cdStable) {
       s_present = false;
-      if (s_mounted) { unmountInternal(false); return MediaEvent::Removed; }
+      if (s_mounted) {
+        Guard g;  // читання mp3 уже завершується помилкою (≤ ~300 мс), мʼютекс звільниться
+        if (!g.ok) return MediaEvent::None;  // повторимо на наступному poll
+        if (s_mounted) { unmountInternal(false); return MediaEvent::Removed; }
+      }
       return MediaEvent::None;
     }
     s_present = true;
     if (s_mounted || s_blocked || !due(now, s_nextMountAt)) return MediaEvent::None;
+    Guard g;
+    if (!g.ok) return MediaEvent::None;
     if (mountInternal()) return MediaEvent::Inserted;
     s_nextMountAt = now + kSdRemountMs;
     if (!s_mountFailLogged) { s_mountFailLogged = true; LOGW(TAG, "картка є (CD), але mount не вдався; повтор кожні %u мс", (unsigned)kSdRemountMs); }
@@ -169,8 +202,10 @@ MediaEvent SdMedia::poll(uint32_t now) {
   } else {
     if (!due(now, s_pollAt)) return MediaEvent::None;
     s_pollAt = now + (s_blocked ? 4 * kSdPollMs : kSdPollMs);
+    if (s_mounted && (uint32_t)(now - s_lastOkAt) < kSdPollMs) { s_pollFails = 0; return MediaEvent::None; }  // є активність
+    Guard g;
+    if (!g.ok) return MediaEvent::None;  // SPI зайнятий читанням файлу: картка явно жива
     if (s_mounted) {
-      if ((uint32_t)(now - s_lastOkAt) < kSdPollMs) { s_pollFails = 0; return MediaEvent::None; }  // є активність
       if (probe()) { okOp(); s_pollFails = 0; return MediaEvent::None; }
       if (++s_pollFails >= kSdPollFails) {
         s_pollFails = 0;
@@ -192,7 +227,8 @@ MediaEvent SdMedia::poll(uint32_t now) {
 }
 
 int SdMedia::openDir(const char* path) {
-  if (!s_mounted) return -1;
+  Guard g;
+  if (!g.ok || !s_mounted) return -1;
   for (int i = 0; i < kDirHandles; i++) {
     if (s_dirs[i].isOpen()) continue;
     s_dirs[i] = s_sd.open(path, O_RDONLY);
@@ -207,11 +243,13 @@ int SdMedia::openDir(const char* path) {
 }
 
 void SdMedia::closeDir(int h) {
-  if (h >= 0 && h < kDirHandles) s_dirs[h].close();
+  Guard g;
+  if (g.ok && h >= 0 && h < kDirHandles) s_dirs[h].close();
 }
 
 int SdMedia::nextEntry(int h, MediaEntry& e) {
-  if (!s_mounted || h < 0 || h >= kDirHandles || !s_dirs[h].isOpen()) return -1;
+  Guard g;
+  if (!g.ok || !s_mounted || h < 0 || h >= kDirHandles || !s_dirs[h].isOpen()) return -1;
   FsFile f;
   if (!f.openNext(&s_dirs[h], O_RDONLY)) {
     if (probe()) { okOp(); return 0; }  // справжній кінець каталогу
@@ -239,6 +277,8 @@ void SdMedia::info(MediaInfo& o) {
   o.cardType = "-";
   o.fs = "-";
   if (!s_mounted) return;
+  Guard g;
+  if (!g.ok || !s_mounted) return;
   o.mhz = kSdSpiMhz[s_speed];
   uint8_t t = s_sd.card()->type();  // 1=SD1, 2=SD2, 3=SDHC/SDXC
   o.cardType = t == 1 ? "SD1" : t == 2 ? "SD2" : t == 3 ? "SDHC/SDXC" : "?";
@@ -248,18 +288,21 @@ void SdMedia::info(MediaInfo& o) {
 }
 
 // ============================================================ SdFileReader
+// Після M3b читач використовує задача mp3 (під час відтворення app файл не чіпає).
 
 bool SdFileReader::isOpen() const { return s_file.isOpen(); }
 
 void SdFileReader::close() {
-  if (s_file.isOpen()) s_file.close();
+  Guard g;
+  if (g.ok && s_file.isOpen()) s_file.close();
 }
 
 bool SdFileReader::open(const char* path) {
   close();
   failed_ = false;
   pos_ = size_ = 0;
-  if (!s_mounted) { failed_ = true; return false; }
+  Guard g;
+  if (!g.ok || !s_mounted) { failed_ = true; return false; }
   s_file = s_sd.open(path, O_RDONLY);
   if (!s_file.isOpen() || !s_file.isFile()) {
     s_file.close();
@@ -271,7 +314,8 @@ bool SdFileReader::open(const char* path) {
 }
 
 size_t SdFileReader::read(void* dst, size_t n) {
-  if (!s_mounted || !s_file.isOpen()) { failed_ = true; return 0; }  // носій зник: без очікувань
+  Guard g;
+  if (!g.ok || !s_mounted || !s_file.isOpen()) { failed_ = true; return 0; }  // носій зник: без очікувань
   int r = s_file.read(dst, n);
   if (r < 0 || (r == 0 && pos_ < size_)) {
     failed_ = true;
@@ -284,7 +328,8 @@ size_t SdFileReader::read(void* dst, size_t n) {
 }
 
 bool SdFileReader::seek(uint32_t p) {
-  if (!s_mounted || !s_file.isOpen()) { failed_ = true; return false; }
+  Guard g;
+  if (!g.ok || !s_mounted || !s_file.isOpen()) { failed_ = true; return false; }
   if (!s_file.seekSet(p)) return false;
   pos_ = p;
   return true;
