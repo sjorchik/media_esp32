@@ -91,11 +91,13 @@ inline constexpr uint32_t kTimeEventMs = 1000;      // період події T
 
 // ---- Bluetooth ----
 inline constexpr const char* kBtDeviceName = "Media Module";
+// M2b: політика фіксована — BT активний (connectable, реконект) лише при src=bt; в усіх інших станах
+// розрив + non-connectable/non-discoverable. Макроси нижче лишено для сумісності й більше не діють.
 #ifndef BT_DISCONNECT_ON_DEACTIVATE
-#define BT_DISCONNECT_ON_DEACTIVATE 0  // 0: лишати ACL при деактивації (швидке повернення); 1: розривати
+#define BT_DISCONNECT_ON_DEACTIVATE 1  // (не використовується)
 #endif
 #ifndef BT_RECONNECT_WHILE_INACTIVE
-#define BT_RECONNECT_WHILE_INACTIVE 1  // реконект і коли джерело не bt (старт модуля)
+#define BT_RECONNECT_WHILE_INACTIVE 0  // (не використовується)
 #endif
 #ifndef BT_OPTIMISTIC_PAUSE
 #define BT_OPTIMISTIC_PAUSE 1          // 1: після нашого PAUSE одразу показувати pause (телефон звітує ≈4,3 с)
@@ -112,6 +114,14 @@ inline constexpr size_t   kBtMetaMax = 96;                  // байтів UTF-
 inline constexpr uint32_t kBtPosNotifS = 2;                 // період AVRCP-повідомлень позиції, с
 inline constexpr uint32_t kBtInactivePauseGapMs = 5000;     // мін. інтервал повторного AVRCP pause
 inline constexpr uint32_t kPairWindowMs = 120000;           // вікно DBG,bt,pair
+inline constexpr uint32_t kBtPauseBeforeDiscMs = 300;       // макс. очікування зупинки потоку після AVRCP pause перед розривом
+inline constexpr uint32_t kBtPausePollMs = 20;              // крок опитування під час цього очікування
+inline constexpr uint32_t kBtDiscRetryMs = 2000;            // повтор запиту розриву, якщо подія не прийшла
+inline constexpr uint8_t  kBtDiscRetryMax = 3;
+inline constexpr uint32_t kBtDiscPairMs = 400;              // макс. різниця часу «подія розриву» ↔ «disc_rsn»
+inline constexpr uint32_t kBtDiscWaitMs = 600;              // скільки чекаємо disc_rsn (далі — вважаємо втратою звʼязку)
+inline constexpr uint32_t kBtSwitchReconnectMs = 500;       // реконект, якщо src=bt повернули, поки йшов наш розрив
+inline constexpr uint32_t kBtHeapAfterMs = 1500;            // через скільки після розриву/підключення логувати heap
 
 // ---- SD (M3a) ----
 #ifndef SD_CD_ACTIVE_LOW
@@ -156,5 +166,3 @@ inline constexpr int kPrioDecoder = 5;   // нижче за audio (6), вище 
 
 // ---- Діагностика ----
 inline constexpr uint32_t kDiagPeriodMs = 60000;
-
-

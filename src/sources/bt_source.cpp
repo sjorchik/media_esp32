@@ -5,8 +5,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <vector>
 
 #include "BluetoothA2DPSink.h"
+#include "esp_a2dp_api.h"
 #include "esp_gap_bt_api.h"
 
 #include "audio/audio_task.h"
@@ -25,6 +27,7 @@ constexpr const char* TAG = "bt";
 constexpr const char* kKeyPeer = "bt_peer";   // BD-адреса: 12 hex-символів
 constexpr const char* kKeyName = "bt_name";
 constexpr uint8_t kAvrcUnknown = 0xFE;
+constexpr uint8_t kRsnNone = 0xFF;            // disc_rsn невідома
 constexpr size_t kNameScanMax = 249;          // макс. довжина BT-імені + 1
 constexpr int32_t kPosDeadZoneMs = 1500;      // розбіжність позиції, яку не коригуємо
 
@@ -45,34 +48,31 @@ void noteCmd(const char* name) {
 // ---- Inbox: колбеки бібліотеки (інші задачі) → задача app ----
 portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 struct Inbox {
-  bool conn = false, audio = false, avrc = false, pos = false, vol = false, meta = false, rate = false;
+  bool conn = false, audio = false, avrc = false, pos = false, meta = false, rate = false;
   esp_a2d_connection_state_t connSt = ESP_A2D_CONNECTION_STATE_DISCONNECTED;
   esp_a2d_audio_state_t audioSt = ESP_A2D_AUDIO_STATE_STOPPED;
   uint8_t avrcSt = kAvrcUnknown;
-  uint32_t posMs = 0, metaAtMs = 0, lastAttrMs = 0, durMs = 0;
-  int volVal = 0;
+  uint32_t posMs = 0, metaAtMs = 0, lastAttrMs = 0, durMs = 0, connAtMs = 0;
   uint16_t rateHz = 0;
   char title[kBtMetaMax + 1] = {0}, artist[kBtMetaMax + 1] = {0}, album[kBtMetaMax + 1] = {0};
 } s_in;
 
 struct Snap {
-  bool conn, audio, avrc, pos, vol, meta, rate;
+  bool conn, audio, avrc, pos, meta, rate;
   esp_a2d_connection_state_t connSt;
   esp_a2d_audio_state_t audioSt;
   uint8_t avrcSt;
-  uint32_t posMs, metaAtMs, durMs;
-  int volVal;
+  uint32_t posMs, metaAtMs, durMs, connAtMs;
   uint16_t rateHz;
   char title[kBtMetaMax + 1], artist[kBtMetaMax + 1], album[kBtMetaMax + 1];
 };
 
 void takeInbox(Snap& s) {
   portENTER_CRITICAL(&s_mux);
-  s.conn = s_in.conn; s.connSt = s_in.connSt; s_in.conn = false;
+  s.conn = s_in.conn; s.connSt = s_in.connSt; s.connAtMs = s_in.connAtMs; s_in.conn = false;
   s.audio = s_in.audio; s.audioSt = s_in.audioSt; s_in.audio = false;
   s.avrc = s_in.avrc; s.avrcSt = s_in.avrcSt; s_in.avrc = false;
   s.pos = s_in.pos; s.posMs = s_in.posMs; s_in.pos = false;
-  s.vol = s_in.vol; s.volVal = s_in.volVal; s_in.vol = false;
   s.rate = s_in.rate; s.rateHz = s_in.rateHz; s_in.rate = false;
   s.meta = s_in.meta; s.metaAtMs = s_in.metaAtMs; s.durMs = s_in.durMs;
   if (s_in.meta) {
@@ -83,6 +83,41 @@ void takeInbox(Snap& s) {
   }
   portEXIT_CRITICAL(&s_mux);
 }
+
+// ---- підклас sink: причина розриву (disc_rsn) і політика scan mode ----
+volatile bool s_blockScan = false;       // true: BT вимкнений — будь-яка спроба бібліотеки зробити connectable блокується
+volatile bool s_wantDisc = false;        // бажана видимість, коли connectable
+volatile uint8_t s_scanMode = 3;         // 0 non-conn, 1 connectable прихований, 2 connectable+discoverable, 3 невідомо
+uint8_t s_rsn = kRsnNone;                // disc_rsn останнього A2DP DISCONNECTED (під s_mux)
+uint32_t s_rsnAt = 0;                    // millis() цієї події
+
+class A2dpSink : public BluetoothA2DPSink {
+ protected:
+  // Контекст BtAppT: лише фіксуємо причину, далі штатна логіка бібліотеки.
+  void handle_connection_state(uint16_t event, void* p) override {
+    esp_a2d_cb_param_t* a = (esp_a2d_cb_param_t*)p;
+    if (a && a->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
+      portENTER_CRITICAL(&s_mux);
+      s_rsn = (uint8_t)a->conn_stat.disc_rsn;
+      s_rsnAt = millis();
+      portEXIT_CRITICAL(&s_mux);
+    }
+    BluetoothA2DPSink::handle_connection_state(event, p);
+  }
+  // Бібліотека викликає це після розриву/старту (з discoverable за замовчуванням): тут керуємо політикою.
+  void set_scan_mode_connectable(bool c) override {
+    if (s_blockScan || !c) {
+      esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+      s_scanMode = 0;
+    } else {
+      bool d = s_wantDisc;
+      esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, d ? ESP_BT_GENERAL_DISCOVERABLE : ESP_BT_NON_DISCOVERABLE);
+      s_scanMode = d ? 2 : 1;
+    }
+  }
+};
+
+void cbNop(const uint8_t*, uint32_t) {}  // stream_reader не потрібен: PCM беремо з raw_stream_reader
 
 // ---- колбеки бібліотеки (контекст BT-задач: коротко, без логів і блокувань) ----
 void cbPcm(const uint8_t* d, uint32_t n) {
@@ -118,6 +153,7 @@ void cbConn(esp_a2d_connection_state_t st, void*) {
   portENTER_CRITICAL(&s_mux);
   s_in.conn = true;
   s_in.connSt = st;
+  s_in.connAtMs = millis();
   portEXIT_CRITICAL(&s_mux);
 }
 
@@ -139,13 +175,6 @@ void cbPos(uint32_t ms) {
   portENTER_CRITICAL(&s_mux);
   s_in.pos = true;
   s_in.posMs = ms;
-  portEXIT_CRITICAL(&s_mux);
-}
-
-void cbVol(int v) {
-  portENTER_CRITICAL(&s_mux);
-  s_in.vol = true;
-  s_in.volVal = v;
   portEXIT_CRITICAL(&s_mux);
 }
 
@@ -249,10 +278,13 @@ bool BtSource::begin() {
 
 void BtSource::startStack() {
   if (started_) return;
-  s_a2dp = new BluetoothA2DPSink();
+  s_blockScan = true;                             // політика «BT вимкнений» діє вже з підйому стеку
+  s_scanMode = 0;
+  s_a2dp = new A2dpSink();
   BluetoothA2DPSink& a = *s_a2dp;
   // Усі виклики бібліотеки зібрані тут (при іншій версії API правити лише цей блок).
-  a.set_stream_reader(cbPcm, false);              // PCM у наше кільце, власного I2S немає
+  a.set_raw_stream_reader(cbPcm);                 // PCM у наше кільце ДО програмної гучності бібліотеки
+  a.set_stream_reader(cbNop, false);              // власного I2S немає
   a.set_sample_rate_callback(cbRate);
   a.set_avrc_metadata_attribute_mask((esp_avrc_md_attr_mask_t)(ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST |
                                                                 ESP_AVRC_MD_ATTR_ALBUM | ESP_AVRC_MD_ATTR_PLAYING_TIME));
@@ -261,18 +293,20 @@ void BtSource::startStack() {
   a.set_avrc_rn_play_pos_callback(cbPos, kBtPosNotifS);
   a.set_on_connection_state_changed(cbConn);
   a.set_on_audio_state_changed(cbAudio);
-  a.set_on_volumechange(cbVol);
+  // Absolute volume вимкнено: порожній список подій TG (без ESP_AVRC_RN_VOLUME_CHANGE) → телефон
+  // не реєструє volume-change і ослаблює потік програмно. Має бути до start() (читається при підйомі AVRCP TG).
+  a.set_avrc_rn_events(std::vector<esp_avrc_rn_event_ids_t>());
   a.start(kBtDeviceName, false);                  // автореконект бібліотеки вимкнено: ним керуємо самі
 
   started_ = true;
   uint32_t now = millis();
-  nextTryAt_ = now + kBtBootReconnectDelayMs;
   statAt_ = now;
+  scanReassertAt_ = now + 2000;                   // стек піднімається асинхронно: ще раз виставити non-connectable
   applyScanMode(now, true);
 
   static const char* const kNames[] = {"BTC_TASK", "BTU_TASK", "BtAppT"};
   for (const char* n : kNames) Diag::registerTask(n, xTaskGetHandle(n));
-  LOGI(TAG, "A2DP sink запущено як '%s' (SBC), реконект: %s", kBtDeviceName, havePeer_ ? "так" : "немає пристрою");
+  LOGI(TAG, "A2DP sink запущено як '%s' (SBC); BT вимкнений до SRC,bt (non-connectable)", kBtDeviceName);
 }
 
 Res BtSource::activate() {
@@ -288,10 +322,12 @@ Res BtSource::activate() {
     st_ = PlayState::Idle;
     return Res::Ok;
   }
-  suppress_ = false;
+  if (!conn_) suppress_ = false;                    // розрив не в польоті; інакше suppress_ зніме подія DISCONNECTED
+  manualDisc_ = false;                              // «ручний розрив» діє лише в межах одного сеансу src=bt
   giveUp_ = false;
   tries_ = 0;
-  nextTryAt_ = now;                                 // нова серія спроб реконекту
+  discRetries_ = 0;
+  nextTryAt_ = now;                                 // нова серія спроб реконекту (до останнього пристрою)
   s_ring.setPendingRate(rate_ ? rate_ : (uint16_t)kDefaultRate);  // гарантуємо правильний формат I2S
   s_ring.flush();                                   // після SD в області сміття: індекси — на порожнє кільце
   s_ring.setAccepting(true);
@@ -310,18 +346,24 @@ void BtSource::deactivate() {
   quiesceRing();
   uint32_t now = millis();
   if (started_ && conn_) {
+    Diag::logHeap("bt-before-disc");
     if (st_ == PlayState::Play || audioStarted_) {
       s_a2dp->pause();                              // телефону — AVRCP pause
       noteCmd("pause (деактивація)");
       lastInactivePauseAt_ = now;
       inactivePauses_ = 1;
+      uint32_t t0 = now;                            // коротка пауза: ≤ kBtPauseBeforeDiscMs, виходимо, коли потік зупинився
+      while (audioStarted_ && (uint32_t)(millis() - t0) < kBtPauseBeforeDiscMs) {
+        vTaskDelay(pdMS_TO_TICKS(kBtPausePollMs));
+        service(millis());
+      }
     }
-#if BT_DISCONNECT_ON_DEACTIVATE
-    suppress_ = true;
-    s_a2dp->disconnect();
-#endif
+    applyScanMode(millis(), true);                  // non-connectable ДО розриву: бібліотека не зробить connectable
+    discRetries_ = 0;
+    sendDisconnect(millis());                       // подія BT,disconnected прийде з service() рівно один раз
+  } else {
+    applyScanMode(now, true);
   }
-  applyScanMode(now, true);                         // не discoverable
   PcmArena::release(PcmArena::Owner::Bt);           // область вільна для SD (audio-задача кільце більше не читає)
 }
 
@@ -438,21 +480,39 @@ void BtSource::doForget(uint32_t now) {
   NvsStore::putStr(kKeyName, "");
   giveUp_ = false;
   tries_ = 0;
-  if (conn_) s_a2dp->disconnect();
+  if (conn_) sendDisconnect(now);
+  // Без цього телефон після «забути» і модуль зі старим link key дають «authentication failed».
+  int nb = esp_bt_gap_get_bond_device_num();
+  if (nb > 0) {
+    esp_bd_addr_t bonds[8];                         // 48 Б у стеку app; модуль парується з одним телефоном
+    int cnt = nb > 8 ? 8 : nb;
+    if (esp_bt_gap_get_bond_device_list(&cnt, bonds) == ESP_OK) {
+      for (int i = 0; i < cnt; i++) esp_bt_gap_remove_bond_device(bonds[i]);
+    }
+    LOGI(TAG, "видалено bond-записів: %d", cnt);
+  }
   applyScanMode(now, true);
   LOGI(TAG, "збережений пристрій забуто");
 }
 
-// Політика видимості: connectable завжди; discoverable лише якщо джерело активне, телефон не підключений
-// і немає збереженого пристрою (або спроби вичерпано), або відкрито вікно DBG,bt,pair.
+// Політика видимості: поза src=bt — non-connectable/non-discoverable (s_blockScan блокує і бібліотеку);
+// при src=bt — connectable; discoverable лише якщо джерело активне, телефон не підключений і немає
+// збереженого пристрою (або спроби вичерпано), або відкрито вікно DBG,bt,pair.
 void BtSource::applyScanMode(uint32_t, bool force) {
-  if (!started_ || conn_) return;                   // при звʼязку режим сканування лишає бібліотека
-  bool disc = pairing_ || (active_ && (!havePeer_ || giveUp_));
-  if (!force && scanApplied_ && disc == scanDisc_) return;
-  esp_err_t e = esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, disc ? ESP_BT_GENERAL_DISCOVERABLE : ESP_BT_NON_DISCOVERABLE);
+  if (!started_) return;
+  bool off = !active_;
+  s_blockScan = off;
+  if (conn_ && !off) return;                        // при звʼязку режим сканування лишає бібліотека
+  bool disc = !off && (pairing_ || !havePeer_ || giveUp_);
+  uint8_t want = off ? 0 : (disc ? 2 : 1);
+  if (!force && scanApplied_ && want == s_scanMode) return;
+  s_wantDisc = disc;
+  esp_err_t e = off ? esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE)
+                    : esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, disc ? ESP_BT_GENERAL_DISCOVERABLE : ESP_BT_NON_DISCOVERABLE);
+  s_scanMode = want;
   scanDisc_ = disc;
   scanApplied_ = (e == ESP_OK);
-  LOGI(TAG, "scan mode: connectable, %s (err=%d)", disc ? "DISCOVERABLE" : "прихований", (int)e);
+  LOGI(TAG, "scan mode: %s (err=%d)", off ? "non-connectable (BT вимкнений)" : (disc ? "connectable, DISCOVERABLE" : "connectable, прихований"), (int)e);
 }
 
 void BtSource::onConnected(uint32_t now) {
@@ -486,12 +546,14 @@ void BtSource::onConnected(uint32_t now) {
   nameWatchEnd_ = now + 5000;
   nameWatch_ = true;
   if (nameReported_) reportConn(true);
-  volFix_ = true;
-  volFixAt_ = now + 1000;
+  manualDisc_ = false;                              // телефон підключився (сам або за реконектом) — новий сеанс звʼязку
+  discWait_ = false;
+  heapAt_ = now + kBtHeapAfterMs;
+  heapTag_ = "bt-connected";
   LOGI(TAG, "підключено: '%s'", name_);
 }
 
-void BtSource::onDisconnected(uint32_t now) {
+void BtSource::onDisconnected(uint32_t now, uint32_t evAt) {
   connecting_ = false;
   if (!conn_) return;                               // невдала спроба — лише скинули прапорець
   conn_ = false;
@@ -500,14 +562,55 @@ void BtSource::onDisconnected(uint32_t now) {
   optPause_ = false;
   nameWatch_ = false;
   DeviceState::setBt(false, name_);
-  Events::bt(false, name_);
+  Events::bt(false, name_);                         // BT,disconnected — один раз на розрив
   clearMeta();
   tries_ = 0;
   giveUp_ = false;
-  nextTryAt_ = now + kBtLossReconnectDelayMs;
+  discWait_ = true;                                 // реконект вирішить resolveDisc() за disc_rsn
+  discEvtAt_ = evAt;
+  discDeadline_ = now + kBtDiscWaitMs;
+  heapAt_ = now + kBtHeapAfterMs;
+  heapTag_ = "bt-after-disc";
   scanReassertAt_ = now + 1000;                     // бібліотека може змінити scan mode після нас
   applyScanMode(now, true);
   LOGI(TAG, "відʼєднано: '%s'", name_);
+}
+
+// Хто розірвав: наш запит (suppress_) → модуль; disc_rsn NORMAL без нашого запиту → телефон (ручний розрив,
+// без реконекту); інакше або причину не отримано → втрата звʼязку (реконект за ліміти).
+void BtSource::resolveDisc(uint32_t now) {
+  uint8_t rsn;
+  uint32_t rsnAt;
+  portENTER_CRITICAL(&s_mux);
+  rsn = s_rsn;
+  rsnAt = s_rsnAt;
+  portEXIT_CRITICAL(&s_mux);
+  int32_t dt = (int32_t)(rsnAt - discEvtAt_);
+  bool fresh = rsn != kRsnNone && dt > -(int32_t)kBtDiscPairMs && dt < (int32_t)kBtDiscPairMs;
+  if (!fresh && !due(now, discDeadline_)) return;
+  discWait_ = false;
+  lastRsn_ = fresh ? rsn : kRsnNone;
+  if (suppress_) {                                  // розрив ініційовано модулем (деактивація/forget)
+    suppress_ = false;
+    lastWho_ = 'M';
+    if (active_ && havePeer_) { tries_ = 0; nextTryAt_ = now + kBtSwitchReconnectMs; }  // src=bt повернули, поки йшов розрив
+  } else if (fresh && rsn == ESP_A2D_DISC_RSN_NORMAL) {
+    lastWho_ = 'U';
+    manualDisc_ = true;                             // користувач відʼєднав у телефоні: не підключаємось самі
+  } else {
+    lastWho_ = 'L';
+    nextTryAt_ = now + kBtLossReconnectDelayMs;
+  }
+  LOGI(TAG, "розрив: причина=%s ініціатор=%c manual=%d", fresh ? (rsn == ESP_A2D_DISC_RSN_NORMAL ? "NORMAL" : "ABNORMAL") : "не отримано",
+       lastWho_, manualDisc_);
+  applyScanMode(now, true);
+}
+
+void BtSource::sendDisconnect(uint32_t now) {
+  suppress_ = true;
+  discRetryAt_ = now + kBtDiscRetryMs;
+  esp_err_t e = esp_a2d_sink_disconnect(peer_);     // адреса поточного пристрою (disconnect() бібліотеки бере last_connection)
+  LOGI(TAG, "розрив A2DP (за політикою) err=%d", (int)e);
 }
 
 // ============================================================ службовий цикл
@@ -519,7 +622,9 @@ void BtSource::service(uint32_t now) {
   if (forgetReq_) { forgetReq_ = false; doForget(now); }
   if (pairReq_) {
     pairReq_ = false;
-    if (conn_) {
+    if (!active_) {
+      LOGW(TAG, "pair лише при src=bt (BT вимкнений)");
+    } else if (conn_) {
       LOGW(TAG, "уже підключено до '%s'; спершу DBG,bt,forget", name_);
     } else {
       pairing_ = true;
@@ -537,8 +642,9 @@ void BtSource::service(uint32_t now) {
   if (sn.conn) {
     if (sn.connSt == ESP_A2D_CONNECTION_STATE_CONNECTING) connecting_ = true;
     else if (sn.connSt == ESP_A2D_CONNECTION_STATE_CONNECTED) onConnected(now);
-    else if (sn.connSt == ESP_A2D_CONNECTION_STATE_DISCONNECTED) onDisconnected(now);
+    else if (sn.connSt == ESP_A2D_CONNECTION_STATE_DISCONNECTED) onDisconnected(now, sn.connAtMs);
   }
+  if (discWait_) resolveDisc(now);
   if (sn.avrc) {
     avrc_ = sn.avrcSt;
     LOGI(TAG, "подія AVRCP-статусу: %s", avrcName(sn.avrcSt));
@@ -553,14 +659,6 @@ void BtSource::service(uint32_t now) {
       posBase_ = sn.posMs;
       posAt_ = now;
     }
-  }
-  if (sn.vol && sn.volVal < 127 && due(now, lastVolSet_ + 500) && conn_) {
-    s_a2dp->set_volume(127);                           // гучність модуля не регулюється (її робить S3)
-    lastVolSet_ = now;
-  }
-  if (volFix_ && due(now, volFixAt_)) {
-    volFix_ = false;
-    if (conn_) { s_a2dp->set_volume(127); lastVolSet_ = now; }
   }
   if (sn.meta) {
     memcpy(pT_, sn.title, sizeof pT_);
@@ -647,12 +745,20 @@ void BtSource::service(uint32_t now) {
       inactivePauses_++;
       LOGI(TAG, "джерело не bt, а телефон грає: повторний AVRCP pause (%u)", (unsigned)inactivePauses_);
     }
+    if (!suppress_) {                                  // підключився попри політику (завершилась давня спроба)
+      discRetries_ = 0;
+      sendDisconnect(now);
+    } else if (discRetries_ < kBtDiscRetryMax && due(now, discRetryAt_)) {
+      discRetries_++;
+      sendDisconnect(now);                             // подія розриву не прийшла: повторюємо запит
+    }
   }
 
   // ---- автореконект до останнього пристрою ----
   if (connecting_ && due(now, connectAt_ + kBtConnectTimeoutMs)) connecting_ = false;
-  bool mayTry = active_ || BT_RECONNECT_WHILE_INACTIVE;
-  if (!conn_ && !connecting_ && havePeer_ && !giveUp_ && !suppress_ && mayTry && due(now, nextTryAt_)) {
+  bool mayTry = active_;                               // реконект лише при src=bt
+  if (!conn_ && !connecting_ && havePeer_ && !giveUp_ && !suppress_ && !manualDisc_ && !discWait_ && mayTry &&
+      due(now, nextTryAt_)) {
     if (tries_ >= kBtReconnectMaxTries) {
       giveUp_ = true;
       LOGW(TAG, "реконект: вичерпано %u спроб", (unsigned)kBtReconnectMaxTries);
@@ -667,6 +773,11 @@ void BtSource::service(uint32_t now) {
       LOGI(TAG, "реконект, спроба %u/%u: %s", (unsigned)tries_, (unsigned)kBtReconnectMaxTries, ok ? "запит надіслано" : "помилка");
       if (!ok && active_) Events::err(proto::errc::kBtFail, "connect");
     }
+  }
+
+  if (heapAt_ && due(now, heapAt_)) {                  // поточні free/largest після зміни стану звʼязку
+    heapAt_ = 0;
+    Diag::logHeap(heapTag_);
   }
 
   // ---- швидкість потоку, раз на секунду ----
@@ -716,6 +827,13 @@ void BtSource::dump() const {
        (unsigned)s_ring.maxWriteUs, (unsigned)s_ring.available(), (unsigned)s_ring.capacity());
   LOGI(TAG, "реконект спроб=%u/%u giveup=%d suppress=%d", (unsigned)tries_, (unsigned)kBtReconnectMaxTries, giveUp_,
        suppress_);
+  static const char* const kScanNames[] = {"non-connectable/non-discoverable", "connectable, прихований",
+                                           "connectable, discoverable", "невідомо"};
+  uint8_t sm = s_scanMode > 3 ? 3 : s_scanMode;
+  const char* rs = lastRsn_ == kRsnNone ? "невідома" : (lastRsn_ == ESP_A2D_DISC_RSN_NORMAL ? "NORMAL" : "ABNORMAL");
+  const char* who = lastWho_ == 'U' ? "телефон" : lastWho_ == 'L' ? "втрата звʼязку" : lastWho_ == 'M' ? "модуль" : "—";
+  LOGI(TAG, "ручний_розрив=%d остання_причина=%s (%s) scan_mode=%s політика_BT_вимкнений=%d очікування_причини=%d", manualDisc_,
+       rs, who, kScanNames[sm], !active_, discWait_);
+  Diag::logHeap("dbg-bt");
   LOGI(TAG, "meta: артист='%s' назва='%s' альбом='%s' трив=%u с", artist_, title_, album_, (unsigned)durS_);
 }
-
