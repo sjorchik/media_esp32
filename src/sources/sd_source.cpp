@@ -115,6 +115,7 @@ void SdSource::stopJobs() {
   endSession();  // зупиняє декодер і закриває файл (це ж закриває й DBG,sdread)
   rdOpen_ = false;
   job_ = Dbg::None;
+  errRun_ = 0;
 }
 
 void SdSource::endSession() {
@@ -137,6 +138,7 @@ void SdSource::startScan() {
   st_ = PlayState::Scan;
   scanned_ = true;
   cur_ = 0;
+  errRun_ = 0;
   scanner_.start(media_, pl_);
   LOGI(TAG, "скан розпочато");
 }
@@ -170,12 +172,18 @@ void SdSource::finishScan(Scanner::St r) {
   }
   cur_ = 0;
   st_ = PlayState::Stop;
-  emitTrackFolder();  // TRACK, FOLDER; далі STATE,sd,stop від менеджера
+  emitTrackInfo();  // TRACK, FOLDER, META, TIME; далі STATE,sd,stop від менеджера
   if (r == Scanner::St::Overflow) Events::err(kErrTooMany);
 }
 
-void SdSource::emitTrackFolder() {
-  Events::track(cur_ + 1, pl_.tracks());
+// ============================================================ події треку (M3c)
+
+void SdSource::sendTime() {
+  SourceStatus s = status();  // у stop/idle → 0, 0
+  Events::position(s.posS, s.durS);
+}
+
+void SdSource::emitFolder() {
   int f = pl_.folderOf(cur_);
   char nm[kEvFolderNameMax + 1] = {0};
   if (f >= 0) {
@@ -185,26 +193,98 @@ void SdSource::emitTrackFolder() {
   Events::folder(nm, f >= 0 ? pl_.folderTracks(f) : 0);
 }
 
+// META одразу з відомим: виконавець і альбом порожні, назва = імʼя файлу без .mp3 (теги — M3d)
+void SdSource::emitMeta() {
+  char full[kMediaNameMax];
+  char title[kEvMetaFieldMax + 1] = {0};
+  if (pl_.trackName(cur_, full, sizeof full)) Utf8::copySafe(title, sizeof title, full);
+  Events::meta("", title, "");
+}
+
+// Порядок за контрактом: TRACK, FOLDER, META, TIME (STATE додасть менеджер, якщо стан змінився)
+void SdSource::emitTrackInfo() {
+  Events::track(cur_ + 1, pl_.tracks());
+  emitFolder();
+  emitMeta();
+  sendTime();
+}
+
 void SdSource::emitInfo() {
   if (!active_ || !pl_.tracks()) return;
-  if (st_ == PlayState::Stop || st_ == PlayState::Play || st_ == PlayState::Pause) emitTrackFolder();
-  if (st_ == PlayState::Play || st_ == PlayState::Pause) sendTime();
+  if (st_ == PlayState::Stop || st_ == PlayState::Play || st_ == PlayState::Pause) emitTrackInfo();
 }
 
-// ============================================================ відтворення (M3b)
+// Нова поточна позиція без запуску. Зміна треку → події; той самий трек → лише TIME (позиція скинута).
+void SdSource::setCur(uint16_t n) {
+  bool changed = n != cur_;
+  cur_ = n;
+  if (changed) emitTrackInfo();
+  else sendTime();
+}
 
-Res SdSource::nav() {  // NEXT/PREV/FNEXT/FPREV — M3c
+// ============================================================ навігація й відтворення (M3b/M3c)
+
+// Загальна передумова команд відтворення/навігації: scan → bad_state; idle → no_media (нема носія або mp3), інакше bad_state.
+Res SdSource::ready() const {
   if (st_ == PlayState::Scan) return Res::BadState;
-  if (st_ == PlayState::Idle) return media_.mounted() ? Res::BadState : Res::NoMedia;
-  return Res::NotImpl;
+  if (st_ == PlayState::Idle) return (!media_.mounted() || !pl_.tracks()) ? Res::NoMedia : Res::BadState;
+  return Res::Ok;
 }
 
-void SdSource::sendTime() { Events::position(dec_.posMs() / 1000, dec_.durMs() / 1000); }
+uint16_t SdSource::nextIdx(uint16_t i) const { return (uint16_t)(i + 1 >= pl_.tracks() ? 0 : i + 1); }
+uint16_t SdSource::prevIdx(uint16_t i) const { return (uint16_t)(i == 0 ? pl_.tracks() - 1 : i - 1); }
 
-// ХУК M3c: тут буде перехід на наступний трек / repeat. Зараз порожній (state вже stop).
-void SdSource::onTrackEnd() {}
+void SdSource::note(char why, uint16_t to) {
+  hist_[histHead_] = Hist{cur_, to, why};
+  histHead_ = (uint8_t)((histHead_ + 1) % kNavHist);
+  if (histCnt_ < kNavHist) histCnt_++;
+  LOGI(TAG, "перехід '%c': #%u -> #%u", why, (unsigned)cur_ + 1, (unsigned)to + 1);
+}
 
-// Відкриває файл і запускає сесію. Викликається з app, коли сесії декодера немає або вона зупиняється тут.
+// NEXT/PREV/FNEXT/FPREV: циклічно; з stop/pause одразу починають відтворення. Ручна команда скидає лічильник помилок.
+Res SdSource::nav(Nav k) {
+  Res r = ready();
+  if (r != Res::Ok) return r;
+  const uint16_t total = pl_.tracks();
+  uint16_t to = cur_;
+  char why = 'N';
+  switch (k) {
+    case Nav::Next:
+      to = nextIdx(cur_);
+      break;
+    case Nav::Prev:
+      if ((st_ == PlayState::Play || st_ == PlayState::Pause) && dec_.posMs() > kPrevRestartMs) {
+        why = 'R';  // перезапуск поточного: файл відкривається знову, скан не повторюється
+      } else {
+        to = prevIdx(cur_);
+        why = 'P';
+      }
+      break;
+    case Nav::FNext:
+    case Nav::FPrev: {
+      int f = pl_.folderOf(cur_);
+      if (f < 0) return Res::BadState;
+      uint32_t first = pl_.folderFirst(f);
+      if (k == Nav::FNext) {  // папки — суцільні діапазони: наступна починається одразу за кінцем поточної
+        uint32_t end = first + pl_.folderTracks(f);
+        to = end >= total ? 0 : (uint16_t)end;
+        why = 'F';
+      } else {                // перша доріжка папки, що містить трек перед першим треком поточної
+        int pf = pl_.folderOf((uint16_t)(first ? first - 1 : total - 1));
+        if (pf < 0) return Res::BadState;
+        to = pl_.folderFirst(pf);
+        why = 'B';
+      }
+      break;
+    }
+  }
+  errRun_ = 0;
+  return playTrack(to, why);
+}
+
+
+// Відкриває файл і запускає сесію. Викликається з app. Нова позиція → події треку (до відкриття файлу).
+// ReadFail = файл не відкрито (рішення про пропуск приймає playTrack).
 Res SdSource::startTrack(uint16_t n) {
   if (!active_ || !media_.mounted()) return Res::NoMedia;
   if (n >= pl_.tracks()) return Res::BadArg;
@@ -215,15 +295,16 @@ Res SdSource::startTrack(uint16_t n) {
     rdOpen_ = false;
     if (job_ == Dbg::Read) job_ = Dbg::None;
   }
-  endSession();  // Play→Play: мʼют, зупинка, закриття; з Stop/Pause — просто закриття
-  if (!media_.reader().open(path)) {
-    st_ = PlayState::Stop;
-    LOGW(TAG, "play: не відкрито #%u", (unsigned)n + 1);
-    return media_.mounted() ? Res::ReadFail : Res::NoMedia;
-  }
+  endSession();  // Play→Play: мʼют, зупинка, закриття; з Stop/Pause/Eof/помилки — просто закриття
+  g_audio.mute();  // ідемпотентно: сесія завжди стартує з замʼючено DAC (задача mp3 чекає розмʼюту), як у перевірених сценаріях
+  st_ = PlayState::Stop;  // status() = 0/0, доки сесія не стартувала (відкриття може не вдатись)
   if (n != cur_) {
     cur_ = n;
-    emitTrackFolder();
+    emitTrackInfo();  // TRACK, FOLDER, META, TIME; STATE додасть менеджер
+  }
+  if (!media_.reader().open(path)) {
+    LOGW(TAG, "play: не відкрито #%u", (unsigned)n + 1);
+    return media_.mounted() ? Res::ReadFail : Res::NoMedia;
   }
   LOGI(TAG, "play #%u %s (%u Б)", (unsigned)n + 1, path, (unsigned)media_.reader().size());
   dec_.startSession();
@@ -235,9 +316,51 @@ Res SdSource::startTrack(uint16_t n) {
   return Res::Ok;
 }
 
+// Запуск треку з автопропуском: файл не відкрито → ERR,read_fail і наступний трек; kPlayErrStop підряд → stop.
+Res SdSource::playTrack(uint16_t n, char why) {
+  for (;;) {
+    note(why, n);
+    Res r = startTrack(n);
+    if (r != Res::ReadFail) return r;  // Ok / NoMedia / BadArg — нагору
+    if (!countFail(r)) return Res::Ok;  // ліміт: state=stop, ERR уже надіслано
+    n = nextIdx(n);
+    why = 'x';
+  }
+}
+
+// ERR + лічильник підряд-помилок. false = ліміт досягнуто → stop (STATE надішле менеджер).
+bool SdSource::countFail(Res r) {
+  Events::err(resCode(r), "play");
+  errRun_++;
+  if (errRun_ < kPlayErrStop) return true;
+  LOGW(TAG, "%u помилок підряд -> stop на #%u", (unsigned)errRun_, (unsigned)cur_ + 1);
+  st_ = PlayState::Stop;
+  return false;
+}
+
+// Помилка під час гри (сесія вже завершена, state=stop): ERR і перехід до наступного за списком (REP не враховується).
+void SdSource::onPlayError(Res r) {
+  if (countFail(r)) playTrack(nextIdx(cur_), 'x');
+}
+
+// Природний кінець треку (state вже stop, файл закрито): REP 0/1/2.
+void SdSource::onTrackEnd() {
+  uint16_t total = pl_.tracks();
+  if (!total) return;
+  if (rep_ == 1) {  // повтор поточного
+    playTrack(cur_, 'r');
+  } else if (rep_ == 2 || cur_ + 1 < total) {  // цикл списку / REP=0, не останній
+    playTrack(nextIdx(cur_), 'e');
+  } else {  // REP=0, кінець списку: stop, поточний = перший (PLAY почне спочатку)
+    note('z', 0);
+    st_ = PlayState::Stop;
+    setCur(0);
+  }
+}
+
 Res SdSource::play() {
-  if (st_ == PlayState::Scan) return Res::BadState;
-  if (st_ == PlayState::Idle) return media_.mounted() ? Res::BadState : Res::NoMedia;
+  Res r = ready();
+  if (r != Res::Ok) return r;
   if (st_ == PlayState::Play) return Res::Ok;
   if (st_ == PlayState::Pause) {  // позиція збережена: файл відкрито, задача чекає
     dec_.resume();                // розмʼют DAC зробить менеджер після повернення (задача його дочекається)
@@ -245,7 +368,8 @@ Res SdSource::play() {
     nextTimeAt_ = millis() + kTimeEventMs;
     return Res::Ok;
   }
-  return startTrack(cur_);        // Stop: поточний трек (на старті — перший)
+  errRun_ = 0;
+  return playTrack(cur_, 'p');    // Stop: поточний трек (на старті / після кінця списку — перший)
 }
 
 Res SdSource::pause() {
@@ -260,6 +384,7 @@ Res SdSource::pause() {
 
 Res SdSource::stop() {
   if (st_ == PlayState::Scan) return Res::BadState;
+  errRun_ = 0;
   if (st_ == PlayState::Play || st_ == PlayState::Pause) {
     endSession();
     st_ = PlayState::Stop;
@@ -269,22 +394,23 @@ Res SdSource::stop() {
 
 // Події задачі mp3 (кінець треку/помилка) і TIME раз на kTimeEventMs.
 void SdSource::pollPlayer(uint32_t now) {
+  if (st_ == PlayState::Play && errRun_ && dec_.posMs() >= kPlayOkMs) errRun_ = 0;  // новий трек відіграв ≥ 1 с
   Mp3Player::Ev ev = dec_.takeEvent();
   if (ev != Mp3Player::Ev::None) {
     if (media_.reader().isOpen()) media_.reader().close();
-    st_ = PlayState::Stop;  // менеджер у publish() замʼютить DAC і надішле STATE
+    st_ = PlayState::Stop;  // якщо далі не стартує інший трек, менеджер замʼютить DAC і надішле STATE
     switch (ev) {
       case Mp3Player::Ev::Eof:
         LOGI(TAG, "кінець треку #%u", (unsigned)cur_ + 1);
         onTrackEnd();
         break;
       case Mp3Player::Ev::ReadFail:
-        LOGW(TAG, "помилка читання під час відтворення");
-        Events::err(proto::errc::kReadFail, "play");
+        LOGW(TAG, "помилка читання під час відтворення #%u", (unsigned)cur_ + 1);
+        onPlayError(Res::ReadFail);
         break;
       default:
-        LOGW(TAG, "помилка декодування");
-        Events::err(proto::errc::kDecodeFail, "play");
+        LOGW(TAG, "помилка декодування #%u", (unsigned)cur_ + 1);
+        onPlayError(Res::DecodeFail);
         break;
     }
     return;
@@ -335,6 +461,7 @@ void SdSource::runDbg() {
     case Dbg::Read: dbgRead(); break;
     case Dbg::Play: dbgPlay(); job_ = Dbg::None; break;
     case Dbg::Decode: dbgDecode(); job_ = Dbg::None; break;
+    case Dbg::Nav: dbgNav(); job_ = Dbg::None; break;
     default: job_ = Dbg::None; break;
   }
 }
@@ -443,8 +570,36 @@ void SdSource::dbgPlay() {
     LOGW(TAG, "play: номер 1..%u", (unsigned)pl_.tracks());
     return;
   }
-  Res r = startTrack((uint16_t)(arg_ - 1));
+  errRun_ = 0;
+  Res r = playTrack((uint16_t)(arg_ - 1), 'd');
   if (r != Res::Ok) Events::err(resCode(r), "dbgplay");
+}
+
+// DBG,nav: стан навігації та історія переходів (лише лог).
+void SdSource::dbgNav() {
+  uint16_t total = pl_.tracks();
+  LOGI(TAG, "nav: state=%s rep=%u shuf=%d помилок підряд=%u (ліміт %u)", stateName(st_), (unsigned)rep_, shuf_ ? 1 : 0,
+       (unsigned)errRun_, (unsigned)kPlayErrStop);
+  if (!total) {
+    LOGI(TAG, "nav: плейлист порожній");
+  } else {
+    int f = pl_.folderOf(cur_);
+    unsigned first = pl_.folderFirst(f), cnt = pl_.folderTracks(f);
+    LOGI(TAG, "nav: поточний #%u/%u, папка %d діапазон %u..%u (%u тр.)", (unsigned)cur_ + 1, (unsigned)total, f, first + 1,
+         first + cnt, cnt);
+  }
+  char buf[kNavHist * 14 + 8];
+  size_t w = 0;
+  buf[0] = 0;
+  for (uint8_t k = 0; k < histCnt_; k++) {  // від найстарішого до найновішого
+    const Hist& h = hist_[(histHead_ + kNavHist - histCnt_ + k) % kNavHist];
+    int n = snprintf(buf + w, sizeof buf - w, " %c%u>%u", h.why, (unsigned)h.from + 1, (unsigned)h.to + 1);
+    if (n < 0 || (size_t)n >= sizeof buf - w) break;
+    w += (size_t)n;
+  }
+  LOGI(TAG, "nav: історія(%u):%s", (unsigned)histCnt_, histCnt_ ? buf : " порожньо");
+  LOGI(TAG, "nav: причини: N next, P prev, R перезапуск, F fnext, B fprev, p play");
+  LOGI(TAG, "nav: причини: e кінець->наступний, r repeat-1, z кінець списку, x пропуск помилки, d DBG,play");
 }
 
 void SdSource::dbgDecode() {

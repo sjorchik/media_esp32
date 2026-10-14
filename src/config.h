@@ -134,8 +134,12 @@ inline constexpr size_t   kMediaNameMax = 256;         // буфер імені 
 inline constexpr size_t   kScanPathMax = 256;          // буфер шляху під час скану
 inline constexpr uint32_t kScanSliceMs = 15;           // порція скану за ітерацію loopTask
 inline constexpr uint32_t kReadSliceMs = 15;           // порція DBG,sdread
-inline constexpr size_t   kSdReadBuf = 2048;           // (не використовується з M3b: DBG,sdread бере вхідний буфер PcmArena)
 inline constexpr size_t   kEvFolderNameMax = 48;       // макс. байтів назви папки в події FOLDER
+inline constexpr size_t   kEvMetaFieldMax = 96;        // макс. байтів назви в META (SD: імʼя файлу без .mp3)
+inline constexpr uint32_t kPrevRestartMs = 3000;       // PREV: позиція більша за це → перезапуск поточного треку
+inline constexpr uint8_t  kPlayErrStop = 3;            // помилок відтворення підряд → stop (M3c)
+inline constexpr uint32_t kPlayOkMs = 1000;            // трек відіграв стільки → лічильник помилок підряд скидається
+inline constexpr uint8_t  kNavHist = 8;                // глибина історії переходів (лише DBG,nav)
 inline constexpr int      kDbgListDefault = 20;        // DBG,list без аргументу
 
 // ---- Задачі ----
@@ -152,4 +156,5 @@ inline constexpr int kPrioDecoder = 5;   // нижче за audio (6), вище 
 
 // ---- Діагностика ----
 inline constexpr uint32_t kDiagPeriodMs = 60000;
+
 
