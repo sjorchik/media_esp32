@@ -194,7 +194,8 @@ void Mp3Player::runSession() {
   memset(&sx, 0, sizeof sx);
   memset(&S->dec, 0, sizeof S->dec);
   mp3dec_init(&S->dec);
-  Ev e = skipId3() ? decodeLoop() : Ev::ReadFail;
+  parseTags();  // теги на скретчі (вхідний буфер), далі файл знову з початку
+  Ev e = (rd_->seek(0) && skipId3()) ? decodeLoop() : Ev::ReadFail;
   if (e == Ev::Eof) drainSilence();
   finish(e);
 }
@@ -225,7 +226,21 @@ bool Mp3Player::fill() {
   return true;
 }
 
-// Лише пропуск ID3v2 за розміром (розбір тегів — окремий етап). false = помилка читання.
+// Розбір ID3 (M3d): вхідний буфер SdSet — скретч (decodeLoop його ще не використовує); результат — у tags_.
+void Mp3Player::parseTags() {
+  Id3::Tags t;  // стек задачі
+  Id3::Info inf;
+  int64_t t0 = esp_timer_get_time();
+  uint8_t mask = Id3::parse(*rd_, set()->in, kDecInBytes, t, &inf);
+  tagUs_ = (uint32_t)(esp_timer_get_time() - t0);
+  tagMask_ = mask;
+  tagVer_ = inf.ver;
+  memcpy(&tags_, &t, sizeof tags_);
+  __sync_synchronize();
+  tagSeq_ = tagSeq_ + 1;  // публікація: app бачить готові теги
+}
+
+// Лише пропуск ID3v2 за розміром (самі теги розбирає parseTags). false = помилка читання.
 bool Mp3Player::skipId3() {
   SdSet* S = set();
   for (int k = 0; k < 4; k++) {  // кілька тегів підряд трапляються рідко
@@ -427,3 +442,4 @@ Mp3Player::Ev Mp3Player::decodeLoop() {
     stats_.pcmBytes = (uint32_t)bytes;
   }
 }
+

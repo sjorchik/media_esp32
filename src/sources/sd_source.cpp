@@ -24,6 +24,19 @@ portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 
 inline bool due(uint32_t now, uint32_t t) { return (int32_t)(now - t) >= 0; }
 
+constexpr uint16_t kNoTag = 0xFFFF;
+
+// FNV-1a по трьох полях (роздільник 0x1F) — компактний відбиток надісланого META
+uint32_t metaHash(const char* a, const char* t, const char* al) {
+  uint32_t h = 2166136261u;
+  const char* f[3] = {a, t, al};
+  for (int k = 0; k < 3; k++) {
+    for (const uint8_t* p = (const uint8_t*)f[k]; *p; p++) h = (h ^ *p) * 16777619u;
+    h = (h ^ 0x1Fu) * 16777619u;
+  }
+  return h;
+}
+
 const char* scanStName(Scanner::St s) {
   switch (s) {
     case Scanner::St::Running: return "running";
@@ -116,6 +129,7 @@ void SdSource::stopJobs() {
   rdOpen_ = false;
   job_ = Dbg::None;
   errRun_ = 0;
+  tagTrack_ = kNoTag;  // плейлист міг змінитись
 }
 
 void SdSource::endSession() {
@@ -124,6 +138,7 @@ void SdSource::endSession() {
     dec_.stopSession();
   }
   dec_.takeEvent();
+  takeTags(false);  // розбір міг завершитись між опитуваннями; cur_ ще відповідає сесії
   if (media_.reader().isOpen()) media_.reader().close();
 }
 
@@ -138,6 +153,7 @@ void SdSource::startScan() {
   st_ = PlayState::Scan;
   scanned_ = true;
   cur_ = 0;
+  tagTrack_ = kNoTag;
   errRun_ = 0;
   scanner_.start(media_, pl_);
   LOGI(TAG, "скан розпочато");
@@ -193,12 +209,48 @@ void SdSource::emitFolder() {
   Events::folder(nm, f >= 0 ? pl_.folderTracks(f) : 0);
 }
 
-// META одразу з відомим: виконавець і альбом порожні, назва = імʼя файлу без .mp3 (теги — M3d)
+// Найкраще відоме: теги, якщо вони розібрані саме для cur_; порожня назва → імʼя файлу без .mp3.
+void SdSource::buildMeta(char* a, char* t, char* al) {
+  a[0] = t[0] = al[0] = 0;
+  if (tagTrack_ == cur_) {
+    const Id3::Tags& g = dec_.tags();
+    memcpy(a, g.artist, kEvMetaFieldMax + 1);
+    memcpy(t, g.title, kEvMetaFieldMax + 1);
+    memcpy(al, g.album, kEvMetaFieldMax + 1);
+    a[kEvMetaFieldMax] = t[kEvMetaFieldMax] = al[kEvMetaFieldMax] = 0;
+  }
+  if (!t[0]) {
+    char full[kMediaNameMax];
+    if (pl_.trackName(cur_, full, sizeof full)) Utf8::copySafe(t, kEvMetaFieldMax + 1, full);
+  }
+}
+
+// META одразу з відомим (при зміні треку — імʼя файлу; GET/HELLO — уже розібрані теги)
 void SdSource::emitMeta() {
-  char full[kMediaNameMax];
-  char title[kEvMetaFieldMax + 1] = {0};
-  if (pl_.trackName(cur_, full, sizeof full)) Utf8::copySafe(title, sizeof title, full);
-  Events::meta("", title, "");
+  char a[kEvMetaFieldMax + 1], t[kEvMetaFieldMax + 1], al[kEvMetaFieldMax + 1];
+  buildMeta(a, t, al);
+  shownHash_ = metaHash(a, t, al);
+  Events::meta(a, t, al);
+}
+
+void SdSource::pushMeta() {
+  char a[kEvMetaFieldMax + 1], t[kEvMetaFieldMax + 1], al[kEvMetaFieldMax + 1];
+  buildMeta(a, t, al);
+  uint32_t h = metaHash(a, t, al);
+  if (h == shownHash_) return;  // нічого нового
+  shownHash_ = h;
+  Events::meta(a, t, al);
+}
+
+// Результат розбору тегів сесії (задача mp3 підняла tagSeq): привʼязуємо до cur_ і, якщо треба, шлемо повторний META.
+void SdSource::takeTags(bool emit) {
+  uint32_t seq = dec_.tagSeq();
+  if (seq == tagSeqSeen_) return;
+  tagSeqSeen_ = seq;
+  tagTrack_ = cur_;
+  LOGI(TAG, "теги #%u: v1=%d v2=%u за %u мкс", (unsigned)cur_ + 1, (dec_.tagMask() & Id3::kFoundV1) ? 1 : 0,
+       (unsigned)dec_.tagVer(), (unsigned)dec_.tagUs());
+  if (emit) pushMeta();
 }
 
 // Порядок за контрактом: TRACK, FOLDER, META, TIME (STATE додасть менеджер, якщо стан змінився)
@@ -211,7 +263,10 @@ void SdSource::emitTrackInfo() {
 
 void SdSource::emitInfo() {
   if (!active_ || !pl_.tracks()) return;
-  if (st_ == PlayState::Stop || st_ == PlayState::Play || st_ == PlayState::Pause) emitTrackInfo();
+  if (st_ == PlayState::Stop || st_ == PlayState::Play || st_ == PlayState::Pause) {
+    takeTags(false);  // віддаємо вже розібрані теги
+    emitTrackInfo();
+  }
 }
 
 // Нова поточна позиція без запуску. Зміна треку → події; той самий трек → лише TIME (позиція скинута).
@@ -388,12 +443,14 @@ Res SdSource::stop() {
   if (st_ == PlayState::Play || st_ == PlayState::Pause) {
     endSession();
     st_ = PlayState::Stop;
+    pushMeta();  // теги, розібрані до зупинки, але ще не надіслані
   }
   return Res::Ok;
 }
 
 // Події задачі mp3 (кінець треку/помилка) і TIME раз на kTimeEventMs.
 void SdSource::pollPlayer(uint32_t now) {
+  takeTags(true);  // теги нового треку → повторний META (лише якщо змінився)
   if (st_ == PlayState::Play && errRun_ && dec_.posMs() >= kPlayOkMs) errRun_ = 0;  // новий трек відіграв ≥ 1 с
   Mp3Player::Ev ev = dec_.takeEvent();
   if (ev != Mp3Player::Ev::None) {
@@ -462,6 +519,7 @@ void SdSource::runDbg() {
     case Dbg::Play: dbgPlay(); job_ = Dbg::None; break;
     case Dbg::Decode: dbgDecode(); job_ = Dbg::None; break;
     case Dbg::Nav: dbgNav(); job_ = Dbg::None; break;
+    case Dbg::Tag: dbgTag(); job_ = Dbg::None; break;
     default: job_ = Dbg::None; break;
   }
 }
@@ -600,6 +658,47 @@ void SdSource::dbgNav() {
   LOGI(TAG, "nav: історія(%u):%s", (unsigned)histCnt_, histCnt_ ? buf : " порожньо");
   LOGI(TAG, "nav: причини: N next, P prev, R перезапуск, F fnext, B fprev, p play");
   LOGI(TAG, "nav: причини: e кінець->наступний, r repeat-1, z кінець списку, x пропуск помилки, d DBG,play");
+}
+
+// DBG,tag,<n>: розібрати теги треку n без відтворення (src=sd у stop; скретч — вхідний буфер області PCM).
+void SdSource::dbgTag() {
+  if (!active_ || st_ != PlayState::Stop || rdOpen_ || dec_.sessionActive()) {
+    LOGW(TAG, "tag: потрібен src=sd у стані stop (state=%s)", stateName(st_));
+    return;
+  }
+  if (arg_ < 1 || arg_ > (int)pl_.tracks()) {
+    LOGW(TAG, "tag: номер 1..%u", (unsigned)pl_.tracks());
+    return;
+  }
+  char path[kScanPathMax + kMediaNameMax + 8];
+  IFileReader& rd = media_.reader();
+  if (!pl_.trackPath((uint16_t)(arg_ - 1), path, sizeof path) || !rd.open(path)) {
+    LOGW(TAG, "tag: не відкрито #%d", arg_);
+    return;
+  }
+  size_t cap = 0;
+  uint8_t* buf = dec_.scratch(cap);
+  Id3::Tags t;
+  Id3::Info inf;
+  uint32_t t0 = micros();
+  uint8_t mask = Id3::parse(rd, buf, cap, t, &inf);
+  uint32_t us = micros() - t0;
+  bool failed = rd.failed();
+  rd.close();
+  LOGI(TAG, "tag #%d: v2=%u v1=%d, тег %u Б, кадрів %u, прочитано %u Б%s%s, розбір %u мкс", arg_, (unsigned)inf.ver,
+       (mask & Id3::kFoundV1) ? 1 : 0, (unsigned)inf.tagBytes, (unsigned)inf.frames, (unsigned)inf.readBytes,
+       inf.cut ? " (УРІЗАНО лімітом)" : "", failed ? " (ПОМИЛКА читання)" : "", (unsigned)us);
+  static const char* const kName[3] = {"artist", "title", "album"};
+  const char* val[3] = {t.artist, t.title, t.album};
+  for (int i = 0; i < 3; i++) {
+    const Id3::FieldInfo& f = inf.f[i];
+    char hex[kId3DbgRaw * 3 + 1];
+    size_t w = 0;
+    for (uint8_t k = 0; k < f.rawN; k++) w += (size_t)snprintf(hex + w, sizeof hex - w, "%02X ", (unsigned)f.raw[k]);
+    hex[w] = 0;
+    LOGI(TAG, "tag: %-6s src=v%u enc=%u raw=[%s] -> '%s'", kName[i], (unsigned)f.src, (unsigned)f.enc, hex, val[i]);
+  }
+  Diag::logHeap("tag");
 }
 
 void SdSource::dbgDecode() {

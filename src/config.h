@@ -152,6 +152,15 @@ inline constexpr uint32_t kPlayOkMs = 1000;            // трек відігр�
 inline constexpr uint8_t  kNavHist = 8;                // глибина історії переходів (лише DBG,nav)
 inline constexpr int      kDbgListDefault = 20;        // DBG,list без аргументу
 
+// ---- ID3-теги (M3d) ----
+inline constexpr size_t   kId3FrameBuf = kEvMetaFieldMax * 4;  // читається лише початок кадру (байт кодування + текст)
+inline constexpr size_t   kId3WinBytes = 512;          // вікно читання файлу (скретч: буфер кадру + вікно ≤ kDecInBytes)
+inline constexpr uint16_t kId3MaxFrames = 48;          // макс. переглянутих кадрів ID3v2
+inline constexpr uint32_t kId3MaxReadBytes = 32768;    // макс. байтів, реально прочитаних з носія при розборі v2 (великі кадри пропускаються seek'ом)
+inline constexpr uint8_t  kId3Cp1251Pct = 50;          // «схоже на cp1251»: частка байтів ≥0x80 серед не-пробільних, %
+inline constexpr bool     kId3C1ForcesCp1251 = true;   // наявність байтів 0x80..0x9F у Latin1-рядку → cp1251
+inline constexpr size_t   kId3DbgRaw = 12;             // скільки сирих байтів показує DBG,tag
+
 // ---- Задачі ----
 inline constexpr int kCoreProto = 0;
 inline constexpr int kCoreAudio = 1;

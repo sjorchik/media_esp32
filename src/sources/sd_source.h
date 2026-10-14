@@ -7,11 +7,11 @@
 #include "sources/isource.h"
 
 // SD-джерело: hot-plug, скан, плейлист (M3a); відтворення MP3 (M3b); навігація, repeat, події треку,
-// обробка помилок відтворення (M3c). Shuffle лише зберігається (логіка — M5a).
+// обробка помилок відтворення (M3c); ID3-теги в META (M3d). Shuffle лише зберігається (логіка — M5a).
 // Працює через IMedia&, тому про SD не знає. Усе (скан, DBG-завдання) виконується в задачі app порціями.
 class SdSource : public ISource {
  public:
-  enum class Dbg : uint8_t { None, Info, Scan, List, Read, Play, Decode, Nav };
+  enum class Dbg : uint8_t { None, Info, Scan, List, Read, Play, Decode, Nav, Tag };
 
   explicit SdSource(IMedia& media) : media_(media) {}
   SrcId id() const override { return SrcId::SD; }
@@ -57,6 +57,7 @@ class SdSource : public ISource {
   void dbgPlay();
   void dbgDecode();
   void dbgNav();
+  void dbgTag();
   // відтворення
   Res startTrack(uint16_t n);              // відкриває файл, запускає сесію; state=play; повертає ReadFail, якщо не відкрито
   Res playTrack(uint16_t n, char why);     // startTrack з автопропуском битих (ERR + наступний; 3 підряд → stop)
@@ -77,6 +78,10 @@ class SdSource : public ISource {
   void emitTrackInfo();                    // TRACK, FOLDER, META, TIME
   void emitFolder();
   void emitMeta();
+  // теги (M3d)
+  void takeTags(bool emit);                // забрати результат розбору сесії; emit — надіслати повторний META, якщо змінився
+  void buildMeta(char* a, char* t, char* al);  // найкраще відоме: теги (якщо для cur_) або імʼя файлу; буфери kEvMetaFieldMax+1
+  void pushMeta();                         // META лише якщо відрізняється від уже показаного
 
   IMedia& media_;
   Playlist pl_;
@@ -90,6 +95,9 @@ class SdSource : public ISource {
   uint8_t errRun_ = 0;                     // помилок відтворення підряд
   Mp3Player dec_;
   uint32_t nextTimeAt_ = 0, infoSeq_ = 0;
+  uint16_t tagTrack_ = 0xFFFF;             // для якого треку чинні dec_.tags() (0xFFFF = ні)
+  uint32_t tagSeqSeen_ = 0;                // останній забраний dec_.tagSeq()
+  uint32_t shownHash_ = 0;                 // хеш META, надісланого останнім (для порівняння «змінилось»)
 
   Hist hist_[kNavHist] = {};
   uint8_t histHead_ = 0, histCnt_ = 0;
@@ -103,3 +111,4 @@ class SdSource : public ISource {
   bool rdOpen_ = false;
   uint32_t rdBytes_ = 0, rdBusyUs_ = 0, rdT0_ = 0;
 };
+

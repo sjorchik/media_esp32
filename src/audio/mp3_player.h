@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "media/id3.h"
 #include "media/ifile_reader.h"
 
 class AudioOut;
@@ -43,7 +44,15 @@ class Mp3Player {
   bool durEstimated() const { return durEst_; }   // true: за бітрейтом, не з Xing/VBRI
   uint32_t infoSeq() const { return infoSeq_; }   // змінюється, коли зʼявилась тривалість
   void stats(Mp3Stats& o) const;
-  uint8_t* scratch(size_t& cap);      // вхідний буфер області для DBG,sdread (лише коли немає сесії)
+  uint8_t* scratch(size_t& cap);      // вхідний буфер області для DBG,sdread/DBG,tag (лише коли немає сесії)
+
+  // Теги (M3d): задача mp3 розбирає їх на старті сесії (до першого кадру) і піднімає tagSeq.
+  // Після зміни tagSeq app читає tags() доти, доки не стартує наступна сесія.
+  uint32_t tagSeq() const { return tagSeq_; }
+  const Id3::Tags& tags() const { return tags_; }
+  uint32_t tagUs() const { return tagUs_; }       // час розбору, мкс
+  uint8_t tagMask() const { return tagMask_; }    // Id3::kFoundV2 | kFoundV1
+  uint8_t tagVer() const { return tagVer_; }      // версія ID3v2 або 0
 
  private:
   static void taskEntry(void* self);
@@ -52,6 +61,7 @@ class Mp3Player {
   Ev decodeLoop();
   bool fill();
   bool skipId3();
+  void parseTags();
   bool waitUnmuted();
   bool parkPaused();
   void writePcm(size_t bytes);
@@ -67,4 +77,8 @@ class Mp3Player {
   volatile uint32_t posMs_ = 0, durMs_ = 0, infoSeq_ = 0;
   volatile bool durEst_ = false;
   Mp3Stats stats_{};
+  Id3::Tags tags_{};                         // ≈ 291 Б; копіюється з локальної структури в стеку задачі
+  volatile uint32_t tagSeq_ = 0, tagUs_ = 0;
+  volatile uint8_t tagMask_ = 0, tagVer_ = 0;
 };
+

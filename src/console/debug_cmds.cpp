@@ -33,6 +33,7 @@ void help() {
   LOGI(TAG, "DBG,sd — присутність, SPI, тип/FS/обсяг | DBG,scan — підсумок останнього скану");
   LOGI(TAG, "DBG,list[,N] — перші N рядків плейлиста (типово %d, 0 = усі) | DBG,sdread,<n> — прочитати трек №n (як у list), КБ/с", kDbgListDefault);
   LOGI(TAG, "DBG,play,<n> — відтворити трек №n (як у list; потрібен src=sd) | DBG,decode — статистика декодера, буфери, heap");
+  LOGI(TAG, "DBG,tag,<n> — розібрати ID3 треку №n без відтворення (src=sd, stop): версія, кодування, hex, UTF-8, час");
   LOGI(TAG, "DBG,nav — індекс, папка/діапазон, repeat, shuffle, помилки підряд, історія переходів");
   LOGI(TAG, "DBG,link[,reset] — втрати черг, злиті TIME, час відправки кадру (UART1+дзеркало)");
 }
@@ -83,18 +84,19 @@ void DebugCmds::handle(const proto::Msg& m) {
     else LOGW(TAG, "DBG,bt[,pair|forget|reset]");
   } else if (!strcasecmp(c, "sd") || !strcasecmp(c, "scan") || !strcasecmp(c, "list") || !strcasecmp(c, "sdread") ||
              !strcasecmp(c, "play") || !strcasecmp(c, "decode") ||
-             !strcasecmp(c, "nav")) {
+             !strcasecmp(c, "nav") || !strcasecmp(c, "tag")) {
     SdSource::Dbg k = !strcasecmp(c, "sd") ? SdSource::Dbg::Info : !strcasecmp(c, "scan") ? SdSource::Dbg::Scan
                       : !strcasecmp(c, "list") ? SdSource::Dbg::List : !strcasecmp(c, "play") ? SdSource::Dbg::Play
                       : !strcasecmp(c, "decode") ? SdSource::Dbg::Decode
-                      : !strcasecmp(c, "nav") ? SdSource::Dbg::Nav : SdSource::Dbg::Read;
+                      : !strcasecmp(c, "nav") ? SdSource::Dbg::Nav
+                      : !strcasecmp(c, "tag") ? SdSource::Dbg::Tag : SdSource::Dbg::Read;
     long n = (k == SdSource::Dbg::List) ? kDbgListDefault : 0;
     if (k == SdSource::Dbg::List && m.argc >= 2 && (!toInt(m.args[1], n) || n < 0 || n > 65535)) {
       LOGW(TAG, "DBG,list[,0..65535]");
       return;
     }
-    if ((k == SdSource::Dbg::Read || k == SdSource::Dbg::Play) && (m.argc != 2 || !toInt(m.args[1], n) || n < 1 || n > 65535)) {
-      LOGW(TAG, "DBG,%s,<n> (n ≥ 1, номер із DBG,list)", k == SdSource::Dbg::Play ? "play" : "sdread");
+    if ((k == SdSource::Dbg::Read || k == SdSource::Dbg::Play || k == SdSource::Dbg::Tag) && (m.argc != 2 || !toInt(m.args[1], n) || n < 1 || n > 65535)) {
+      LOGW(TAG, "DBG,%s,<n> (n ≥ 1, номер із DBG,list)", k == SdSource::Dbg::Play ? "play" : k == SdSource::Dbg::Tag ? "tag" : "sdread");
       return;
     }
     if (!g_sd.dbg(k, (int)n)) LOGW(TAG, "SD: попередня DBG-команда ще виконується");
@@ -112,5 +114,6 @@ void DebugCmds::handle(const proto::Msg& m) {
     LOGW(TAG, "невідома DBG-команда '%s' (DBG,help)", c);
   }
 }
+
 
 
