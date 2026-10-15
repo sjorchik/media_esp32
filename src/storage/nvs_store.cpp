@@ -20,6 +20,11 @@ bool NvsStore::begin() {
   s_mtx = xSemaphoreCreateMutex();
   s_ok = s_p.begin("media", false);
   if (!s_ok) LOGE("nvs", "не вдалося відкрити NVS");
+  // M5c6: застарілий ключ last_src (u8) від попередньої версії; M5b2 його не читає. Стираємо один раз.
+  if (s_ok && s_p.isKey("last_src")) {
+    const bool ok = s_p.remove("last_src");
+    LOGI("nvs", "застарілий ключ last_src стерто: %s", ok ? "ок" : "помилка");
+  }
   return s_ok;
 }
 
@@ -85,3 +90,4 @@ bool NvsStore::remove(const char* key) {
   if (!s_ok) return false;
   return !s_p.isKey(key) || s_p.remove(key);
 }
+

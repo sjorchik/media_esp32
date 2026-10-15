@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """M5c1: серія «DBG,failnext,1[,decode] + NEXT» через UART0 (pyserial). Лише перевірка на залізі, у збірку не входить.
 Використання: python tools/m5c1_series.py COM5 [серій=20] [read|decode]
-Після серії друкує DBG,aout / decode / tasks / heap; увесь лог — у m5c1_series.log."""
+Після серії друкує DBG,aout / decode / tasks / heap; увесь лог — у m5c1_series.log.
+ПОТРІБНЕ СЕРЕДОВИЩЕ: esp32dev_test (збірка з -DSKIP_TEST_CMDS=1). В esp32dev DBG,failnext відповідає «вимкнено».
+Потрібен pyserial: pip install pyserial"""
 import sys
 import time
 
@@ -48,3 +50,4 @@ for cmd in ("DBG,aout", "DBG,decode", "DBG,tasks", "DBG,heap"):
     send(cmd)
     for s in drain(1.5):
         print(s)
+

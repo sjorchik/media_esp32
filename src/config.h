@@ -187,12 +187,12 @@ inline constexpr uint32_t kResumeTailGuard = 4096;     // зсув ближче 
 inline constexpr uint8_t  kCrashLoopMax = 3;           // аварійних перезапусків підряд → режим захисту на цей запуск
 inline constexpr uint32_t kBootStableMs = 60000;       // безперервна робота, після якої лічильник аварій → 0
 #ifndef BOOT_TEST_CMDS
-#define BOOT_TEST_CMDS 1       // 1: DBG,boot,crash (abort) і DBG,boot,set,<n> для перевірки на залізі; у релізі — 0
+#define BOOT_TEST_CMDS 0       // 1: DBG,boot,crash (abort) і DBG,boot,set,<n> для перевірки на залізі; типово 0 (реліз), тести — env esp32dev_test
 #endif
 
 // ---- Зависання AudioOut після автопропуску треку (M5c1) ----
 #ifndef SKIP_TEST_CMDS
-#define SKIP_TEST_CMDS 1       // 1: DBG,failnext,<n>[,read|decode] — штучні збої старту треку (перевірка автопропуску); у релізі — 0
+#define SKIP_TEST_CMDS 0       // 1: DBG,failnext,<n>[,read|decode], DBG,media,ins|rem — штучні збої (перевірка автопропуску, hot-plug); типово 0 (реліз), тести — env esp32dev_test
 #endif
 #ifndef ALWAYS_MUTE_ON_TRACK_START
 #define ALWAYS_MUTE_ON_TRACK_START 1   // 1: обхід M3c (мʼют на старті кожного треку); 0: діагностична збірка (-DALWAYS_MUTE_ON_TRACK_START=0)
@@ -214,3 +214,4 @@ inline constexpr int kPrioDecoder = 5;   // нижче за audio (6), вище 
 
 // ---- Діагностика ----
 inline constexpr uint32_t kDiagPeriodMs = 60000;
+

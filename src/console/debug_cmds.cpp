@@ -159,6 +159,10 @@ void DebugCmds::handle(const proto::Msg& m) {
         LOGI(TAG, "media: імітація %s поставлена (виконає app через SdMedia::poll)", ins ? "ins" : "rem");
       else LOGW(TAG, "media: попередня імітація ще не виконана");
 #endif
+#if !SKIP_TEST_CMDS
+    } else if (m.argc == 2 && (!strcasecmp(m.args[1], "ins") || !strcasecmp(m.args[1], "rem"))) {
+      LOGW(TAG, "DBG,media,ins|rem вимкнено (SKIP_TEST_CMDS=0)");
+#endif
     } else {
 #if SKIP_TEST_CMDS
       LOGW(TAG, "DBG,media | DBG,media,ins|rem");
@@ -253,6 +257,12 @@ void DebugCmds::handle(const proto::Msg& m) {
       arg = (uint8_t)n;
 #endif
     }
+#if !BOOT_TEST_CMDS
+    if (isBoot && m.argc >= 2 && (!strcasecmp(m.args[1], "crash") || !strcasecmp(m.args[1], "set"))) {
+      LOGW(TAG, "DBG,boot,crash|set вимкнено (BOOT_TEST_CMDS=0)");
+      return;
+    }
+#endif
     if (!ok) {
       if (isBoot) LOGW(TAG, "DBG,boot[,clear|crash|set,<0..255>]");
       else LOGW(TAG, "DBG,settings[,clear]");
@@ -273,3 +283,4 @@ void DebugCmds::handle(const proto::Msg& m) {
     LOGW(TAG, "невідома DBG-команда '%s' (DBG,help)", c);
   }
 }
+
