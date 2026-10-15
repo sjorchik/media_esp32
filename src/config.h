@@ -173,6 +173,13 @@ inline constexpr uint32_t kResumeSaveMs = 10000;       // період запи�
 inline constexpr uint32_t kResumeMinStepBytes = 128;   // періодичний запис лише якщо зсув змінився ≥ цього (≈ один кадр MP3)
 inline constexpr uint32_t kResumeTailGuard = 4096;     // зсув ближче до кінця файлу ігнорується (трек з початку)
 
+// ---- Налаштування й захист від петлі аварій (M5b2) ----
+inline constexpr uint8_t  kCrashLoopMax = 3;           // аварійних перезапусків підряд → режим захисту на цей запуск
+inline constexpr uint32_t kBootStableMs = 60000;       // безперервна робота, після якої лічильник аварій → 0
+#ifndef BOOT_TEST_CMDS
+#define BOOT_TEST_CMDS 1       // 1: DBG,boot,crash (abort) і DBG,boot,set,<n> для перевірки на залізі; у релізі — 0
+#endif
+
 // ---- Задачі ----
 inline constexpr int kCoreProto = 0;
 inline constexpr int kCoreAudio = 1;
@@ -187,3 +194,4 @@ inline constexpr int kPrioDecoder = 5;   // нижче за audio (6), вище 
 
 // ---- Діагностика ----
 inline constexpr uint32_t kDiagPeriodMs = 60000;
+

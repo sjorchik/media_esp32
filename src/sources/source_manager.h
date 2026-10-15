@@ -25,6 +25,7 @@ class SourceManager {
   void publish(bool force);          // STATE при зміні + політика мʼюту DAC
   void emitErr(Res r, const char* detail);
   void saveLast(SrcId id);
+  void persist();                    // set_v1: last_src + shuf + rep (лише якщо змінилось)
 
   AudioOut* audio_ = nullptr;
   ISource* src_[4] = {nullptr, nullptr, nullptr, nullptr};

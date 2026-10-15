@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "storage/boot_guard_store.h"
 #include "storage/nvs_store.h"
 #include "util/log.h"
 
@@ -27,6 +28,10 @@ const char* ResumeStore::key(Src s) { return kKeys[ix(s)]; }
 ResumeStore::Load ResumeStore::load(Src s, Resume::Record& r, Resume::ParseErr* why) {
   const int i = ix(s);
   if (why) *why = Resume::ParseErr::Ok;
+  if (BootGuard::protect()) {  // режим захисту від петлі аварій (M5b2): резюме не читаємо
+    s_have[i] = false;
+    return Load::None;
+  }
   size_t n = NvsStore::blobLen(kKeys[i]);
   if (n == 0) {
     s_have[i] = false;
@@ -73,3 +78,4 @@ bool ResumeStore::erase(Src s) {
   if (!ok) LOGW(TAG, "%s: не вдалося стерти", kKeys[i]);
   return ok;
 }
+

@@ -14,7 +14,9 @@
 #include "proto/link.h"
 #include "sources/sd_source.h"
 #include "sources/stub_source.h"
+#include "storage/boot_guard_store.h"
 #include "storage/nvs_store.h"
+#include "storage/storage_dbg.h"
 #include "util/diag.h"
 #include "util/log.h"
 
@@ -43,6 +45,7 @@ void setup() {
 
   Diag::registerTask("app", xTaskGetCurrentTaskHandle());
   NvsStore::begin();
+  BootGuard::init();  // захист від петлі аварій: до будь-якого відновлення резюме
   DeviceState::init();
   g_audio.begin();
 
@@ -60,7 +63,7 @@ void setup() {
   Diag::logHeap("boot");
   Diag::logTasks();
 #if AUTO_RESUME_SOURCE
-  g_sources.resumeLast();
+  g_sources.resumeLast();  // у режимі захисту ігнорується всередині
 #endif
 }
 
@@ -73,5 +76,8 @@ void loop() {
   }
   uint32_t now = millis();
   g_sources.loop(now);
+  BootGuard::tick(now);      // через kBootStableMs лічильник аварій → 0
+  StorageDbg::service();     // DBG boot/settings виконує loopTask
   Diag::tick(now);
 }
+

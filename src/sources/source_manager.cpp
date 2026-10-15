@@ -2,13 +2,13 @@
 
 #include "core/device_state.h"
 #include "core/events.h"
-#include "storage/nvs_store.h"
+#include "storage/boot_guard_store.h"
+#include "storage/settings_store.h"
 #include "util/diag.h"
 #include "util/log.h"
 
 namespace {
 constexpr const char* TAG = "src";
-constexpr const char* kKeyLast = "last_src";
 }  // namespace
 
 void SourceManager::begin(AudioOut* audio, ISource* bt, ISource* sd, ISource* usb) {
@@ -17,9 +17,14 @@ void SourceManager::begin(AudioOut* audio, ISource* bt, ISource* sd, ISource* us
   src_[(int)SrcId::SD] = sd;
   src_[(int)SrcId::USB] = usb;
   for (int i = 1; i <= 3; i++) src_[i]->begin();
-  uint8_t v = 0;
-  if (NvsStore::getU8(kKeyLast, v) && v >= 1 && v <= 3) lastSaved_ = v;
-  LOGI(TAG, "старт: src=off, останнє джерело в NVS: %s", srcName((SrcId)lastSaved_));
+  Settings::Record st = {};
+  if (SettingsStore::load(st) == SettingsStore::Load::Ok) {  // Bad/None → значення за замовчуванням (лог у сховищі)
+    lastSaved_ = st.lastSrc;
+    shuf_ = st.shuf != 0;
+    rep_ = st.rep;  // STATE із ними піде першим publish() після READY (pubShuf_/pubRep_ ще за замовчуванням)
+  }
+  LOGI(TAG, "старт: src=off, shuf=%d rep=%u, останнє джерело в NVS: %s", shuf_ ? 1 : 0, (unsigned)rep_,
+       srcName((SrcId)lastSaved_));
 }
 
 PlayState SourceManager::state() const {
@@ -28,12 +33,17 @@ PlayState SourceManager::state() const {
 }
 
 void SourceManager::saveLast(SrcId id) {
-  if ((uint8_t)id == lastSaved_) return;  // не гаяти флеш без потреби
   lastSaved_ = (uint8_t)id;
-  NvsStore::putU8(kKeyLast, lastSaved_);
+  persist();
 }
 
+void SourceManager::persist() { SettingsStore::save(lastSaved_, shuf_ ? 1 : 0, rep_); }  // не змінилось → флеш не чіпаємо
+
 void SourceManager::resumeLast() {
+  if (BootGuard::protect()) {  // попередження вже виведено в BootGuard::init()
+    LOGI(TAG, "AUTO_RESUME_SOURCE пропущено (режим захисту)");
+    return;
+  }
   if (lastSaved_ >= 1 && lastSaved_ <= 3) select((SrcId)lastSaved_);
 }
 
@@ -62,7 +72,7 @@ Res SourceManager::select(SrcId id) {
   } else {
     LOGI(TAG, "src=off: DAC замʼючено");
   }
-  if (id != SrcId::Off) saveLast(id);
+  if (id != SrcId::Off && (r == Res::Ok || r == Res::NoMedia)) saveLast(id);  // NoMedia: джерело лишається активним
   Diag::logHeap("src");
   Diag::logTasks();
   publish(false);
@@ -123,11 +133,13 @@ void SourceManager::handle(const Cmd& c) {
     case CmdId::Shuf:
       shuf_ = c.arg != 0;
       for (int i = 1; i <= 3; i++) src_[i]->setShuffle(shuf_);
+      persist();
       publish(false);
       return;
     case CmdId::Rep:
       rep_ = (uint8_t)c.arg;
       for (int i = 1; i <= 3; i++) src_[i]->setRepeat(rep_);
+      persist();
       publish(false);
       return;
     case CmdId::DbgMedia:

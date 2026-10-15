@@ -8,6 +8,7 @@
 #include "core/device_state.h"
 #include "core/router.h"
 #include "proto/link.h"
+#include "storage/storage_dbg.h"
 #include "util/diag.h"
 #include "util/log.h"
 
@@ -37,6 +38,11 @@ void help() {
   LOGI(TAG, "DBG,nav — індекс, папка/діапазон, repeat, shuffle, помилки підряд, історія переходів");
   LOGI(TAG, "DBG,shuf — shuffle: режим, коло k/N, початок перестановки, хвіст історії, якість esp_random() | DBG,shuftest — самоперевірка рушія (OK/FAIL)");
   LOGI(TAG, "DBG,resume — що збережено в NVS для активного SD (шлях, зсув, мс, CRC) і що знайдено в плейлисті | DBG,resume,clear — стерти запис");
+  LOGI(TAG, "DBG,boot — причина перезапуску, аварійний?, лічильник, режим захисту, AUTO_RESUME_SOURCE | DBG,boot,clear — скинути лічильник");
+#if BOOT_TEST_CMDS
+  LOGI(TAG, "DBG,boot,crash — abort() (тест аварії) | DBG,boot,set,<0..255> — виставити лічильник (тест)");
+#endif
+  LOGI(TAG, "DBG,settings — збережені last_src/shuf/rep (CRC) | DBG,settings,clear — стерти set_v1");
   LOGI(TAG, "DBG,link[,reset] — втрати черг, злиті TIME, час відправки кадру (UART1+дзеркало)");
 }
 
@@ -111,6 +117,32 @@ void DebugCmds::handle(const proto::Msg& m) {
       return;
     }
     if (!g_sd.dbg(clear ? SdSource::Dbg::ResumeClear : SdSource::Dbg::Resume, 0)) LOGW(TAG, "SD: попередня DBG-команда ще виконується");
+  } else if (!strcasecmp(c, "boot") || !strcasecmp(c, "settings")) {
+    // NVS пише лише loopTask: консоль ставить запит у скриньку (storage_dbg)
+    const bool isBoot = !strcasecmp(c, "boot");
+    StorageDbg::Req req = isBoot ? StorageDbg::Req::Boot : StorageDbg::Req::Settings;
+    uint8_t arg = 0;
+    bool ok = m.argc == 1;
+    if (m.argc == 2 && !strcasecmp(m.args[1], "clear")) {
+      req = isBoot ? StorageDbg::Req::BootClear : StorageDbg::Req::SettingsClear;
+      ok = true;
+#if BOOT_TEST_CMDS
+    } else if (isBoot && m.argc == 2 && !strcasecmp(m.args[1], "crash")) {
+      req = StorageDbg::Req::BootCrash;
+      ok = true;
+    } else if (isBoot && m.argc == 3 && !strcasecmp(m.args[1], "set")) {
+      long n = 0;
+      ok = toInt(m.args[2], n) && n >= 0 && n <= 255;
+      req = StorageDbg::Req::BootSet;
+      arg = (uint8_t)n;
+#endif
+    }
+    if (!ok) {
+      if (isBoot) LOGW(TAG, "DBG,boot[,clear|crash|set,<0..255>]");
+      else LOGW(TAG, "DBG,settings[,clear]");
+      return;
+    }
+    if (!StorageDbg::post(req, arg)) LOGW(TAG, "попередня DBG-команда сховища ще виконується");
   } else if (!strcasecmp(c, "link")) {
     if (m.argc >= 2 && !strcasecmp(m.args[1], "reset")) {
       Link::resetTxStats();
@@ -125,3 +157,4 @@ void DebugCmds::handle(const proto::Msg& m) {
     LOGW(TAG, "невідома DBG-команда '%s' (DBG,help)", c);
   }
 }
+
