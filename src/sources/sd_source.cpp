@@ -61,7 +61,7 @@ bool SdSource::begin() {
   dec_.init(g_audio, media_.reader());
   bool ok = media_.begin();
   media_.poll(millis());  // початковий mount; події не шлемо — MEDIA піде з HELLO/GET
-  DeviceState::setMedia(media_.mounted(), DeviceState::usb());
+  DeviceState::setSd(media_.mounted());  // M5c4b: usb не зберігаємо
   LOGI(TAG, "begin: картка %s", media_.mounted() ? "є" : "немає");
   return ok;
 }
@@ -134,7 +134,7 @@ void SdSource::onMedia(MediaEvent ev) {
     g_audio.mute();
     st_ = PlayState::Idle;
   }
-  DeviceState::setMedia(ins, DeviceState::usb());
+  DeviceState::setSd(ins);
   LOGI(TAG, "картку %s", ins ? "вставлено" : "вийнято");
   g_sources.onMediaChanged();  // MEDIA, refreshMedia() активного SD, STATE
   Diag::logHeap("sd-media");

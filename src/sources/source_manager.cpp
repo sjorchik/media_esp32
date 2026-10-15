@@ -9,6 +9,10 @@
 
 namespace {
 constexpr const char* TAG = "src";
+// M5c4b/Q7: носія для sd/usb немає (bt/off — не стосується)
+bool mediaMissing(SrcId id) {
+  return (id == SrcId::SD && !DeviceState::sd()) || (id == SrcId::USB && !DeviceState::usb());
+}
 }  // namespace
 
 void SourceManager::begin(AudioOut* audio, ISource* bt, ISource* sd, ISource* usb) {
@@ -52,6 +56,10 @@ void SourceManager::emitErr(Res r, const char* detail) { Events::err(resCode(r),
 Res SourceManager::select(SrcId id) {
   if (id == cur_) {  // ідемпотентно
     LOGI(TAG, "джерело %s вже активне", srcName(id));
+    if (mediaMissing(id)) {  // Q7: кожна команда без носія → ERR,no_media (STATE не дублюється)
+      emitErr(Res::NoMedia, nullptr);
+      return Res::NoMedia;
+    }
     return Res::Ok;
   }
   LOGI(TAG, "перемикання %s -> %s", srcName(cur_), srcName(id));

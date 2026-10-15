@@ -30,6 +30,12 @@ void DeviceState::setMedia(bool sd, bool usb) {
   portEXIT_CRITICAL(&s_mux);
 }
 
+void DeviceState::setSd(bool sd) {
+  portENTER_CRITICAL(&s_mux);
+  s_sd = sd;
+  portEXIT_CRITICAL(&s_mux);
+}
+
 bool DeviceState::btConnected() { return s_bt; }
 
 void DeviceState::btName(char* out, size_t cap) {

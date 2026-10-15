@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""M5c4: перевірка протоколу UART1 медіамодуля WROOM (контракт proto_ver=1) на залізі.
+"""M5c4/M5c4b: перевірка протоколу UART1 медіамодуля WROOM (контракт proto_ver=1) на залізі.
 
 Підключення: USB-UART адаптер (3,3 В) до UART1 модуля:
   адаптер TX -> GPIO32 (RX модуля), адаптер RX <- GPIO33 (TX модуля), спільна земля.
@@ -9,6 +9,7 @@ S3 має бути ВІДКЛЮЧЕНИЙ від GPIO32/33 (див. hwcheck_M5c4
 Запуск:  python tools/m5c4_frames.py COMx
 Скрипт шле кадри з правильною XOR-сумою й друкує PASS / FAIL / SKIP / INFO по кожному сценарію.
 Код виходу 0 — немає FAIL; 1 — є FAIL; 2 — не вдалось відкрити порт / не зайшла передумова.
+Ручні сценарії (src_sd_nomedia, src_sd_nomedia_repeat) потребують вийнятої картки SD, інакше SKIP.
 Звичайні сценарії (крім SKIP) залишають модуль у SRC,off із початковими shuf/rep.
 """
 import argparse
@@ -367,9 +368,19 @@ def sc_hello(ctx):
     return PASS, "HELLO,1 → READY(fw=%s,proto=1) + повний стан: %s" % (fr[0].args[0], fmt(fr[1:]))
 
 
-def sc_hello_mismatch(ctx):
+def sc_hello_wrong_ver(ctx):
+    """HELLO,2 (чужа proto_ver) → лише READY,<fw>,1: без STATE/MEDIA/BT і без ERR (Q2); HELLO,abc / HELLO, → bad_arg."""
     fr = cmd(ctx, "HELLO,2")
-    return INFO, "HELLO,2 (інша proto_ver) → %s; контракт мовчить про реакцію WROOM — відкрите питання в audit_M5c4.md" % fmt(fr)
+    ok, d = expect(fr, [("READY", [None, "1"])])
+    if not ok:
+        return FAIL, "HELLO,2: " + d
+    if not fr[0].args[0]:
+        return FAIL, "READY без версії прошивки"
+    for body in ("HELLO,abc", "HELLO,"):
+        ok2, d2 = expect(cmd(ctx, body), [("ERR", ["bad_arg", "HELLO"])])
+        if not ok2:
+            return FAIL, "%s: %s" % (body, d2)
+    return PASS, "HELLO,2 → лише READY(fw=%s,proto=1); HELLO,abc і HELLO, → ERR,bad_arg,HELLO" % fr[0].args[0]
 
 
 def sc_get(ctx):
@@ -386,11 +397,12 @@ def sc_get(ctx):
 
 
 def sc_media_usb(ctx):
+    """MEDIA usb=0 у збірці без CH376S (Q1; STUB_USB_PRESENT=0)."""
     exp = str(ctx.args.usb_expected)
     got = ctx.base.get("usb")
     if got == exp:
         return PASS, "MEDIA usb=%s (як очікувалось для збірки без CH376S)" % got
-    return FAIL, "MEDIA usb=%s, очікувалось %s: USB не змонтовано (ENABLE_USB_CH376=0), але подія каже інакше — відкрите питання (STUB_USB_PRESENT)" % (got, exp)
+    return FAIL, "MEDIA usb=%s, очікувалось %s (перевір STUB_USB_PRESENT=0 у config.h і що прошито нову збірку)" % (got, exp)
 
 
 def sc_src_off_idem(ctx):
@@ -401,10 +413,18 @@ def sc_src_off_idem(ctx):
 
 
 def sc_src_usb(ctx):
+    """SRC,usb без носія → STATE,usb,idle + ERR,no_media (Q1); повтор → лише ERR,no_media (Q7)."""
+    if ctx.base.get("usb") == "1":
+        return SKIP, "USB-носій змонтовано (збірка з CH376S?) — сценарій для usb=0"
     try:
         fr = cmd(ctx, "SRC,usb")
         ok, d = expect(fr, [("STATE", ["usb", "idle", ctx.base["shuf"], ctx.base["rep"]]), ("ERR", ["no_media"])])
-        return (PASS, "SRC,usb без носія → STATE,usb,idle + ERR,no_media") if ok else (FAIL, "SRC,usb: " + d + " (відкрите питання, див. audit)")
+        if not ok:
+            return FAIL, "SRC,usb: " + d
+        ok, d = expect(cmd(ctx, "SRC,usb"), [("ERR", ["no_media"])])
+        if not ok:
+            return FAIL, "повторне SRC,usb: " + d
+        return PASS, "SRC,usb без носія → STATE,usb,idle + ERR,no_media; повтор → лише ERR,no_media"
     finally:
         send(ctx, "SRC,off")
         settle(ctx, 1.0)
@@ -417,6 +437,25 @@ def sc_src_sd_nomedia(ctx):
         fr = cmd(ctx, "SRC,sd")
         ok, d = expect(fr, [("STATE", ["sd", "idle", ctx.base["shuf"], ctx.base["rep"]]), ("ERR", ["no_media"])])
         return (PASS, "SRC,sd без картки → STATE,sd,idle + ERR,no_media") if ok else (FAIL, "SRC,sd: " + d)
+    finally:
+        send(ctx, "SRC,off")
+        settle(ctx, 1.0)
+
+
+def sc_src_sd_nomedia_repeat(ctx):
+    """РУЧНИЙ, потребує вийнятої картки SD: двічі SRC,sd → двічі ERR,no_media, один STATE,sd,idle (Q7)."""
+    if ctx.base.get("sd") != "0":
+        return SKIP, "потребує вийнятої картки SD: витягніть її й запустіть: --only src_sd_nomedia_repeat"
+    try:
+        fr = cmd(ctx, "SRC,sd")
+        ok, d = expect(fr, [("STATE", ["sd", "idle", ctx.base["shuf"], ctx.base["rep"]]), ("ERR", ["no_media"])])
+        if not ok:
+            return FAIL, "1-ше SRC,sd: " + d
+        fr = cmd(ctx, "SRC,sd")
+        ok, d = expect(fr, [("ERR", ["no_media"])])
+        if not ok:
+            return FAIL, "2-ге SRC,sd (очікувався лише ERR,no_media, без повторного STATE): " + d
+        return PASS, "SRC,sd двічі без картки → ERR,no_media двічі, STATE,sd,idle один раз"
     finally:
         send(ctx, "SRC,off")
         settle(ctx, 1.0)
@@ -523,12 +562,13 @@ SCENARIOS = [
     ("not_implemented", sc_not_implemented),
     ("off_controls", sc_off_controls),
     ("hello", sc_hello),
-    ("hello_mismatch", sc_hello_mismatch),
+    ("hello_wrong_ver", sc_hello_wrong_ver),
     ("get", sc_get),
     ("media_usb", sc_media_usb),
     ("src_off_idem", sc_src_off_idem),
     ("src_usb", sc_src_usb),
     ("src_sd_nomedia", sc_src_sd_nomedia),
+    ("src_sd_nomedia_repeat", sc_src_sd_nomedia_repeat),
     ("shuf_rep", sc_shuf_rep),
     ("meta_escape", sc_meta_escape),
     ("final", sc_final),

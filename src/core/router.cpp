@@ -79,8 +79,13 @@ void Router::dispatch(char* body, Origin o) {
     case CmdId::Hb:
       return;  // лише ознака живості (час останнього валідного кадру оновлює link)
     case CmdId::Hello:
-      if (!parseInt(m.args[0], v) || v != kProtoVer) {
-        Events::err(proto::errc::kBadArg, "proto");  // без іншої реакції
+      if (!parseInt(m.args[0], v)) {  // нечислова / порожня версія
+        Events::err(proto::errc::kBadArg, d->name);
+        return;
+      }
+      if (v != kProtoVer) {  // M5c4b/Q2: чужа версія — лише READY (S3 бачить proto у READY); без стану й ERR
+        LOGW(TAG, "HELLO,%ld: proto_ver не збігається (наша %d), лише READY", v, kProtoVer);
+        Events::ready();
         return;
       }
       c.arg = (int16_t)v;

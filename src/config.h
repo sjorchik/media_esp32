@@ -41,7 +41,7 @@ inline constexpr int kProtoVer = 1;
 #define MIRROR_HB 0            // 1: дзеркалити HB в UART0
 #define RELEASE_BLE_MEM 1      // esp_bt_controller_mem_release(ESP_BT_MODE_BLE) на старті
 #define STUB_SD_PRESENT 0      // SD тепер справжній: старт без картки, далі hot-plug (SdMedia)
-#define STUB_USB_PRESENT 1
+#define STUB_USB_PRESENT 0     // M5c4b/Q1: без CH376S usb=0 (при ENABLE_USB_CH376=1 прапорець веде драйвер); 1 — лише імітація на стенді
 
 // ---- Консоль / лог (UART0) ----
 inline constexpr uint32_t kConsoleBaud = 460800;
