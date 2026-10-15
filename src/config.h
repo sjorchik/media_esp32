@@ -150,6 +150,13 @@ inline constexpr uint32_t kPrevRestartMs = 3000;       // PREV: позиція �
 inline constexpr uint8_t  kPlayErrStop = 3;            // помилок відтворення підряд → stop (M3c)
 inline constexpr uint32_t kPlayOkMs = 1000;            // трек відіграв стільки → лічильник помилок підряд скидається
 inline constexpr uint8_t  kNavHist = 8;                // глибина історії переходів (лише DBG,nav)
+inline constexpr uint16_t kHistLen = 32;               // кільце останніх відтворених треків (M5a), 2 Б на запис
+inline constexpr size_t   kPermBytesPerTrack = 2;      // перестановка shuffle (M5a): uint16_t на трек у вільному хвості арени
+inline constexpr uint16_t kShufTestMax = 256;          // DBG,shuftest: макс. N у самоперевірці (буфери на стеку)
+inline constexpr uint16_t kShufTestCircles = 20;       // DBG,shuftest: кіл на кожен розмір
+inline constexpr uint8_t  kDbgShufHead = 10;           // DBG,shuf: скільки елементів перестановки показувати
+inline constexpr uint8_t  kDbgHistTail = 8;            // DBG,shuf: скільки останніх записів історії показувати
+inline constexpr uint16_t kRngHealthSamples = 64;      // DBG,shuf: вибірка esp_random()
 inline constexpr int      kDbgListDefault = 20;        // DBG,list без аргументу
 
 // ---- ID3-теги (M3d) ----
@@ -175,3 +182,4 @@ inline constexpr int kPrioDecoder = 5;   // нижче за audio (6), вище 
 
 // ---- Діагностика ----
 inline constexpr uint32_t kDiagPeriodMs = 60000;
+

@@ -1,6 +1,7 @@
 #include "sources/sd_source.h"
 
 #include <Arduino.h>
+#include <esp_system.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -25,6 +26,8 @@ portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 inline bool due(uint32_t now, uint32_t t) { return (int32_t)(now - t) >= 0; }
 
 constexpr uint16_t kNoTag = 0xFFFF;
+
+uint32_t hwRand() { return esp_random(); }  // генератор для shuffle (у тестах на ПК — детермінований)
 
 // FNV-1a по трьох полях (роздільник 0x1F) — компактний відбиток надісланого META
 uint32_t metaHash(const char* a, const char* t, const char* al) {
@@ -52,6 +55,7 @@ const char* scanStName(Scanner::St s) {
 // ============================================================ життєвий цикл
 
 bool SdSource::begin() {
+  nav_.init(histBuf_, kHistLen, hwRand);
   dec_.init(g_audio, media_.reader());
   bool ok = media_.begin();
   media_.poll(millis());  // початковий mount; події не шлемо — MEDIA піде з HELLO/GET
@@ -130,6 +134,7 @@ void SdSource::stopJobs() {
   job_ = Dbg::None;
   errRun_ = 0;
   tagTrack_ = kNoTag;  // плейлист міг змінитись
+  nav_.detach();       // коло й історія недійсні разом із плейлистом
 }
 
 void SdSource::endSession() {
@@ -154,6 +159,7 @@ void SdSource::startScan() {
   scanned_ = true;
   cur_ = 0;
   tagTrack_ = kNoTag;
+  nav_.detach();  // перестановка живе в арені, яку скан перезаписує
   errRun_ = 0;
   scanner_.start(media_, pl_);
   LOGI(TAG, "скан розпочато");
@@ -186,7 +192,8 @@ void SdSource::finishScan(Scanner::St r) {
     Events::err(proto::errc::kNoMedia, "empty");  // носій є, але mp3 немає
     return;
   }
-  cur_ = 0;
+  nav_.attach(pl_.permBuf(), pl_.tracks());  // перестановка — у зарезервованому хвості арени
+  cur_ = nav_.initialTrack();                // shuffle: випадковий старт (M5b задасть явний), інакше перший
   st_ = PlayState::Stop;
   emitTrackInfo();  // TRACK, FOLDER, META, TIME; далі STATE,sd,stop від менеджера
   if (r == Scanner::St::Overflow) Events::err(kErrTooMany);
@@ -286,8 +293,6 @@ Res SdSource::ready() const {
   return Res::Ok;
 }
 
-uint16_t SdSource::nextIdx(uint16_t i) const { return (uint16_t)(i + 1 >= pl_.tracks() ? 0 : i + 1); }
-uint16_t SdSource::prevIdx(uint16_t i) const { return (uint16_t)(i == 0 ? pl_.tracks() - 1 : i - 1); }
 
 void SdSource::note(char why, uint16_t to) {
   hist_[histHead_] = Hist{cur_, to, why};
@@ -296,30 +301,36 @@ void SdSource::note(char why, uint16_t to) {
   LOGI(TAG, "перехід '%c': #%u -> #%u", why, (unsigned)cur_ + 1, (unsigned)to + 1);
 }
 
+// SHUF: звук не переривається. Увімкнення — поточний трек стає першим у колі й вважається зіграним;
+// до завершення скану лише запамʼятовується (старт підбере finishScan). Вимкнення — далі порядок каталогу від поточного.
+void SdSource::setShuffle(bool on) {
+  if (!nav_.setOn(on)) return;
+  LOGI(TAG, "shuffle %s", on ? "увімкнено" : "вимкнено");
+  if (on && active_ && (st_ == PlayState::Stop || st_ == PlayState::Play || st_ == PlayState::Pause)) nav_.startAt(cur_);
+}
+
 // NEXT/PREV/FNEXT/FPREV: циклічно; з stop/pause одразу починають відтворення. Ручна команда скидає лічильник помилок.
 Res SdSource::nav(Nav k) {
   Res r = ready();
   if (r != Res::Ok) return r;
   const uint16_t total = pl_.tracks();
-  uint16_t to = cur_;
-  char why = 'N';
+  Pick p{cur_, HAct::Push, 'N', false};
   switch (k) {
     case Nav::Next:
-      to = nextIdx(cur_);
+      p = nav_.next(cur_);  // без shuffle — каталог; у shuffle — вперед по історії або наступний у колі
       break;
-    case Nav::Prev:
-      if ((st_ == PlayState::Play || st_ == PlayState::Pause) && dec_.posMs() > kPrevRestartMs) {
-        why = 'R';  // перезапуск поточного: файл відкривається знову, скан не повторюється
-      } else {
-        to = prevIdx(cur_);
-        why = 'P';
-      }
+    case Nav::Prev: {
+      bool restart = (st_ == PlayState::Play || st_ == PlayState::Pause) && dec_.posMs() > kPrevRestartMs;
+      p = nav_.prev(cur_, restart);  // перезапуск / каталог / (shuffle) історія; файл відкривається знову, скан не повторюється
       break;
+    }
     case Nav::FNext:
     case Nav::FPrev: {
       int f = pl_.folderOf(cur_);
       if (f < 0) return Res::BadState;
       uint32_t first = pl_.folderFirst(f);
+      uint16_t to;
+      char why;
       if (k == Nav::FNext) {  // папки — суцільні діапазони: наступна починається одразу за кінцем поточної
         uint32_t end = first + pl_.folderTracks(f);
         to = end >= total ? 0 : (uint16_t)end;
@@ -330,11 +341,12 @@ Res SdSource::nav(Nav k) {
         to = pl_.folderFirst(pf);
         why = 'B';
       }
+      p = nav_.jump(to, why);  // у shuffle: незіграний міняється з елементом на вказівнику; в обох випадках — в історію
       break;
     }
   }
   errRun_ = 0;
-  return playTrack(to, why);
+  return playTrack(p.to, p.why, p.act);
 }
 
 
@@ -372,14 +384,20 @@ Res SdSource::startTrack(uint16_t n) {
 }
 
 // Запуск треку з автопропуском: файл не відкрито → ERR,read_fail і наступний трек; kPlayErrStop підряд → stop.
-Res SdSource::playTrack(uint16_t n, char why) {
+Res SdSource::playTrack(uint16_t n, char why, HAct act) {
   for (;;) {
     note(why, n);
     Res r = startTrack(n);
-    if (r != Res::ReadFail) return r;  // Ok / NoMedia / BadArg — нагору
+    if (r == Res::Ok) {
+      nav_.commit(act, n);  // історія й курсор міняються лише після успішного запуску
+      return r;
+    }
+    if (r != Res::ReadFail) return r;  // NoMedia / BadArg — нагору
     if (!countFail(r)) return Res::Ok;  // ліміт: state=stop, ERR уже надіслано
-    n = nextIdx(n);
-    why = 'x';
+    Pick p = nav_.skip(n);              // shuffle: наступний із кола; інакше наступний за каталогом
+    n = p.to;
+    why = p.why;
+    act = p.act;
   }
 }
 
@@ -395,22 +413,22 @@ bool SdSource::countFail(Res r) {
 
 // Помилка під час гри (сесія вже завершена, state=stop): ERR і перехід до наступного за списком (REP не враховується).
 void SdSource::onPlayError(Res r) {
-  if (countFail(r)) playTrack(nextIdx(cur_), 'x');
+  if (!countFail(r)) return;
+  Pick p = nav_.skip(cur_);
+  playTrack(p.to, p.why, p.act);
 }
 
 // Природний кінець треку (state вже stop, файл закрито): REP 0/1/2.
 void SdSource::onTrackEnd() {
-  uint16_t total = pl_.tracks();
-  if (!total) return;
-  if (rep_ == 1) {  // повтор поточного
-    playTrack(cur_, 'r');
-  } else if (rep_ == 2 || cur_ + 1 < total) {  // цикл списку / REP=0, не останній
-    playTrack(nextIdx(cur_), 'e');
-  } else {  // REP=0, кінець списку: stop, поточний = перший (PLAY почне спочатку)
-    note('z', 0);
+  if (!pl_.tracks()) return;
+  Pick p = nav_.end(cur_, rep_);  // REP 0/1/2; у shuffle — після історії вперед, далі коло
+  if (p.stop) {                   // каталог: кінець списку, поточний = перший; shuffle: коло завершено, лишається останній (лише TIME)
+    note(p.why, p.to);
     st_ = PlayState::Stop;
-    setCur(0);
+    setCur(p.to);
+    return;
   }
+  playTrack(p.to, p.why, p.act);
 }
 
 Res SdSource::play() {
@@ -424,7 +442,8 @@ Res SdSource::play() {
     return Res::Ok;
   }
   errRun_ = 0;
-  return playTrack(cur_, 'p');    // Stop: поточний трек (на старті / після кінця списку — перший)
+  Pick p = nav_.play(cur_);       // після завершеного кола shuffle — нове коло (перший ≠ останньому)
+  return playTrack(p.to, p.why, p.act);
 }
 
 Res SdSource::pause() {
@@ -520,6 +539,8 @@ void SdSource::runDbg() {
     case Dbg::Decode: dbgDecode(); job_ = Dbg::None; break;
     case Dbg::Nav: dbgNav(); job_ = Dbg::None; break;
     case Dbg::Tag: dbgTag(); job_ = Dbg::None; break;
+    case Dbg::Shuf: dbgShuf(); job_ = Dbg::None; break;
+    case Dbg::ShufTest: dbgShufTest(); job_ = Dbg::None; break;
     default: job_ = Dbg::None; break;
   }
 }
@@ -629,14 +650,15 @@ void SdSource::dbgPlay() {
     return;
   }
   errRun_ = 0;
-  Res r = playTrack((uint16_t)(arg_ - 1), 'd');
+  Pick p = nav_.jump((uint16_t)(arg_ - 1), 'd');
+  Res r = playTrack(p.to, p.why, p.act);
   if (r != Res::Ok) Events::err(resCode(r), "dbgplay");
 }
 
 // DBG,nav: стан навігації та історія переходів (лише лог).
 void SdSource::dbgNav() {
   uint16_t total = pl_.tracks();
-  LOGI(TAG, "nav: state=%s rep=%u shuf=%d помилок підряд=%u (ліміт %u)", stateName(st_), (unsigned)rep_, shuf_ ? 1 : 0,
+  LOGI(TAG, "nav: state=%s rep=%u shuf=%d помилок підряд=%u (ліміт %u)", stateName(st_), (unsigned)rep_, nav_.on() ? 1 : 0,
        (unsigned)errRun_, (unsigned)kPlayErrStop);
   if (!total) {
     LOGI(TAG, "nav: плейлист порожній");
@@ -658,6 +680,7 @@ void SdSource::dbgNav() {
   LOGI(TAG, "nav: історія(%u):%s", (unsigned)histCnt_, histCnt_ ? buf : " порожньо");
   LOGI(TAG, "nav: причини: N next, P prev, R перезапуск, F fnext, B fprev, p play");
   LOGI(TAG, "nav: причини: e кінець->наступний, r repeat-1, z кінець списку, x пропуск помилки, d DBG,play");
+  LOGI(TAG, "nav: причини shuffle: S next з кола, H prev по історії, h вперед по історії, P prev за каталогом (історія порожня)");
 }
 
 // DBG,tag,<n>: розібрати теги треку n без відтворення (src=sd у stop; скретч — вхідний буфер області PCM).
@@ -720,4 +743,104 @@ void SdSource::dbgDecode() {
        (unsigned)s.rdMaxUs);
   LOGI(TAG, "decode: область PCM: власник=%s, %u Б", PcmArena::ownerName(PcmArena::owner()), (unsigned)kPcmArenaBytes);
   Diag::logHeap("decode");
+}
+
+
+// DBG,shuf: режим, позиція кола k/N, початок перестановки, хвіст історії, якість esp_random().
+void SdSource::dbgShuf() {
+  const Shuffle& e = nav_.eng();
+  LOGI(TAG, "shuf: режим=%d активний=%d коло завершено=%d | коло k/N=%u/%u відновлень=%u перестановка=%s", nav_.on() ? 1 : 0,
+       nav_.active() ? 1 : 0, nav_.ended() ? 1 : 0, (unsigned)e.played(), (unsigned)e.size(), (unsigned)e.rounds(),
+       !e.started() ? "—" : e.check() ? "OK" : "ПОШКОДЖЕНА");
+  if (e.started()) {
+    char buf[kDbgShufHead * 7 + 8];
+    size_t w = 0;
+    buf[0] = 0;
+    for (uint16_t i = 0; i < kDbgShufHead && i < e.size(); i++) {
+      int n = snprintf(buf + w, sizeof buf - w, "%s%u", i == e.played() && i ? "|" : "", (unsigned)e.at(i) + 1);
+      if (n < 0 || (size_t)n >= sizeof buf - w) break;
+      w += (size_t)n;
+      if (i + 1 < kDbgShufHead && i + 1 < e.size() && w + 1 < sizeof buf) buf[w++] = ' ', buf[w] = 0;
+    }
+    LOGI(TAG, "shuf: перестановка[0..%u] (треки з 1; до '|' — зіграні): %s", (unsigned)(kDbgShufHead - 1), buf);
+  }
+  const TrackHistory& h = nav_.hist();
+  char hb[kDbgHistTail * 8 + 8];
+  size_t w = 0;
+  hb[0] = 0;
+  uint16_t from = h.count() > kDbgHistTail ? (uint16_t)(h.count() - kDbgHistTail) : 0;
+  for (uint16_t i = from; i < h.count(); i++) {
+    int n = snprintf(hb + w, sizeof hb - w, " %s%u", i == h.cursor() ? ">" : "", (unsigned)h.at(i) + 1);
+    if (n < 0 || (size_t)n >= sizeof hb - w) break;
+    w += (size_t)n;
+  }
+  LOGI(TAG, "shuf: історія %u/%u курсор=%u (від старих до нових, '>' — курсор):%s", (unsigned)h.count(), (unsigned)h.capacity(),
+       (unsigned)h.cursor(), h.count() ? hb : " порожньо");
+  // Якість esp_random(): частка одиниць (очікується ≈ 50%) і кількість різних значень у вибірці
+  uint32_t ones = 0, distinct = 0;
+  uint32_t smp[kRngHealthSamples];  // вибірка на стеку app (256 Б)
+  for (uint16_t i = 0; i < kRngHealthSamples; i++) {
+    smp[i] = esp_random();
+    ones += (uint32_t)__builtin_popcount(smp[i]);
+    bool dup = false;
+    for (uint16_t j = 0; j < i && !dup; j++) dup = smp[j] == smp[i];
+    if (!dup) distinct++;
+  }
+  const uint32_t bits = (uint32_t)kRngHealthSamples * 32, lo = bits / 2 - bits / 16, hi = bits / 2 + bits / 16;  // ≈ ±6%, ≈5,7σ
+  bool ok = ones >= lo && ones <= hi && distinct + 2 >= kRngHealthSamples;
+  LOGI(TAG, "shuf: esp_random: одиниць %u/%u (норма %u..%u), різних %u/%u -> %s", (unsigned)ones, (unsigned)bits, (unsigned)lo,
+       (unsigned)hi, (unsigned)distinct, (unsigned)kRngHealthSamples, ok ? "OK" : "ПІДОЗРІЛО");
+}
+
+// DBG,shuftest: самоперевірка рушія на залізі (окремий буфер, живе коло не чіпається).
+// Для кількох N: повні кола — кожен трек рівно раз, межа кола без збігу; у непарних колах — ручний стрибок посередині.
+void SdSource::dbgShufTest() {
+  uint16_t buf[kShufTestMax];
+  uint8_t seen[(kShufTestMax + 7) / 8];
+  uint16_t sizes[7] = {1, 2, 3, 7, 32, 100, 0};
+  uint16_t real = pl_.tracks() > kShufTestMax ? kShufTestMax : pl_.tracks();
+  sizes[6] = real;
+  bool all = true;
+  Shuffle t;
+  for (int si = 0; si < 7; si++) {
+    const uint16_t n = sizes[si];
+    if (!n || n > kShufTestMax) continue;
+    t.attach(buf, n, hwRand);
+    bool ok = true;
+    uint16_t prev = Shuffle::kNone;
+    for (uint16_t c = 0; c < kShufTestCircles && ok; c++) {
+      memset(seen, 0, sizeof seen);
+      uint16_t cnt = 0;
+      bool jumped = false;
+      while (cnt < n && ok) {
+        if (!jumped && (c & 1) && cnt > 0 && cnt == n / 2) {
+          jumped = true;
+          uint16_t x = (uint16_t)(esp_random() % n);
+          bool was = !(seen[x >> 3] & (1u << (x & 7)));
+          bool r = t.jump(x);
+          if (r != was) { ok = false; break; }
+          if (r) {
+            seen[x >> 3] |= (uint8_t)(1u << (x & 7));
+            cnt++;
+            prev = x;
+          }
+          continue;
+        }
+        uint16_t v = t.next(prev);
+        if (v >= n || (seen[v >> 3] & (1u << (v & 7)))) { ok = false; break; }
+        if (cnt == 0 && c > 0 && n >= 2 && v == prev) { ok = false; break; }  // межа кола
+        seen[v >> 3] |= (uint8_t)(1u << (v & 7));
+        cnt++;
+        prev = v;
+      }
+      if (ok && (!t.check() || !t.atEnd())) ok = false;
+    }
+    LOGI(TAG, "shuftest N=%u кіл=%u -> %s", (unsigned)n, (unsigned)kShufTestCircles, ok ? "OK" : "FAIL");
+    all = all && ok;
+  }
+  if (nav_.eng().started() && !nav_.eng().check()) {
+    LOGW(TAG, "shuftest: жива перестановка пошкоджена");
+    all = false;
+  }
+  LOGI(TAG, "shuftest: %s", all ? "OK" : "FAIL");
 }

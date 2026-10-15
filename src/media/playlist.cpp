@@ -35,7 +35,16 @@ void Playlist::clear() {
   pool_ = 0;
 }
 
-size_t Playlist::freeBytes() const { return kPlaylistArenaBytes - pool_ - (size_t)nFolders_ * kRec; }
+// Вільне місце з урахуванням резерву kPermBytesPerTrack на кожен уже доданий трек
+size_t Playlist::freeBytes() const {
+  return kPlaylistArenaBytes - pool_ - (size_t)nFolders_ * kRec - (size_t)nTracks_ * kPermBytesPerTrack;
+}
+
+uint16_t* Playlist::permBuf() {
+  if (!nTracks_) return nullptr;
+  size_t off = kPlaylistArenaBytes - (size_t)nFolders_ * kRec - (size_t)nTracks_ * kPermBytesPerTrack;  // парне
+  return reinterpret_cast<uint16_t*>(s_arena + off);
+}
 
 int Playlist::addFolder(uint16_t parent, const char* name, size_t len) {
   if (nFolders_ >= kNone - 1 || freeBytes() < kRec + len + 1) return -1;
@@ -48,7 +57,7 @@ int Playlist::addFolder(uint16_t parent, const char* name, size_t len) {
 }
 
 bool Playlist::addTrack(const char* stem, size_t len) {
-  if (!nFolders_ || nTracks_ >= kNone - 1 || freeBytes() < len + 1) return false;
+  if (!nFolders_ || nTracks_ >= kNone - 1 || freeBytes() < len + 1 + kPermBytesPerTrack) return false;
   memcpy(s_arena + pool_, stem, len);
   s_arena[pool_ + len] = 0;
   pool_ += len + 1;
@@ -127,3 +136,4 @@ bool Playlist::trackPath(uint16_t i, char* out, size_t cap) const {
   memcpy(out + w + l, ".mp3", 5);
   return true;
 }
+

@@ -35,6 +35,7 @@ void help() {
   LOGI(TAG, "DBG,play,<n> — відтворити трек №n (як у list; потрібен src=sd) | DBG,decode — статистика декодера, буфери, heap");
   LOGI(TAG, "DBG,tag,<n> — розібрати ID3 треку №n без відтворення (src=sd, stop): версія, кодування, hex, UTF-8, час");
   LOGI(TAG, "DBG,nav — індекс, папка/діапазон, repeat, shuffle, помилки підряд, історія переходів");
+  LOGI(TAG, "DBG,shuf — shuffle: режим, коло k/N, початок перестановки, хвіст історії, якість esp_random() | DBG,shuftest — самоперевірка рушія (OK/FAIL)");
   LOGI(TAG, "DBG,link[,reset] — втрати черг, злиті TIME, час відправки кадру (UART1+дзеркало)");
 }
 
@@ -84,12 +85,14 @@ void DebugCmds::handle(const proto::Msg& m) {
     else LOGW(TAG, "DBG,bt[,pair|forget|reset]");
   } else if (!strcasecmp(c, "sd") || !strcasecmp(c, "scan") || !strcasecmp(c, "list") || !strcasecmp(c, "sdread") ||
              !strcasecmp(c, "play") || !strcasecmp(c, "decode") ||
-             !strcasecmp(c, "nav") || !strcasecmp(c, "tag")) {
+             !strcasecmp(c, "nav") || !strcasecmp(c, "tag") || !strcasecmp(c, "shuf") || !strcasecmp(c, "shuftest")) {
     SdSource::Dbg k = !strcasecmp(c, "sd") ? SdSource::Dbg::Info : !strcasecmp(c, "scan") ? SdSource::Dbg::Scan
                       : !strcasecmp(c, "list") ? SdSource::Dbg::List : !strcasecmp(c, "play") ? SdSource::Dbg::Play
                       : !strcasecmp(c, "decode") ? SdSource::Dbg::Decode
                       : !strcasecmp(c, "nav") ? SdSource::Dbg::Nav
-                      : !strcasecmp(c, "tag") ? SdSource::Dbg::Tag : SdSource::Dbg::Read;
+                      : !strcasecmp(c, "tag") ? SdSource::Dbg::Tag
+                      : !strcasecmp(c, "shuf") ? SdSource::Dbg::Shuf
+                      : !strcasecmp(c, "shuftest") ? SdSource::Dbg::ShufTest : SdSource::Dbg::Read;
     long n = (k == SdSource::Dbg::List) ? kDbgListDefault : 0;
     if (k == SdSource::Dbg::List && m.argc >= 2 && (!toInt(m.args[1], n) || n < 0 || n > 65535)) {
       LOGW(TAG, "DBG,list[,0..65535]");
@@ -114,6 +117,7 @@ void DebugCmds::handle(const proto::Msg& m) {
     LOGW(TAG, "невідома DBG-команда '%s' (DBG,help)", c);
   }
 }
+
 
 
 

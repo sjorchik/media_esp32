@@ -4,14 +4,15 @@
 #include "media/imedia.h"
 #include "media/playlist.h"
 #include "media/scanner.h"
+#include "media/shuffle.h"
 #include "sources/isource.h"
 
 // SD-джерело: hot-plug, скан, плейлист (M3a); відтворення MP3 (M3b); навігація, repeat, події треку,
-// обробка помилок відтворення (M3c); ID3-теги в META (M3d). Shuffle лише зберігається (логіка — M5a).
+// обробка помилок відтворення (M3c); ID3-теги в META (M3d); shuffle без повторів та історія для PREV (M5a, media/shuffle).
 // Працює через IMedia&, тому про SD не знає. Усе (скан, DBG-завдання) виконується в задачі app порціями.
 class SdSource : public ISource {
  public:
-  enum class Dbg : uint8_t { None, Info, Scan, List, Read, Play, Decode, Nav, Tag };
+  enum class Dbg : uint8_t { None, Info, Scan, List, Read, Play, Decode, Nav, Tag, Shuf, ShufTest };
 
   explicit SdSource(IMedia& media) : media_(media) {}
   SrcId id() const override { return SrcId::SD; }
@@ -26,7 +27,7 @@ class SdSource : public ISource {
   Res fnext() override { return nav(Nav::FNext); }
   Res fprev() override { return nav(Nav::FPrev); }
   void setRepeat(uint8_t mode) override { rep_ = mode <= 2 ? mode : 0; }  // застосовується одразу (читає onTrackEnd)
-  void setShuffle(bool on) override { shuf_ = on; }                        // лише зберігається
+  void setShuffle(bool on) override;                                       // SHUF: звук не переривається
   SourceStatus status() const override;
   void loop(uint32_t nowMs) override;
   void idleLoop(uint32_t nowMs) override { service(nowMs); }
@@ -58,9 +59,11 @@ class SdSource : public ISource {
   void dbgDecode();
   void dbgNav();
   void dbgTag();
+  void dbgShuf();
+  void dbgShufTest();
   // відтворення
   Res startTrack(uint16_t n);              // відкриває файл, запускає сесію; state=play; повертає ReadFail, якщо не відкрито
-  Res playTrack(uint16_t n, char why);     // startTrack з автопропуском битих (ERR + наступний; 3 підряд → stop)
+  Res playTrack(uint16_t n, char why, HAct act = HAct::Push);  // startTrack з автопропуском битих (ERR + наступний з кола/каталогу; 3 підряд → stop); act — запис в історію після успіху
   bool countFail(Res r);                   // ERR + лічильник; false = ліміт, state=stop
   void onPlayError(Res r);                 // помилка під час гри: ERR і перехід до наступного
   void endSession();                       // мʼют → зупинка сесії → закриття файлу (ідемпотентно)
@@ -69,8 +72,6 @@ class SdSource : public ISource {
   // навігація
   Res nav(Nav k);
   Res ready() const;                       // Ok або BadState (scan) / NoMedia / BadState (idle)
-  uint16_t nextIdx(uint16_t i) const;      // циклічно
-  uint16_t prevIdx(uint16_t i) const;      // циклічно
   void setCur(uint16_t n);                 // нова поточна позиція без запуску; зміна → події треку
   void note(char why, uint16_t to);        // запис в історію переходів
   // події
@@ -91,7 +92,8 @@ class SdSource : public ISource {
   uint8_t scanRetry_ = 0;
   uint16_t cur_ = 0;
   uint8_t rep_ = 0;
-  bool shuf_ = false;
+  ShufNav nav_;                            // shuffle-коло (перестановка в арені плейлиста), історія, політика вибору
+  uint16_t histBuf_[kHistLen] = {};        // кільце історії (2 Б на запис)
   uint8_t errRun_ = 0;                     // помилок відтворення підряд
   Mp3Player dec_;
   uint32_t nextTimeAt_ = 0, infoSeq_ = 0;
@@ -111,4 +113,5 @@ class SdSource : public ISource {
   bool rdOpen_ = false;
   uint32_t rdBytes_ = 0, rdBusyUs_ = 0, rdT0_ = 0;
 };
+
 
