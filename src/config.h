@@ -45,8 +45,16 @@ inline constexpr int kProtoVer = 1;
 
 // ---- Консоль / лог (UART0) ----
 inline constexpr uint32_t kConsoleBaud = 460800;
-inline constexpr size_t   kConsoleRxBuf = 512;
+// M5c5: RX-буфер UART0 (виставляється до begin). Було 512 Б ≈ 11 мс при 460800: відповідь DBG,* блокує консоль на TX
+// (≈1,4 мс на рядок) довше, ніж надходить наступна команда пачки → переповнення. 1472 Б = +960 Б (бюджет M5c5 ≤ 1 КБ
+// разом із лічильниками консолі ≈ 32 Б). Базовий вимір: збірка з -DCONSOLE_RX_BUF=512.
+#ifndef CONSOLE_RX_BUF
+#define CONSOLE_RX_BUF 1472
+#endif
+inline constexpr size_t   kConsoleRxBuf = CONSOLE_RX_BUF;
+static_assert(kConsoleRxBuf >= 256 && kConsoleRxBuf <= 2048, "kConsoleRxBuf: 256..2048 Б");
 inline constexpr size_t   kConsoleLineMax = 260;
+inline constexpr uint8_t  kConsoleRxHighPct = 90;   // M5c5: заповнення RX ≥ цього % ємності = «майже переповнення» (DBG,console)
 
 // ---- Лінк із S3 (UART1) ----
 inline constexpr uint32_t kLinkBaud = 921600;

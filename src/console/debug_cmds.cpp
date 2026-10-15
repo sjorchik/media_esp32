@@ -8,6 +8,7 @@
 #include "audio/mp3_player.h"
 #include "core/app.h"
 #include "core/device_state.h"
+#include "console/console.h"
 #include "core/router.h"
 #include "media/sd_media.h"
 #include "proto/link.h"
@@ -50,6 +51,7 @@ void help() {
 #endif
   LOGI(TAG, "DBG,settings — збережені last_src/shuf/rep (CRC) | DBG,settings,clear — стерти set_v1");
   LOGI(TAG, "DBG,link[,reset] — втрати черг, злиті TIME, час відправки кадру (UART1+дзеркало)");
+  LOGI(TAG, "DBG,console[,reset] — M5c5: заповнення RX UART0 (cap/peak/high), рядки ok/long, макс. довжина, байти");
   LOGI(TAG, "DBG,aout — стан AudioOut (мʼют, лічильники, власник мʼютекса) і задачі mp3 (де стоїть); читає без app, працює й при завислому app");
 #if SKIP_TEST_CMDS
   LOGI(TAG, "DBG,failnext,<n>[,read|decode] — наступні n стартів треку штучно завершуються read_fail (типово) або decode_fail");
@@ -192,6 +194,21 @@ void DebugCmds::handle(const proto::Msg& m) {
     if (!g_sd.dbg(k, (int)n)) LOGW(TAG, "SD: попередня DBG-команда ще виконується");
   } else if (!strcasecmp(c, "aout")) {
     aout();
+  } else if (!strcasecmp(c, "console")) {
+    // Виконується в задачі console, тож лічильники не конкурують із записом.
+    if (m.argc == 2 && !strcasecmp(m.args[1], "reset")) {
+      Console::resetStats();
+      LOGI(TAG, "console: лічильники скинуто");
+    } else if (m.argc == 1) {
+      Console::Stats s = Console::stats();
+      // Два рядки: буфер логера 192 Б (кирилиця = 2 Б/символ), один рядок обрізався б.
+      LOGI(TAG, "console: RX-буфер cap=%u peak=%u high=%u (≥%u%% ємності)", (unsigned)s.rxCap, (unsigned)s.rxPeak,
+           (unsigned)s.rxHigh, (unsigned)kConsoleRxHighPct);
+      LOGI(TAG, "console: рядки ok=%u long=%u longB=%u maxlen=%u/%u байтів=%u", (unsigned)s.lines, (unsigned)s.longLines,
+           (unsigned)s.longBytes, (unsigned)s.maxLen, (unsigned)(kConsoleLineMax - 1), (unsigned)s.bytes);
+    } else {
+      LOGW(TAG, "DBG,console[,reset]");
+    }
   } else if (!strcasecmp(c, "failnext")) {
 #if SKIP_TEST_CMDS
     long n = 0;
