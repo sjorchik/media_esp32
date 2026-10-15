@@ -31,7 +31,10 @@ class Mp3Player {
 
   void init(AudioOut& out, IFileReader& rd) { out_ = &out; rd_ = &rd; }
   bool start();                       // створює задачу (один раз); вимагає PcmArena=Sd
-  void startSession();                // файл уже відкрито (pos 0); асинхронно
+  void startSession() { startSessionAt(0, 0); }   // файл уже відкрито (pos 0); асинхронно
+  // M5b1: старт із відновленням. off = байтовий зсув початку кадру (0 = з початку), ms = пройдений час.
+  // Теги розбираються з початку файлу, далі seek на off; невалідний/надто близький до кінця off ігнорується (з початку).
+  void startSessionAt(uint32_t off, uint32_t ms);
   bool pause();                       // синхронно; true = задача на паузі
   void resume();                      // асинхронно (задача чекає розмʼюту DAC сама)
   void stopSession();                 // синхронно; потім файл можна закривати
@@ -40,6 +43,9 @@ class Mp3Player {
   Ev takeEvent();                     // подія кінця сесії (раз), None якщо нема
 
   uint32_t posMs() const { return posMs_; }
+  // M5b1: узгоджена пара «зсув початку наступного недекодованого кадру + пройдені мс» (seqlock; з будь-якої задачі).
+  // До першого кадру сесії — зсув/час, з якими її запущено. false, якщо пару не вдалось прочитати (запис саме йде).
+  bool position(uint32_t& off, uint32_t& ms) const;
   uint32_t durMs() const { return durMs_; }       // 0 = невідома
   bool durEstimated() const { return durEst_; }   // true: за бітрейтом, не з Xing/VBRI
   uint32_t infoSeq() const { return infoSeq_; }   // змінюється, коли зʼявилась тривалість
@@ -61,6 +67,8 @@ class Mp3Player {
   Ev decodeLoop();
   bool fill();
   bool skipId3();
+  bool seekResume(uint32_t off, uint32_t ms);
+  void publishPos(uint32_t off, uint32_t ms);
   void parseTags();
   bool waitUnmuted();
   bool parkPaused();
@@ -75,10 +83,11 @@ class Mp3Player {
   volatile uint8_t req_ = 0;
   volatile Ev ev_ = Ev::None;
   volatile uint32_t posMs_ = 0, durMs_ = 0, infoSeq_ = 0;
+  volatile uint32_t posOff_ = 0, posSeq_ = 0;   // зсув кадру й лічильник seqlock (непарний = йде запис)
+  volatile uint32_t rsmOff_ = 0, rsmMs_ = 0;    // параметри відновлення для наступної сесії
   volatile bool durEst_ = false;
   Mp3Stats stats_{};
   Id3::Tags tags_{};                         // ≈ 291 Б; копіюється з локальної структури в стеку задачі
   volatile uint32_t tagSeq_ = 0, tagUs_ = 0;
   volatile uint8_t tagMask_ = 0, tagVer_ = 0;
 };
-

@@ -64,6 +64,9 @@ struct Sess {
   int64_t lastT;       // мкс: кінець попереднього write()
   int32_t cushUs;      // оцінка запасу даних у DMA, мкс
   uint32_t fastRun;    // скільки кадрів підряд write() не блокував (мʼют/abort)
+  uint32_t fEnd;       // файловий зсув кінця даних у вхідному буфері (зсув in[inPos] = fEnd - (inLen - inPos))
+  uint32_t probeMs;    // тривалість, розрахована пробою першого кадру при відновленні
+  bool probed, probeEst;
 };
 Sess sx;
 
@@ -91,6 +94,27 @@ bool vbrHeader(const uint8_t* f, int n, uint32_t& frames) {
   return false;
 }
 
+struct DurInfo {
+  uint32_t ms;
+  bool est, meta;
+};
+
+// Тривалість за першим кадром: Xing/Info/VBRI, інакше оцінка за бітрейтом. meta = службовий кадр (звуку немає).
+DurInfo calcDur(const uint8_t* fp, int fn, int smp, uint32_t hz, int kbps, uint32_t fileSize, uint32_t id3Skip) {
+  DurInfo r{0, false, false};
+  uint32_t vf = 0;
+  r.meta = vbrHeader(fp, fn, vf);
+  uint64_t d = 0;
+  if (vf) {
+    d = (uint64_t)vf * (uint32_t)smp * 1000ULL / hz;
+  } else if (kbps > 0 && fileSize > id3Skip) {
+    d = (uint64_t)(fileSize - id3Skip) * 8ULL / (uint32_t)kbps;
+    r.est = true;
+  }
+  r.ms = (uint32_t)d;
+  return r;
+}
+
 }  // namespace
 
 // ============================================================ керування (app)
@@ -112,11 +136,13 @@ bool Mp3Player::start() {
   return true;
 }
 
-void Mp3Player::startSession() {
+void Mp3Player::startSessionAt(uint32_t off, uint32_t ms) {
   if (!s_task) return;
   memset(&stats_, 0, sizeof stats_);
   ev_ = Ev::None;
-  posMs_ = 0;
+  rsmOff_ = off;
+  rsmMs_ = ms;
+  publishPos(off, off ? ms : 0);  // TIME одразу показує збережений час
   durMs_ = 0;
   durEst_ = false;
   req_ = kReqStart;
@@ -149,6 +175,32 @@ void Mp3Player::stopSession() {
   uint32_t t0 = millis();
   while (st_ != St::Idle && (uint32_t)(millis() - t0) < kDecStopWaitMs) vTaskDelay(1);
   if (st_ != St::Idle) LOGE(TAG, "стоп сесії: задача не відповіла за %u мс", (unsigned)kDecStopWaitMs);
+}
+
+// Єдиний писар у кожен момент: app (сесія в Idle) або задача mp3 (Run) — передача власності через notify/req.
+void Mp3Player::publishPos(uint32_t off, uint32_t ms) {
+  posSeq_ = posSeq_ + 1;  // непарний: запис іде
+  __sync_synchronize();
+  posOff_ = off;
+  posMs_ = ms;
+  __sync_synchronize();
+  posSeq_ = posSeq_ + 1;
+}
+
+bool Mp3Player::position(uint32_t& off, uint32_t& ms) const {
+  for (int i = 0; i < 8; i++) {
+    uint32_t a = posSeq_;
+    if (a & 1u) continue;
+    __sync_synchronize();
+    uint32_t o = posOff_, m = posMs_;
+    __sync_synchronize();
+    if (posSeq_ == a) {
+      off = o;
+      ms = m;
+      return true;
+    }
+  }
+  return false;
 }
 
 Mp3Player::Ev Mp3Player::takeEvent() {
@@ -194,8 +246,13 @@ void Mp3Player::runSession() {
   memset(&sx, 0, sizeof sx);
   memset(&S->dec, 0, sizeof S->dec);
   mp3dec_init(&S->dec);
+  const uint32_t rOff = rsmOff_, rMs = rsmMs_;
   parseTags();  // теги на скретчі (вхідний буфер), далі файл знову з початку
-  Ev e = (rd_->seek(0) && skipId3()) ? decodeLoop() : Ev::ReadFail;
+  Ev e = Ev::ReadFail;
+  if (rd_->seek(0)) {
+    sx.fEnd = 0;
+    if (skipId3() && (!rOff || seekResume(rOff, rMs))) e = decodeLoop();
+  }
   if (e == Ev::Eof) drainSilence();
   finish(e);
 }
@@ -222,6 +279,7 @@ bool Mp3Player::fill() {
     }
     stats_.rdBytes += (uint32_t)n;
     sx.inLen += (uint32_t)n;
+    sx.fEnd += (uint32_t)n;
   }
   return true;
 }
@@ -255,8 +313,40 @@ bool Mp3Player::skipId3() {
     if (sx.id3Skip > rd_->size()) sx.id3Skip = rd_->size();
     if (!rd_->seek(sx.id3Skip)) return false;
     sx.inPos = sx.inLen = 0;
+    sx.fEnd = sx.id3Skip;
     sx.eof = false;
   }
+  return true;
+}
+
+// Відновлення (M5b1): після skipId3 (у буфері початок аудіо). Спершу проба першого кадру — тривалість (Xing/VBRI),
+// бо після seek його вже не буде; далі скидання декодера й seek на off. true = продовжувати (зсув може бути проігноровано).
+bool Mp3Player::seekResume(uint32_t off, uint32_t ms) {
+  SdSet* S = set();
+  const uint32_t sz = rd_->size();
+  if (off <= sx.id3Skip || off > sz || sz - off < kResumeTailGuard) {  // сміття або майже кінець → з початку
+    publishPos(0, 0);
+    return true;
+  }
+  mp3dec_frame_info_t info;
+  memset(&info, 0, sizeof info);
+  uint32_t avail = sx.inLen - sx.inPos;
+  int smp = avail ? mp3dec_decode_frame(&S->dec, S->in + sx.inPos, (int)avail, S->pcm, &info) : 0;
+  if (smp > 0 && info.frame_bytes > 0 && info.hz > 0) {
+    DurInfo d = calcDur(S->in + sx.inPos + info.frame_offset, info.frame_bytes - info.frame_offset, smp, (uint32_t)info.hz,
+                        info.bitrate_kbps, sz, sx.id3Skip);
+    sx.probed = true;
+    sx.probeMs = d.ms;
+    sx.probeEst = d.est;
+  }
+  mp3dec_init(&S->dec);  // стан після проби не потрібен
+  if (!rd_->seek(off)) return false;
+  sx.inPos = sx.inLen = 0;
+  sx.eof = false;
+  sx.fEnd = off;
+  sx.posUs = (uint64_t)ms * 1000ULL;
+  publishPos(off, ms);
+  LOGI(TAG, "відновлення: зсув %u Б, %u мс", (unsigned)off, (unsigned)ms);
   return true;
 }
 
@@ -370,22 +460,20 @@ Mp3Player::Ev Mp3Player::decodeLoop() {
     uint32_t ch = (uint32_t)info.channels;
     if (hz == 0 || (ch != 1 && ch != 2)) continue;
 
-    // 5) перший кадр: тривалість (Xing/Info/VBRI, інакше оцінка за бітрейтом)
+    // 5) перший кадр: тривалість (Xing/Info/VBRI, інакше оцінка за бітрейтом); після відновлення — з проби
     if (!sx.metaDone) {
       sx.metaDone = true;
-      uint32_t vf = 0;
-      bool meta = vbrHeader(fp, fn, vf);
-      uint64_t d = 0;
-      if (vf) {
-        d = (uint64_t)vf * (uint32_t)smp * 1000ULL / hz;
-        durEst_ = false;
-      } else if (info.bitrate_kbps > 0 && rd_->size() > sx.id3Skip) {
-        d = (uint64_t)(rd_->size() - sx.id3Skip) * 8ULL / (uint32_t)info.bitrate_kbps;
-        durEst_ = true;
+      if (sx.probed) {
+        durMs_ = sx.probeMs;
+        durEst_ = sx.probeEst;
+        infoSeq_ = infoSeq_ + 1;
+      } else {
+        DurInfo d = calcDur(fp, fn, smp, hz, info.bitrate_kbps, rd_->size(), sx.id3Skip);
+        durEst_ = d.est;
+        durMs_ = d.ms;
+        infoSeq_ = infoSeq_ + 1;
+        if (d.meta) continue;     // службовий кадр: звуку немає
       }
-      durMs_ = (uint32_t)d;
-      infoSeq_ = infoSeq_ + 1;
-      if (meta) continue;         // службовий кадр: звуку немає
     }
 
     // 6) формат: зміна частоти/каналів → мʼют → setFormat → анмʼют (робить AudioOut::setFormat)
@@ -427,7 +515,7 @@ Mp3Player::Ev Mp3Player::decodeLoop() {
     // 8) лічильники й позиція
     stats_.frames++;
     sx.posUs += frameUs;
-    posMs_ = (uint32_t)(sx.posUs / 1000ULL);
+    publishPos(sx.fEnd - (sx.inLen - sx.inPos), (uint32_t)(sx.posUs / 1000ULL));  // початок наступного кадру
     sx.sumDecUs += decUs;
     sx.sumFrameUs += frameUs;
     stats_.decAvgUs = (uint32_t)(sx.sumDecUs / stats_.frames);
@@ -442,4 +530,3 @@ Mp3Player::Ev Mp3Player::decodeLoop() {
     stats_.pcmBytes = (uint32_t)bytes;
   }
 }
-

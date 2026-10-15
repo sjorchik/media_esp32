@@ -8,11 +8,12 @@
 #include "sources/isource.h"
 
 // SD-джерело: hot-plug, скан, плейлист (M3a); відтворення MP3 (M3b); навігація, repeat, події треку,
-// обробка помилок відтворення (M3c); ID3-теги в META (M3d); shuffle без повторів та історія для PREV (M5a, media/shuffle).
+// обробка помилок відтворення (M3c); ID3-теги в META (M3d); shuffle без повторів та історія для PREV (M5a, media/shuffle);
+// резюме треку й позиції в NVS (M5b1, storage/resume_store).
 // Працює через IMedia&, тому про SD не знає. Усе (скан, DBG-завдання) виконується в задачі app порціями.
 class SdSource : public ISource {
  public:
-  enum class Dbg : uint8_t { None, Info, Scan, List, Read, Play, Decode, Nav, Tag, Shuf, ShufTest };
+  enum class Dbg : uint8_t { None, Info, Scan, List, Read, Play, Decode, Nav, Tag, Shuf, ShufTest, Resume, ResumeClear };
 
   explicit SdSource(IMedia& media) : media_(media) {}
   SrcId id() const override { return SrcId::SD; }
@@ -61,9 +62,10 @@ class SdSource : public ISource {
   void dbgTag();
   void dbgShuf();
   void dbgShufTest();
+  void dbgResume(bool clear);
   // відтворення
-  Res startTrack(uint16_t n);              // відкриває файл, запускає сесію; state=play; повертає ReadFail, якщо не відкрито
-  Res playTrack(uint16_t n, char why, HAct act = HAct::Push);  // startTrack з автопропуском битих (ERR + наступний з кола/каталогу; 3 підряд → stop); act — запис в історію після успіху
+  Res startTrack(uint16_t n, uint32_t off = 0, uint32_t ms = 0);  // відкриває файл, запускає сесію (з зсуву off, мс); state=play; ReadFail, якщо не відкрито
+  Res playTrack(uint16_t n, char why, HAct act = HAct::Push, uint32_t off = 0, uint32_t ms = 0);  // startTrack з автопропуском битих (ERR + наступний з кола/каталогу; 3 підряд → stop); act — запис в історію після успіху; off/ms — лише для першої спроби
   bool countFail(Res r);                   // ERR + лічильник; false = ліміт, state=stop
   void onPlayError(Res r);                 // помилка під час гри: ERR і перехід до наступного
   void endSession();                       // мʼют → зупинка сесії → закриття файлу (ідемпотентно)
@@ -76,9 +78,13 @@ class SdSource : public ISource {
   void note(char why, uint16_t to);        // запис в історію переходів
   // події
   void sendTime();                         // TIME за status()
-  void emitTrackInfo();                    // TRACK, FOLDER, META, TIME
+  void emitTrackInfo(int32_t timeS = -1);  // TRACK, FOLDER, META, TIME (timeS ≥ 0 — показати збережену позицію замість 0)
   void emitFolder();
   void emitMeta();
+  // резюме (M5b1)
+  uint16_t loadResume(uint32_t& off, uint32_t& ms);  // індекс збереженого треку в плейлисті або kNone (тоді перший трек із нуля)
+  bool rsmWrite(uint32_t off, uint32_t ms);           // запис (cur_, off, ms) у NVS; шлях > 255 Б → запис стирається
+  void saveResume(bool periodic);                     // поточна позиція декодера (play/pause); periodic — лише якщо зсув ≥ кадру
   // теги (M3d)
   void takeTags(bool emit);                // забрати результат розбору сесії; emit — надіслати повторний META, якщо змінився
   void buildMeta(char* a, char* t, char* al);  // найкраще відоме: теги (якщо для cur_) або імʼя файлу; буфери kEvMetaFieldMax+1
@@ -100,6 +106,9 @@ class SdSource : public ISource {
   uint16_t tagTrack_ = 0xFFFF;             // для якого треку чинні dec_.tags() (0xFFFF = ні)
   uint32_t tagSeqSeen_ = 0;                // останній забраний dec_.tagSeq()
   uint32_t shownHash_ = 0;                 // хеш META, надісланого останнім (для порівняння «змінилось»)
+  uint32_t rsmAt_ = 0;                     // коли наступний періодичний запис резюме
+  uint32_t rsmLastOff_ = 0;                // зсув останнього запису (умова «≥ одного кадру»)
+  uint16_t rsmWarn_ = 0xFFFF;              // для якого треку вже попередили «шлях задовгий»
 
   Hist hist_[kNavHist] = {};
   uint8_t histHead_ = 0, histCnt_ = 0;
@@ -113,5 +122,3 @@ class SdSource : public ISource {
   bool rdOpen_ = false;
   uint32_t rdBytes_ = 0, rdBusyUs_ = 0, rdT0_ = 0;
 };
-
-

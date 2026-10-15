@@ -168,6 +168,11 @@ inline constexpr uint8_t  kId3Cp1251Pct = 50;          // «схоже на cp12
 inline constexpr bool     kId3C1ForcesCp1251 = true;   // наявність байтів 0x80..0x9F у Latin1-рядку → cp1251
 inline constexpr size_t   kId3DbgRaw = 12;             // скільки сирих байтів показує DBG,tag
 
+// ---- Резюме треку й позиції (M5b1) ----
+inline constexpr uint32_t kResumeSaveMs = 10000;       // період запису позиції під час play
+inline constexpr uint32_t kResumeMinStepBytes = 128;   // періодичний запис лише якщо зсув змінився ≥ цього (≈ один кадр MP3)
+inline constexpr uint32_t kResumeTailGuard = 4096;     // зсув ближче до кінця файлу ігнорується (трек з початку)
+
 // ---- Задачі ----
 inline constexpr int kCoreProto = 0;
 inline constexpr int kCoreAudio = 1;
@@ -182,4 +187,3 @@ inline constexpr int kPrioDecoder = 5;   // нижче за audio (6), вище 
 
 // ---- Діагностика ----
 inline constexpr uint32_t kDiagPeriodMs = 60000;
-

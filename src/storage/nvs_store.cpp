@@ -57,3 +57,31 @@ bool NvsStore::putStr(const char* key, const char* v) {
   G g;
   return s_ok && s_p.putString(key, v) > 0;
 }
+
+size_t NvsStore::blobLen(const char* key) {
+  G g;
+  if (!s_ok || !s_p.isKey(key)) return 0;
+  return s_p.getBytesLength(key);
+}
+
+bool NvsStore::getBlob(const char* key, void* out, size_t cap, size_t& len) {
+  G g;
+  len = 0;
+  if (!s_ok || !out || !cap || !s_p.isKey(key)) return false;
+  size_t n = s_p.getBytesLength(key);
+  if (n == 0 || n > cap) return false;
+  if (s_p.getBytes(key, out, n) != n) return false;
+  len = n;
+  return true;
+}
+
+bool NvsStore::putBlob(const char* key, const void* v, size_t len) {
+  G g;
+  return s_ok && v && len && s_p.putBytes(key, v, len) == len;
+}
+
+bool NvsStore::remove(const char* key) {
+  G g;
+  if (!s_ok) return false;
+  return !s_p.isKey(key) || s_p.remove(key);
+}

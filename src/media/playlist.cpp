@@ -28,6 +28,22 @@ bool copyStr(const char* s, char* out, size_t cap) {
   return true;
 }
 
+// Чи шлях папки f дорівнює dir[0..len) ("" = корінь, "/A/B"). Іде від листа до кореня, без буфера.
+bool dirMatches(int f, const char* dir, size_t len) {
+  size_t end = len;
+  int cur = f;
+  for (int guard = 0; guard < 16; guard++) {
+    Rec r = getRec(cur);
+    if (r.parent == Playlist::kNone) return end == 0;  // корінь у шлях не входить
+    const char* nm = (const char*)s_arena + r.nameOff;
+    size_t l = strlen(nm);
+    if (end < l + 1 || dir[end - 1 - l] != '/' || memcmp(dir + end - l, nm, l) != 0) return false;
+    end -= l + 1;
+    cur = r.parent;
+  }
+  return false;
+}
+
 }  // namespace
 
 void Playlist::clear() {
@@ -137,3 +153,26 @@ bool Playlist::trackPath(uint16_t i, char* out, size_t cap) const {
   return true;
 }
 
+uint16_t Playlist::indexOfPath(const char* path) const {
+  if (!path || path[0] != '/' || !nTracks_) return kNone;
+  const size_t n = strlen(path);
+  if (n < 6 || memcmp(path + n - 4, ".mp3", 4) != 0) return kNone;  // "/" + хоч 1 символ + ".mp3"
+  size_t slash = n;
+  while (path[--slash] != '/') {}                                     // path[0] == '/', тож зупиниться
+  const size_t dirLen = slash;                                        // 0 для кореня
+  const char* stem = path + slash + 1;
+  const size_t stemLen = n - 4 - (slash + 1);
+  if (!stemLen) return kNone;
+  for (int f = 0; f < nFolders_; f++) {
+    Rec r = getRec(f);
+    if (!r.count || !dirMatches(f, path, dirLen)) continue;
+    const char* p = (const char*)s_arena + r.nameOff;
+    p += strlen(p) + 1;  // пропустити імʼя папки
+    for (uint16_t k = 0; k < r.count; k++) {
+      size_t l = strlen(p);
+      if (l == stemLen && memcmp(p, stem, l) == 0) return (uint16_t)(r.first + k);
+      p += l + 1;
+    }
+  }
+  return kNone;
+}

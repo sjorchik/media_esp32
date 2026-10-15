@@ -10,6 +10,7 @@
 #include "core/app.h"
 #include "core/device_state.h"
 #include "core/events.h"
+#include "storage/resume_store.h"
 #include "util/diag.h"
 #include "util/log.h"
 #include "util/utf8.h"
@@ -20,6 +21,7 @@ constexpr const char* TAG = "sdsrc";
 // Код з контракту. Якщо в proto::errc є відповідна константа — замінити.
 constexpr const char* kErrTooMany = "too_many_files";
 constexpr int kListPerSlice = 12;
+static_assert(kScanPathMax > Resume::kPathMax, "буфер шляху має вміщати шлях резюме + NUL");
 
 portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -83,6 +85,7 @@ Res SdSource::activate() {
 
 void SdSource::deactivate() {
   g_audio.mute();  // мʼют ДО зупинки (ідемпотентно: менеджер уже мʼютив) — без клацань і «хвостів»
+  if (active_ && (st_ == PlayState::Play || st_ == PlayState::Pause)) saveResume(false);  // позиція ДО зупинки сесії; носія нема — не пишеться
   stopJobs();      // скан, DBG-читання, сесія декодера; після цього файл закрито
   active_ = false;
   st_ = PlayState::Idle;
@@ -193,10 +196,22 @@ void SdSource::finishScan(Scanner::St r) {
     return;
   }
   nav_.attach(pl_.permBuf(), pl_.tracks());  // перестановка — у зарезервованому хвості арени
-  cur_ = nav_.initialTrack();                // shuffle: випадковий старт (M5b задасть явний), інакше перший
+  // M5b1: збережений трек із позиції; запису/файлу нема → перший трек за каталогом із нуля. У shuffle він перший у колі.
+  uint32_t off = 0, ms = 0;
+  uint16_t rt = loadResume(off, ms);
+  if (rt == Playlist::kNone) {
+    rt = 0;
+    off = ms = 0;
+  }
+  cur_ = rt;
+  if (nav_.on()) nav_.startAt(cur_);
   st_ = PlayState::Stop;
-  emitTrackInfo();  // TRACK, FOLDER, META, TIME; далі STATE,sd,stop від менеджера
+  emitTrackInfo((int32_t)(ms / 1000));  // TRACK, FOLDER, META, TIME (збережена позиція); далі STATE,sd,play від менеджера
   if (r == Scanner::St::Overflow) Events::err(kErrTooMany);
+  errRun_ = 0;
+  Pick p = nav_.play(cur_);             // як PLAY зі stop: історія й коло shuffle ведуться звично
+  playTrack(p.to, p.why, p.act, off, ms);
+  Diag::logHeap("resume");
 }
 
 // ============================================================ події треку (M3c)
@@ -261,11 +276,12 @@ void SdSource::takeTags(bool emit) {
 }
 
 // Порядок за контрактом: TRACK, FOLDER, META, TIME (STATE додасть менеджер, якщо стан змінився)
-void SdSource::emitTrackInfo() {
+void SdSource::emitTrackInfo(int32_t timeS) {
   Events::track(cur_ + 1, pl_.tracks());
   emitFolder();
   emitMeta();
-  sendTime();
+  if (timeS > 0) Events::position((uint32_t)timeS, 0);  // відновлення: тривалість зʼявиться з першим кадром
+  else sendTime();
 }
 
 void SdSource::emitInfo() {
@@ -352,7 +368,7 @@ Res SdSource::nav(Nav k) {
 
 // Відкриває файл і запускає сесію. Викликається з app. Нова позиція → події треку (до відкриття файлу).
 // ReadFail = файл не відкрито (рішення про пропуск приймає playTrack).
-Res SdSource::startTrack(uint16_t n) {
+Res SdSource::startTrack(uint16_t n, uint32_t off, uint32_t ms) {
   if (!active_ || !media_.mounted()) return Res::NoMedia;
   if (n >= pl_.tracks()) return Res::BadArg;
   char path[kScanPathMax + kMediaNameMax + 8];
@@ -374,20 +390,22 @@ Res SdSource::startTrack(uint16_t n) {
     return media_.mounted() ? Res::ReadFail : Res::NoMedia;
   }
   LOGI(TAG, "play #%u %s (%u Б)", (unsigned)n + 1, path, (unsigned)media_.reader().size());
-  dec_.startSession();
+  dec_.startSessionAt(off, ms);
   st_ = PlayState::Play;
   nextTimeAt_ = millis() + kTimeEventMs;
+  rsmAt_ = millis() + kResumeSaveMs;
   infoSeq_ = dec_.infoSeq();
+  rsmWrite(off, ms);  // новий трек → (cur_, 0); DAC ще замʼючено, тож зупинка кешу при записі у флеш не чутна
   // state==play ⇒ DAC має звучати. Менеджер розмʼючує при зміні STATE, але для Play→Play STATE не міняється.
   g_audio.unmute();
   return Res::Ok;
 }
 
 // Запуск треку з автопропуском: файл не відкрито → ERR,read_fail і наступний трек; kPlayErrStop підряд → stop.
-Res SdSource::playTrack(uint16_t n, char why, HAct act) {
+Res SdSource::playTrack(uint16_t n, char why, HAct act, uint32_t off, uint32_t ms) {
   for (;;) {
     note(why, n);
-    Res r = startTrack(n);
+    Res r = startTrack(n, off, ms);
     if (r == Res::Ok) {
       nav_.commit(act, n);  // історія й курсор міняються лише після успішного запуску
       return r;
@@ -398,6 +416,7 @@ Res SdSource::playTrack(uint16_t n, char why, HAct act) {
     n = p.to;
     why = p.why;
     act = p.act;
+    off = ms = 0;  // відновлення стосується лише збереженого треку
   }
 }
 
@@ -426,6 +445,7 @@ void SdSource::onTrackEnd() {
     note(p.why, p.to);
     st_ = PlayState::Stop;
     setCur(p.to);
+    rsmWrite(0, 0);  // природний стоп: поточний трек із зсувом 0
     return;
   }
   playTrack(p.to, p.why, p.act);
@@ -452,7 +472,10 @@ Res SdSource::pause() {
   g_audio.mute();  // спершу тиша, потім зупинка продюсера
   bool ok = dec_.pause();
   st_ = PlayState::Pause;
-  if (ok) sendTime();  // один раз при паузі (якщо сесія вже скінчилась — подію кінця обробить pollPlayer)
+  if (ok) {
+    sendTime();         // один раз при паузі (якщо сесія вже скінчилась — подію кінця обробить pollPlayer)
+    saveResume(false);  // пауза: зсув стабільний, DAC замʼючено
+  }
   return Res::Ok;
 }
 
@@ -463,6 +486,7 @@ Res SdSource::stop() {
     endSession();
     st_ = PlayState::Stop;
     pushMeta();  // теги, розібрані до зупинки, але ще не надіслані
+    rsmWrite(0, 0);  // stop скидає позицію: той самий трек, зсув 0
   }
   return Res::Ok;
 }
@@ -498,6 +522,60 @@ void SdSource::pollPlayer(uint32_t now) {
     nextTimeAt_ = now + kTimeEventMs;
     sendTime();
   }
+  if (due(now, rsmAt_)) {  // раз на kResumeSaveMs під час play
+    rsmAt_ = now + kResumeSaveMs;
+    saveResume(true);
+  }
+}
+
+// ============================================================ резюме (M5b1)
+
+// Збережений трек активного SD: індекс у плейлисті або kNone (запису немає/битий/файлу нема → викликач бере перший трек).
+uint16_t SdSource::loadResume(uint32_t& off, uint32_t& ms) {
+  off = ms = 0;
+  Resume::Record rec;
+  Resume::ParseErr why = Resume::ParseErr::Ok;
+  ResumeStore::Load lr = ResumeStore::load(ResumeStore::Src::Sd, rec, &why);
+  if (lr != ResumeStore::Load::Ok) {
+    LOGI(TAG, "резюме: %s -> перший трек", lr == ResumeStore::Load::None ? "запису немає" : "запис пошкоджено");
+    return Playlist::kNone;
+  }
+  uint16_t idx = pl_.indexOfPath(rec.path);
+  if (idx == Playlist::kNone) {
+    LOGI(TAG, "резюме: '%s' немає в плейлисті -> перший трек", rec.path);
+    return Playlist::kNone;
+  }
+  off = rec.off;
+  ms = rec.ms;
+  LOGI(TAG, "резюме: #%u %s, зсув %u Б, %u мс", (unsigned)idx + 1, rec.path, (unsigned)off, (unsigned)ms);
+  return idx;
+}
+
+// Запис (cur_, off, ms). Шлях, що не влізає в 255 Б, не зберігається; старий запис стираємо, щоб не вести на інший трек.
+bool SdSource::rsmWrite(uint32_t off, uint32_t ms) {
+  if (!media_.mounted() || cur_ >= pl_.tracks()) return false;
+  char path[Resume::kPathMax + 1];  // стек app, 256 Б
+  if (!pl_.trackPath(cur_, path, sizeof path)) {
+    if (rsmWarn_ != cur_) {
+      rsmWarn_ = cur_;
+      LOGW(TAG, "резюме: шлях треку #%u довший за %u Б — не зберігається", (unsigned)cur_ + 1, (unsigned)Resume::kPathMax);
+    }
+    ResumeStore::erase(ResumeStore::Src::Sd);
+    return false;
+  }
+  rsmLastOff_ = off;
+  return ResumeStore::save(ResumeStore::Src::Sd, path, off, ms);
+}
+
+// Поточна позиція декодера → NVS. periodic: лише якщо зсув змінився щонайменше на один кадр відносно останнього запису.
+void SdSource::saveResume(bool periodic) {
+  uint32_t off = 0, ms = 0;
+  if (!dec_.position(off, ms)) return;
+  if (periodic) {
+    uint32_t d = off > rsmLastOff_ ? off - rsmLastOff_ : rsmLastOff_ - off;
+    if (d < kResumeMinStepBytes) return;
+  }
+  rsmWrite(off, ms);
 }
 
 // ============================================================ DBG
@@ -541,6 +619,8 @@ void SdSource::runDbg() {
     case Dbg::Tag: dbgTag(); job_ = Dbg::None; break;
     case Dbg::Shuf: dbgShuf(); job_ = Dbg::None; break;
     case Dbg::ShufTest: dbgShufTest(); job_ = Dbg::None; break;
+    case Dbg::Resume: dbgResume(false); job_ = Dbg::None; break;
+    case Dbg::ResumeClear: dbgResume(true); job_ = Dbg::None; break;
     default: job_ = Dbg::None; break;
   }
 }
@@ -843,4 +923,40 @@ void SdSource::dbgShufTest() {
     all = false;
   }
   LOGI(TAG, "shuftest: %s", all ? "OK" : "FAIL");
+}
+
+// DBG,resume: що збережено для активного SD, що знайдено в плейлисті. DBG,resume,clear: стерти запис (у play його
+// перепише наступний періодичний запис).
+void SdSource::dbgResume(bool clear) {
+  if (!active_) {
+    LOGW(TAG, "resume: потрібен src=sd");
+    return;
+  }
+  if (clear) {
+    bool ok = ResumeStore::erase(ResumeStore::Src::Sd);
+    LOGI(TAG, "resume: запис %s стерто%s", ResumeStore::key(ResumeStore::Src::Sd), ok ? "" : " (ПОМИЛКА)");
+    return;
+  }
+  Resume::Record rec;
+  Resume::ParseErr why = Resume::ParseErr::Ok;
+  ResumeStore::Load lr = ResumeStore::load(ResumeStore::Src::Sd, rec, &why);
+  if (lr == ResumeStore::Load::None) {
+    LOGI(TAG, "resume: %s — запису немає", ResumeStore::key(ResumeStore::Src::Sd));
+  } else if (lr == ResumeStore::Load::Bad) {
+    LOGI(TAG, "resume: %s — запис є, CRC/формат: ПОМИЛКА (%s)", ResumeStore::key(ResumeStore::Src::Sd), Resume::errName(why));
+  } else {
+    LOGI(TAG, "resume: %s шлях='%s' зсув=%u Б час=%u мс CRC ok версія=%u", ResumeStore::key(ResumeStore::Src::Sd), rec.path,
+         (unsigned)rec.off, (unsigned)rec.ms, (unsigned)rec.version);
+    if (st_ == PlayState::Scan) {
+      LOGI(TAG, "resume: триває скан, плейлист неповний");
+    } else {
+      uint16_t idx = pl_.indexOfPath(rec.path);
+      if (idx == Playlist::kNone) LOGI(TAG, "resume: у плейлисті: немає (старт — перший трек)");
+      else LOGI(TAG, "resume: у плейлисті: трек #%u з %u", (unsigned)idx + 1, (unsigned)pl_.tracks());
+    }
+  }
+  uint32_t off = 0, ms = 0;
+  if ((st_ == PlayState::Play || st_ == PlayState::Pause) && dec_.position(off, ms))
+    LOGI(TAG, "resume: зараз #%u зсув=%u Б час=%u мс, останній запис зсув=%u Б", (unsigned)cur_ + 1, (unsigned)off, (unsigned)ms,
+         (unsigned)rsmLastOff_);
 }

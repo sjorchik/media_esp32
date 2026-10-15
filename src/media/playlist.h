@@ -29,7 +29,10 @@ class Playlist {
   bool folderName(int f, char* out, size_t cap) const;         // остання компонента; корінь = "/"
   bool folderPath(int f, char* out, size_t cap) const;         // "/" або "/A/B"
   bool trackName(uint16_t i, char* out, size_t cap) const;     // без розширення
-  bool trackPath(uint16_t i, char* out, size_t cap) const;     // "/A/B/імʼя.mp3"
+  bool trackPath(uint16_t i, char* out, size_t cap) const;     // "/A/B/імʼя.mp3" — повний шлях за індексом (false, якщо не влізло в cap)
+  // M5b1: індекс треку за повним шляхом у форматі trackPath() (точний збіг, регістр важливий, розширення ".mp3");
+  // без буферів і виділень. kNone, якщо такого треку немає.
+  uint16_t indexOfPath(const char* path) const;
 
   // Буфер перестановки на tracks() елементів (uint16_t) у зарезервованому хвості арени.
   // Чинний лише після завершення скану (розташування залежить від кількості папок і треків); nullptr, якщо треків немає.
@@ -40,4 +43,3 @@ class Playlist {
   uint16_t nTracks_ = 0, nFolders_ = 0;
   size_t pool_ = 0;
 };
-

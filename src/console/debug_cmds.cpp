@@ -36,6 +36,7 @@ void help() {
   LOGI(TAG, "DBG,tag,<n> — розібрати ID3 треку №n без відтворення (src=sd, stop): версія, кодування, hex, UTF-8, час");
   LOGI(TAG, "DBG,nav — індекс, папка/діапазон, repeat, shuffle, помилки підряд, історія переходів");
   LOGI(TAG, "DBG,shuf — shuffle: режим, коло k/N, початок перестановки, хвіст історії, якість esp_random() | DBG,shuftest — самоперевірка рушія (OK/FAIL)");
+  LOGI(TAG, "DBG,resume — що збережено в NVS для активного SD (шлях, зсув, мс, CRC) і що знайдено в плейлисті | DBG,resume,clear — стерти запис");
   LOGI(TAG, "DBG,link[,reset] — втрати черг, злиті TIME, час відправки кадру (UART1+дзеркало)");
 }
 
@@ -103,6 +104,13 @@ void DebugCmds::handle(const proto::Msg& m) {
       return;
     }
     if (!g_sd.dbg(k, (int)n)) LOGW(TAG, "SD: попередня DBG-команда ще виконується");
+  } else if (!strcasecmp(c, "resume")) {
+    bool clear = m.argc == 2 && !strcasecmp(m.args[1], "clear");
+    if (m.argc > 2 || (m.argc == 2 && !clear)) {
+      LOGW(TAG, "DBG,resume[,clear]");
+      return;
+    }
+    if (!g_sd.dbg(clear ? SdSource::Dbg::ResumeClear : SdSource::Dbg::Resume, 0)) LOGW(TAG, "SD: попередня DBG-команда ще виконується");
   } else if (!strcasecmp(c, "link")) {
     if (m.argc >= 2 && !strcasecmp(m.args[1], "reset")) {
       Link::resetTxStats();
@@ -117,7 +125,3 @@ void DebugCmds::handle(const proto::Msg& m) {
     LOGW(TAG, "невідома DBG-команда '%s' (DBG,help)", c);
   }
 }
-
-
-
-
