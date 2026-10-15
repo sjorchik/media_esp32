@@ -379,7 +379,9 @@ Res SdSource::startTrack(uint16_t n, uint32_t off, uint32_t ms) {
     if (job_ == Dbg::Read) job_ = Dbg::None;
   }
   endSession();  // Play→Play: мʼют, зупинка, закриття; з Stop/Pause/Eof/помилки — просто закриття
-  g_audio.mute();  // ідемпотентно: сесія завжди стартує з замʼючено DAC (задача mp3 чекає розмʼюту), як у перевірених сценаріях
+  // Обхід M3c: після помилки сесії DAC лишається розмʼючений (endSession мʼютить лише живу сесію), причина зависання не доведена.
+  // 1 = сесія завжди стартує з замʼючено DAC (задача mp3 чекає розмʼюту), як у перевірених сценаріях; 0 = діагностична збірка.
+  if (kAlwaysMuteOnTrackStart) g_audio.mute();  // ідемпотентно
   st_ = PlayState::Stop;  // status() = 0/0, доки сесія не стартувала (відкриття може не вдатись)
   if (n != cur_) {
     cur_ = n;
@@ -390,12 +392,20 @@ Res SdSource::startTrack(uint16_t n, uint32_t off, uint32_t ms) {
     return media_.mounted() ? Res::ReadFail : Res::NoMedia;
   }
   LOGI(TAG, "play #%u %s (%u Б)", (unsigned)n + 1, path, (unsigned)media_.reader().size());
+#if SKIP_TEST_CMDS
+  if (failN_) {  // M5c1: штучний збій — задача mp3 поверне помилку після розмʼюту, далі звичайний шлях (pollPlayer → onPlayError)
+    failN_--;
+    LOGW(TAG, "failnext: штучний %s для #%u (лишилось %u)", failMode_ ? "decode_fail" : "read_fail", (unsigned)n + 1,
+         (unsigned)failN_);
+    dec_.injectNext(failMode_ ? Mp3Player::Ev::DecodeFail : Mp3Player::Ev::ReadFail);
+  }
+#endif
   dec_.startSessionAt(off, ms);
   st_ = PlayState::Play;
   nextTimeAt_ = millis() + kTimeEventMs;
   rsmAt_ = millis() + kResumeSaveMs;
   infoSeq_ = dec_.infoSeq();
-  rsmWrite(off, ms);  // новий трек → (cur_, 0); DAC ще замʼючено, тож зупинка кешу при записі у флеш не чутна
+  rsmWrite(off, ms);  // новий трек → (cur_, 0); при kAlwaysMuteOnTrackStart=1 DAC ще замʼючено, тож зупинка кешу при записі у флеш не чутна
   // state==play ⇒ DAC має звучати. Менеджер розмʼючує при зміні STATE, але для Play→Play STATE не міняється.
   g_audio.unmute();
   return Res::Ok;
@@ -621,6 +631,7 @@ void SdSource::runDbg() {
     case Dbg::ShufTest: dbgShufTest(); job_ = Dbg::None; break;
     case Dbg::Resume: dbgResume(false); job_ = Dbg::None; break;
     case Dbg::ResumeClear: dbgResume(true); job_ = Dbg::None; break;
+    case Dbg::FailNext: dbgFailNext(); job_ = Dbg::None; break;
     default: job_ = Dbg::None; break;
   }
 }
@@ -733,6 +744,18 @@ void SdSource::dbgPlay() {
   Pick p = nav_.jump((uint16_t)(arg_ - 1), 'd');
   Res r = playTrack(p.to, p.why, p.act);
   if (r != Res::Ok) Events::err(resCode(r), "dbgplay");
+}
+
+// DBG,failnext,<n>[,read|decode]: наступні n стартів треку штучно завершуються помилкою (M5c1; лише з SKIP_TEST_CMDS=1).
+void SdSource::dbgFailNext() {
+#if SKIP_TEST_CMDS
+  failN_ = (uint8_t)(arg_ & 0xFF);
+  failMode_ = (arg_ & 0x100) ? 1 : 0;
+  LOGI(TAG, "failnext: наступні %u стартів -> %s (помилок підряд зараз %u з %u)", (unsigned)failN_,
+       failMode_ ? "decode_fail" : "read_fail", (unsigned)errRun_, (unsigned)kPlayErrStop);
+#else
+  LOGW(TAG, "failnext: вимкнено (SKIP_TEST_CMDS=0)");
+#endif
 }
 
 // DBG,nav: стан навігації та історія переходів (лише лог).

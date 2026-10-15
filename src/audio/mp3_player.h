@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "config.h"
 #include "media/id3.h"
 #include "media/ifile_reader.h"
 
@@ -60,6 +61,27 @@ class Mp3Player {
   uint8_t tagMask() const { return tagMask_; }    // Id3::kFoundV2 | kFoundV1
   uint8_t tagVer() const { return tagVer_; }      // версія ID3v2 або 0
 
+  // M5c1: діагностика задачі «mp3» для DBG,aout (без блокувань, з будь-якої задачі; значення «на льоту»).
+  // Місце, де задача зараз (або була востаннє): де саме вона стоїть, якщо сесія «зависла».
+  enum Where : uint8_t { kWIdle = 0, kWOpen, kWWaitUnmute, kWDecode, kWFill, kWWrite, kWParked, kWDrain, kWFinish };
+  struct Snap {
+    St st;
+    Ev ev;
+    uint8_t req, where;
+    uint32_t whereAgoMs;                 // скільки мс тому задача зайшла в це місце
+    uint32_t starts, endEof, endRead, endDec, endStop;   // сесії: стартів / завершень за причинами
+    uint32_t lastEndAgoMs;               // 0xFFFFFFFF = сесій ще не завершувалось
+    int32_t cushUs;                      // оцінка запасу даних у DMA, мкс
+    uint32_t inFill, posMs;
+  };
+  void snap(Snap& o) const;
+  static const char* whereName(uint8_t w);
+#if SKIP_TEST_CMDS
+  // Штучний збій (DBG,failnext): наступна сесія після розмʼюту DAC завершиться цією помилкою (ReadFail/DecodeFail)
+  // тим самим шляхом, що й справжня (повернення з decodeLoop → finish → Ev). Викликати ДО startSession*.
+  void injectNext(Ev e) { inj_ = (uint8_t)e; }
+#endif
+
  private:
   static void taskEntry(void* self);
   void taskMain();
@@ -76,6 +98,7 @@ class Mp3Player {
   void drainSilence();
   uint8_t takeReq();
   void finish(Ev e);
+  void mark(uint8_t w);                // M5c1: де зараз задача (для snap)
 
   AudioOut* out_ = nullptr;
   IFileReader* rd_ = nullptr;
@@ -90,4 +113,11 @@ class Mp3Player {
   Id3::Tags tags_{};                         // ≈ 291 Б; копіюється з локальної структури в стеку задачі
   volatile uint32_t tagSeq_ = 0, tagUs_ = 0;
   volatile uint8_t tagMask_ = 0, tagVer_ = 0;
+  // M5c1: діагностика (≈ 36 Б)
+  volatile uint8_t where_ = 0;
+  volatile uint32_t whereMs_ = 0, lastEndMs_ = 0;                           // lastEndMs_: millis()|1, 0 = не було
+  volatile uint32_t nStart_ = 0, nEndEof_ = 0, nEndRead_ = 0, nEndDec_ = 0, nEndStop_ = 0;
+#if SKIP_TEST_CMDS
+  volatile uint8_t inj_ = 0;           // Ev штучної помилки (0 = нема)
+#endif
 };

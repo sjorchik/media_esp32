@@ -3,7 +3,9 @@
 #include <stdlib.h>
 #include <strings.h>
 
+#include "audio/audio_out.h"
 #include "audio/audio_task.h"
+#include "audio/mp3_player.h"
 #include "core/app.h"
 #include "core/device_state.h"
 #include "core/router.h"
@@ -44,6 +46,51 @@ void help() {
 #endif
   LOGI(TAG, "DBG,settings — збережені last_src/shuf/rep (CRC) | DBG,settings,clear — стерти set_v1");
   LOGI(TAG, "DBG,link[,reset] — втрати черг, злиті TIME, час відправки кадру (UART1+дзеркало)");
+  LOGI(TAG, "DBG,aout — стан AudioOut (мʼют, лічильники, власник мʼютекса) і задачі mp3 (де стоїть); читає без app, працює й при завислому app");
+#if SKIP_TEST_CMDS
+  LOGI(TAG, "DBG,failnext,<n>[,read|decode] — наступні n стартів треку штучно завершуються read_fail (типово) або decode_fail");
+#endif
+}
+
+const char* mp3St(Mp3Player::St s) { return s == Mp3Player::St::Idle ? "idle" : s == Mp3Player::St::Run ? "run" : "paused"; }
+
+const char* mp3Ev(Mp3Player::Ev e) {
+  switch (e) {
+    case Mp3Player::Ev::Eof: return "eof";
+    case Mp3Player::Ev::ReadFail: return "read_fail";
+    case Mp3Player::Ev::DecodeFail: return "decode_fail";
+    default: return "-";
+  }
+}
+
+// DBG,aout (M5c1): лише читання volatile-станів, без черги до app — відповідає й тоді, коли app завис на мʼютексі AudioOut.
+void aout() {
+  AudioOut::DbgInfo a;
+  g_audio.dbgInfo(a);
+  Mp3Player::Snap d;
+  g_sd.dec().snap(d);
+  LOGI(TAG, "aout: ready=%d muted=%d abort=%d | %u Гц %u кан gain=%u%%", a.ready, a.muted, a.aborting, (unsigned)a.rate,
+       (unsigned)a.channels, (unsigned)a.gainPct);
+  LOGI(TAG, "aout: src=%s state=%s | sd=%s errRun=%u/%u failnext=%u(%s)", srcName(g_sources.current()),
+       stateName(g_sources.state()), stateName(g_sd.playState()), (unsigned)g_sd.errRun(), (unsigned)kPlayErrStop,
+       (unsigned)g_sd.failLeft(), g_sd.failIsDecode() ? "decode" : "read");
+  LOGI(TAG, "aout: мʼют %u/%u анмʼют %u/%u fmt=%u stop=%u (виклики/реальні переходи)", (unsigned)a.muteCalls,
+       (unsigned)a.muteDone, (unsigned)a.unmuteCalls, (unsigned)a.unmuteDone, (unsigned)a.fmtCalls, (unsigned)a.stopCalls);
+  if (a.lastTrans) LOGI(TAG, "aout: остання зміна '%c' %u мс тому", a.lastTrans, (unsigned)a.lastTransAgoMs);
+  else LOGI(TAG, "aout: змін мʼюту ще не було");
+  LOGI(TAG, "aout: write: відкинуто=%u без_мʼютекса=%u неповних=%u", (unsigned)a.wDropped, (unsigned)a.wLockFail,
+       (unsigned)a.wPartial);
+  LOGI(TAG, "aout: мʼютекс: власник=%s оп='%c' | чекає '%c' %u мс | макс. очікування %u мс", a.owner ? a.owner : "вільний",
+       a.ownerOp ? a.ownerOp : '-', a.waitingOp ? a.waitingOp : '-', (unsigned)a.waitingMs, (unsigned)a.lockWaitMaxMs);
+  LOGI(TAG, "aout: DMA %u кадрів (≈%u мс), запас за оцінкою mp3 %d мкс", (unsigned)a.dmaFrames,
+       (unsigned)(a.dmaFrames * 1000u / (a.rate ? a.rate : kDefaultRate)), (int)d.cushUs);
+  LOGI(TAG, "mp3: st=%s req=%u ev=%s | місце: %s, %u мс", mp3St(d.st), (unsigned)d.req, mp3Ev(d.ev),
+       Mp3Player::whereName(d.where), (unsigned)d.whereAgoMs);
+  LOGI(TAG, "mp3: сесій старт=%u eof=%u read=%u dec=%u stop=%u | остання завершена %d мс тому | вхід=%u Б поз=%u мс",
+       (unsigned)d.starts, (unsigned)d.endEof, (unsigned)d.endRead, (unsigned)d.endDec, (unsigned)d.endStop,
+       d.lastEndAgoMs == 0xFFFFFFFFu ? -1 : (int)d.lastEndAgoMs, (unsigned)d.inFill, (unsigned)d.posMs);
+  LOGI(TAG, "aout: збірка: ALWAYS_MUTE_ON_TRACK_START=%d SKIP_TEST_CMDS=%d", (int)kAlwaysMuteOnTrackStart, SKIP_TEST_CMDS);
+  Diag::logHeap("aout");
 }
 
 }  // namespace
@@ -110,6 +157,25 @@ void DebugCmds::handle(const proto::Msg& m) {
       return;
     }
     if (!g_sd.dbg(k, (int)n)) LOGW(TAG, "SD: попередня DBG-команда ще виконується");
+  } else if (!strcasecmp(c, "aout")) {
+    aout();
+  } else if (!strcasecmp(c, "failnext")) {
+#if SKIP_TEST_CMDS
+    long n = 0;
+    bool dec = false;
+    bool ok = m.argc >= 2 && m.argc <= 3 && toInt(m.args[1], n) && n >= 0 && n <= 50;
+    if (ok && m.argc == 3) {
+      if (!strcasecmp(m.args[2], "decode")) dec = true;
+      else if (strcasecmp(m.args[2], "read") != 0) ok = false;
+    }
+    if (!ok) {
+      LOGW(TAG, "DBG,failnext,<0..50>[,read|decode]");
+      return;
+    }
+    if (!g_sd.dbg(SdSource::Dbg::FailNext, (int)n | (dec ? 0x100 : 0))) LOGW(TAG, "SD: попередня DBG-команда ще виконується");
+#else
+    LOGW(TAG, "DBG,failnext вимкнено (SKIP_TEST_CMDS=0)");
+#endif
   } else if (!strcasecmp(c, "resume")) {
     bool clear = m.argc == 2 && !strcasecmp(m.args[1], "clear");
     if (m.argc > 2 || (m.argc == 2 && !clear)) {
@@ -157,4 +223,3 @@ void DebugCmds::handle(const proto::Msg& m) {
     LOGW(TAG, "невідома DBG-команда '%s' (DBG,help)", c);
   }
 }
-

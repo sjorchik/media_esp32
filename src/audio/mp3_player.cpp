@@ -220,6 +220,45 @@ uint8_t* Mp3Player::scratch(size_t& cap) {
   return set()->in;
 }
 
+void Mp3Player::mark(uint8_t w) {
+  where_ = w;
+  whereMs_ = millis();
+}
+
+const char* Mp3Player::whereName(uint8_t w) {
+  switch (w) {
+    case kWIdle: return "idle(чекає notify)";
+    case kWOpen: return "старт(теги/seek)";
+    case kWWaitUnmute: return "чекає розмʼюту DAC";
+    case kWDecode: return "декодує";
+    case kWFill: return "читає файл";
+    case kWWrite: return "write() в AudioOut";
+    case kWParked: return "пауза";
+    case kWDrain: return "хвіст тиші";
+    case kWFinish: return "завершення";
+    default: return "?";
+  }
+}
+
+void Mp3Player::snap(Snap& o) const {
+  const uint32_t now = millis();
+  o.st = st_;
+  o.ev = ev_;
+  o.req = req_;
+  o.where = where_;
+  o.whereAgoMs = now - whereMs_;
+  o.starts = nStart_;
+  o.endEof = nEndEof_;
+  o.endRead = nEndRead_;
+  o.endDec = nEndDec_;
+  o.endStop = nEndStop_;
+  const uint32_t le = lastEndMs_;
+  o.lastEndAgoMs = le ? now - le : 0xFFFFFFFFu;
+  o.cushUs = sx.cushUs;
+  o.inFill = sx.inLen - sx.inPos;
+  o.posMs = posMs_;
+}
+
 // ============================================================ задача «mp3»
 
 void Mp3Player::taskEntry(void* self) { static_cast<Mp3Player*>(self)->taskMain(); }
@@ -228,6 +267,7 @@ uint8_t Mp3Player::takeReq() { return __atomic_exchange_n(&req_, (uint8_t)kReqNo
 
 void Mp3Player::taskMain() {
   for (;;) {
+    mark(kWIdle);
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  // Idle: блокуємось без витрат CPU
     uint8_t rq = takeReq();
     if (rq == kReqStart) runSession();
@@ -236,6 +276,17 @@ void Mp3Player::taskMain() {
 }
 
 void Mp3Player::finish(Ev e) {
+  switch (e) {  // M5c1: лічильники причин завершення
+    case Ev::Eof: nEndEof_ = nEndEof_ + 1; break;
+    case Ev::ReadFail: nEndRead_ = nEndRead_ + 1; break;
+    case Ev::DecodeFail: nEndDec_ = nEndDec_ + 1; break;
+    default: nEndStop_ = nEndStop_ + 1; break;
+  }
+  lastEndMs_ = millis() | 1u;
+  mark(kWFinish);
+#if SKIP_TEST_CMDS
+  inj_ = 0;  // невикористана штучна помилка не переходить на наступну сесію
+#endif
   ev_ = e;
   __sync_synchronize();
   st_ = St::Idle;  // app чекає саме на Idle (стоп) або бачить подію (кінець/помилка)
@@ -243,6 +294,8 @@ void Mp3Player::finish(Ev e) {
 
 void Mp3Player::runSession() {
   SdSet* S = set();
+  nStart_ = nStart_ + 1;
+  mark(kWOpen);
   memset(&sx, 0, sizeof sx);
   memset(&S->dec, 0, sizeof S->dec);
   mp3dec_init(&S->dec);
@@ -260,6 +313,7 @@ void Mp3Player::runSession() {
 // Докачує вхід до повного буфера (залишок зсувається на початок). false = помилка читання.
 bool Mp3Player::fill() {
   SdSet* S = set();
+  mark(kWFill);
   uint32_t avail = sx.inLen - sx.inPos;
   if (sx.inPos > 0) {
     if (avail) memmove(S->in, S->in + sx.inPos, avail);
@@ -355,6 +409,7 @@ bool Mp3Player::seekResume(uint32_t off, uint32_t ms) {
 // без блокувань «промотав» би трек, не даючи app (prio 1) завершити mute() — це був живий лок на залізі.
 bool Mp3Player::waitUnmuted() {
   const TickType_t tick = pdMS_TO_TICKS(2) ? pdMS_TO_TICKS(2) : 1;  // ніколи не 0 (busy-loop)
+  if (out_->isMuted() || out_->aborting()) mark(kWWaitUnmute);
   while (out_->isMuted() || out_->aborting()) {
     if (req_ != kReqNone) return false;
     ulTaskNotifyTake(pdTRUE, tick);
@@ -366,6 +421,7 @@ bool Mp3Player::waitUnmuted() {
 // Пауза: чекаємо Resume/Stop без витрат CPU. true = продовжувати, false = Stop.
 bool Mp3Player::parkPaused() {
   st_ = St::Paused;
+  mark(kWParked);
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     uint8_t rq = takeReq();
@@ -383,6 +439,7 @@ bool Mp3Player::parkPaused() {
 void Mp3Player::writePcm(size_t bytes) {
   const uint8_t* p = reinterpret_cast<const uint8_t*>(set()->pcm);
   size_t off = 0;
+  mark(kWWrite);
   while (off < bytes) {
     size_t w = out_->write(p + off, bytes - off, kPcmWriteTimeoutMs);
     if (w == 0) {
@@ -397,6 +454,7 @@ void Mp3Player::writePcm(size_t bytes) {
 // Природний кінець: дописуємо тишу на глибину DMA, щоб мʼют не обрізав останні мілісекунди звуку.
 void Mp3Player::drainSilence() {
   if (!sx.lastCh || out_->isMuted()) return;
+  mark(kWDrain);
   SdSet* S = set();
   size_t bytes = (size_t)(kDmaFrames + kChunkFrames) * sx.lastCh * 2;
   if (bytes > sizeof S->pcm) bytes = sizeof S->pcm;
@@ -414,12 +472,22 @@ Mp3Player::Ev Mp3Player::decodeLoop() {
     if (rq == kReqPause && !parkPaused()) return Ev::None;
 
     // 2) поки DAC замʼючений — не декодуємо (write() відкидав би дані, і ми «промотали» б трек)
+    mark(kWDecode);
     if (!waitUnmuted()) continue;
+    mark(kWDecode);
+#if SKIP_TEST_CMDS
+    if (inj_) {  // M5c1: штучна помилка тим самим шляхом і в той самий момент (після розмʼюту), що й справжня
+      Ev ie = (Ev)inj_;
+      inj_ = 0;
+      return ie;
+    }
+#endif
 
     // 3) вхід: докачуємо, коли лишилось менше за два максимальні кадри
     uint32_t avail = sx.inLen - sx.inPos;
     if (!sx.eof && avail < kDecInRefill) {
       if (!fill()) return Ev::ReadFail;
+      mark(kWDecode);
       avail = sx.inLen - sx.inPos;
     }
     if (avail == 0) return stats_.frames ? Ev::Eof : Ev::DecodeFail;

@@ -29,9 +29,28 @@ class AudioOut {
   size_t write(const void* data, size_t bytes, uint32_t timeoutMs = 100);
   void stop();                        // mute + скидання буферів; тактування I2S продовжується
 
+  // M5c1: діагностика для DBG,aout. Без блокувань, з будь-якої задачі (значення «на льоту», лише для лога).
+  struct DbgInfo {
+    bool ready, muted, aborting;
+    uint8_t channels, gainPct;
+    uint32_t rate;
+    uint32_t muteCalls, muteDone, unmuteCalls, unmuteDone, fmtCalls, stopCalls;  // виклики / реальні переходи
+    uint32_t wDropped, wLockFail, wPartial;   // write(): відкинуто (мʼют/abort); не взято мʼютекс; неповний запис
+    uint32_t lastTransAgoMs;                  // скільки мс тому була остання зміна (0xFFFFFFFF = ще не було)
+    char lastTrans;                           // 'M' мʼют, 'U' анмʼют, 'F' setFormat, 0 = не було
+    uint32_t waitingMs;                       // >0: хтось уже стільки мс чекає мʼютекс без таймауту (ознака завислого власника)
+    char waitingOp;
+    uint32_t lockWaitMaxMs;                   // макс. очікування мʼютекса в mute()/unmute()/setFormat()/stop()
+    const char* owner;                        // задача, що тримає мʼютекс зараз (nullptr = вільний)
+    char ownerOp;                             // остання операція під мʼютексом: w write, m mute, u unmute, f setFormat, s stop
+    uint32_t dmaFrames;                       // глибина DMA, кадрів
+  };
+  void dbgInfo(DbgInfo& o) const;
+
  private:
   void setXsmt(bool unmuted);
   void computeStep();
+  void mark(char kind);               // запис «остання зміна» для dbgInfo
 
   SemaphoreHandle_t mtx_ = nullptr;
   volatile bool muted_ = true;
@@ -42,4 +61,9 @@ class AudioOut {
   int32_t step_ = 1;
   int16_t lastL_ = 0, lastR_ = 0;
   int16_t buf_[kChunkFrames * 2];
+  struct Cnt {                        // лічильники діагностики (M5c1), ≈ 44 Б
+    uint32_t muteCalls, muteDone, unmuteCalls, unmuteDone, fmtCalls, stopCalls;
+    uint32_t wDropped, wLockFail, wPartial, lastTransMs;
+    char lastTrans;
+  } cnt_{};
 };

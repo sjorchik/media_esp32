@@ -180,6 +180,15 @@ inline constexpr uint32_t kBootStableMs = 60000;       // безперервна
 #define BOOT_TEST_CMDS 1       // 1: DBG,boot,crash (abort) і DBG,boot,set,<n> для перевірки на залізі; у релізі — 0
 #endif
 
+// ---- Зависання AudioOut після автопропуску треку (M5c1) ----
+#ifndef SKIP_TEST_CMDS
+#define SKIP_TEST_CMDS 1       // 1: DBG,failnext,<n>[,read|decode] — штучні збої старту треку (перевірка автопропуску); у релізі — 0
+#endif
+#ifndef ALWAYS_MUTE_ON_TRACK_START
+#define ALWAYS_MUTE_ON_TRACK_START 1   // 1: обхід M3c (мʼют на старті кожного треку); 0: діагностична збірка (-DALWAYS_MUTE_ON_TRACK_START=0)
+#endif
+inline constexpr bool kAlwaysMuteOnTrackStart = ALWAYS_MUTE_ON_TRACK_START != 0;  // SdSource::startTrack: mute() завжди перед стартом сесії
+
 // ---- Задачі ----
 inline constexpr int kCoreProto = 0;
 inline constexpr int kCoreAudio = 1;
@@ -194,4 +203,3 @@ inline constexpr int kPrioDecoder = 5;   // нижче за audio (6), вище 
 
 // ---- Діагностика ----
 inline constexpr uint32_t kDiagPeriodMs = 60000;
-

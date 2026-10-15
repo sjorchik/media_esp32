@@ -13,7 +13,7 @@
 // Працює через IMedia&, тому про SD не знає. Усе (скан, DBG-завдання) виконується в задачі app порціями.
 class SdSource : public ISource {
  public:
-  enum class Dbg : uint8_t { None, Info, Scan, List, Read, Play, Decode, Nav, Tag, Shuf, ShufTest, Resume, ResumeClear };
+  enum class Dbg : uint8_t { None, Info, Scan, List, Read, Play, Decode, Nav, Tag, Shuf, ShufTest, Resume, ResumeClear, FailNext };
 
   explicit SdSource(IMedia& media) : media_(media) {}
   SrcId id() const override { return SrcId::SD; }
@@ -36,7 +36,15 @@ class SdSource : public ISource {
   Res refreshMedia() override;
 
   // DBG (з будь-якої задачі): лише ставить запит; виконує app. false = попереднє ще виконується.
+  // FailNext: arg = n (0..255) | 0x100 для decode_fail (інакше read_fail); потрібен SKIP_TEST_CMDS=1.
   bool dbg(Dbg k, int arg = 0);
+
+  // Читання стану для DBG,aout (без блокувань; з консольної задачі, навіть якщо app завис)
+  const Mp3Player& dec() const { return dec_; }
+  PlayState playState() const { return st_; }
+  uint8_t errRun() const { return errRun_; }
+  uint8_t failLeft() const { return failN_; }
+  bool failIsDecode() const { return failMode_ != 0; }
 
  private:
   enum class Nav : uint8_t { Next, Prev, FNext, FPrev };
@@ -63,6 +71,7 @@ class SdSource : public ISource {
   void dbgShuf();
   void dbgShufTest();
   void dbgResume(bool clear);
+  void dbgFailNext();
   // відтворення
   Res startTrack(uint16_t n, uint32_t off = 0, uint32_t ms = 0);  // відкриває файл, запускає сесію (з зсуву off, мс); state=play; ReadFail, якщо не відкрито
   Res playTrack(uint16_t n, char why, HAct act = HAct::Push, uint32_t off = 0, uint32_t ms = 0);  // startTrack з автопропуском битих (ERR + наступний з кола/каталогу; 3 підряд → stop); act — запис в історію після успіху; off/ms — лише для першої спроби
@@ -101,6 +110,8 @@ class SdSource : public ISource {
   ShufNav nav_;                            // shuffle-коло (перестановка в арені плейлиста), історія, політика вибору
   uint16_t histBuf_[kHistLen] = {};        // кільце історії (2 Б на запис)
   uint8_t errRun_ = 0;                     // помилок відтворення підряд
+  uint8_t failN_ = 0;                      // M5c1: скільки наступних стартів треку штучно завершити помилкою (SKIP_TEST_CMDS)
+  uint8_t failMode_ = 0;                   // 0 = read_fail, 1 = decode_fail
   Mp3Player dec_;
   uint32_t nextTimeAt_ = 0, infoSeq_ = 0;
   uint16_t tagTrack_ = 0xFFFF;             // для якого треку чинні dec_.tags() (0xFFFF = ні)

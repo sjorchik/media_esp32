@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include "driver/i2s.h"
+#include "freertos/task.h"
 
 #include "pins.h"
 #include "util/log.h"
@@ -27,11 +28,45 @@ struct AbortGuard {
   ~AbortGuard() { s_abortWrite = false; }
 };
 
+// Діагностика мʼютекса (M5c1): хто тримає й хто чекає. s_owner/s_depth/s_op пише лише власник мʼютекса,
+// s_waitMs/s_waitOp — той, хто чекає без таймауту; DBG,aout читає без блокувань.
+volatile TaskHandle_t s_owner = nullptr;
+volatile uint8_t s_depth = 0;
+volatile char s_op = 0;
+volatile uint32_t s_waitMs = 0;   // millis()|1 від початку очікування (0 = ніхто не чекає; при кількох чекальниках — останній)
+volatile char s_waitOp = 0;
+uint32_t s_waitMaxMs = 0;
+
 struct Lock {
   SemaphoreHandle_t m;
   bool ok;
-  Lock(SemaphoreHandle_t mtx, TickType_t t) : m(mtx), ok(mtx && xSemaphoreTakeRecursive(mtx, t) == pdTRUE) {}
-  ~Lock() { if (ok) xSemaphoreGiveRecursive(m); }
+  Lock(SemaphoreHandle_t mtx, TickType_t t, char op) : m(mtx), ok(false) {
+    if (!mtx) return;
+    const bool block = (t == portMAX_DELAY);
+    uint32_t t0 = 0;
+    if (block) {
+      t0 = millis();
+      s_waitOp = op;
+      s_waitMs = t0 | 1u;
+    }
+    ok = xSemaphoreTakeRecursive(mtx, t) == pdTRUE;
+    if (block) {
+      s_waitMs = 0;
+      uint32_t w = millis() - t0;
+      if (ok && w > s_waitMaxMs) s_waitMaxMs = w;
+    }
+    if (ok) {
+      if (s_depth == 0) s_owner = xTaskGetCurrentTaskHandle();
+      s_depth = (uint8_t)(s_depth + 1);
+      s_op = op;
+    }
+  }
+  ~Lock() {
+    if (!ok) return;
+    s_depth = (uint8_t)(s_depth - 1);
+    if (s_depth == 0) s_owner = nullptr;
+    xSemaphoreGiveRecursive(m);
+  }
 };
 }  // namespace
 
@@ -42,6 +77,40 @@ void AudioOut::earlyMute() {
 }
 
 bool AudioOut::aborting() const { return s_abortWrite; }
+
+void AudioOut::mark(char kind) {
+  cnt_.lastTrans = kind;
+  cnt_.lastTransMs = millis();
+}
+
+void AudioOut::dbgInfo(DbgInfo& o) const {
+  const uint32_t now = millis();
+  o.ready = ready_;
+  o.muted = muted_;
+  o.aborting = s_abortWrite;
+  o.channels = ch_;
+  o.rate = rate_;
+  o.gainPct = (uint8_t)((int64_t)gain_ * 100 / 32768);
+  o.muteCalls = cnt_.muteCalls;
+  o.muteDone = cnt_.muteDone;
+  o.unmuteCalls = cnt_.unmuteCalls;
+  o.unmuteDone = cnt_.unmuteDone;
+  o.fmtCalls = cnt_.fmtCalls;
+  o.stopCalls = cnt_.stopCalls;
+  o.wDropped = cnt_.wDropped;
+  o.wLockFail = cnt_.wLockFail;
+  o.wPartial = cnt_.wPartial;
+  o.lastTrans = cnt_.lastTrans;
+  o.lastTransAgoMs = cnt_.lastTrans ? now - cnt_.lastTransMs : 0xFFFFFFFFu;
+  const uint32_t ws = s_waitMs;
+  o.waitingMs = ws ? now - (ws & ~1u) : 0;
+  o.waitingOp = ws ? s_waitOp : 0;
+  o.lockWaitMaxMs = s_waitMaxMs;
+  TaskHandle_t h = s_owner;
+  o.owner = h ? pcTaskGetName(h) : nullptr;
+  o.ownerOp = s_op;
+  o.dmaFrames = kDmaFrames;
+}
 
 void AudioOut::setXsmt(bool unmuted) { digitalWrite(PIN_XSMT, levelFor(unmuted)); }
 
@@ -88,8 +157,9 @@ bool AudioOut::begin() {
 }
 
 void AudioOut::mute() {
+  cnt_.muteCalls++;
   AbortGuard ag;                        // оголошено до Lock: скидається після відпускання мʼютекса
-  Lock l(mtx_, portMAX_DELAY);
+  Lock l(mtx_, portMAX_DELAY, 'm');
   if (!ready_) return;
   if (!muted_) {
     // Хвіст fade-out: від останнього кадру лінійно до нуля, без участі продюсера
@@ -109,6 +179,8 @@ void AudioOut::mute() {
     }
     setXsmt(false);
     muted_ = true;
+    cnt_.muteDone++;
+    mark('M');
     vTaskDelay(pdMS_TO_TICKS(kMuteSettleMs));
     i2s_zero_dma_buffer(kPort);
     lastL_ = lastR_ = 0;
@@ -118,13 +190,16 @@ void AudioOut::mute() {
 }
 
 void AudioOut::unmute() {
-  Lock l(mtx_, portMAX_DELAY);
+  cnt_.unmuteCalls++;
+  Lock l(mtx_, portMAX_DELAY, 'u');
   if (!ready_ || !muted_) return;
   i2s_zero_dma_buffer(kPort);
   gain_ = 0;                          // fade-in на перших кадрах write()
   setXsmt(true);
   vTaskDelay(pdMS_TO_TICKS(kUnmuteSettleMs));
   muted_ = false;
+  cnt_.unmuteDone++;
+  mark('U');
 }
 
 bool AudioOut::setFormat(uint32_t rate, uint8_t bits, uint8_t channels) {
@@ -132,7 +207,8 @@ bool AudioOut::setFormat(uint32_t rate, uint8_t bits, uint8_t channels) {
     LOGW(TAG, "формат не підтримується: %u Гц %u біт %u кан", (unsigned)rate, bits, channels);
     return false;
   }
-  Lock l(mtx_, portMAX_DELAY);
+  cnt_.fmtCalls++;
+  Lock l(mtx_, portMAX_DELAY, 'f');
   if (!ready_) return false;
   bool wasOn = !muted_;
   if (wasOn) mute();
@@ -141,20 +217,33 @@ bool AudioOut::setFormat(uint32_t rate, uint8_t bits, uint8_t channels) {
   ch_ = channels;
   computeStep();
   if (wasOn) unmute();
+  mark('F');
   return true;
 }
 
 size_t AudioOut::write(const void* data, size_t bytes, uint32_t timeoutMs) {
   if (!ready_ || bytes == 0) return 0;
-  if (muted_ || s_abortWrite) return bytes;   // замʼючено або йде мʼют — відкидаємо
-  Lock l(mtx_, pdMS_TO_TICKS(timeoutMs));
-  if (!l.ok) return 0;
-  if (muted_ || s_abortWrite) return bytes;
+  if (muted_ || s_abortWrite) {               // замʼючено або йде мʼют — відкидаємо
+    cnt_.wDropped++;
+    return bytes;
+  }
+  Lock l(mtx_, pdMS_TO_TICKS(timeoutMs), 'w');
+  if (!l.ok) {
+    cnt_.wLockFail++;
+    return 0;
+  }
+  if (muted_ || s_abortWrite) {
+    cnt_.wDropped++;
+    return bytes;
+  }
 
   const int16_t* in = (const int16_t*)data;
   size_t fb = (size_t)ch_ * 2, frames = bytes / fb, consumed = 0;
   while (frames) {
-    if (s_abortWrite) return bytes;           // між порціями віддаємо мʼютекс для mute()
+    if (s_abortWrite) {                       // між порціями віддаємо мʼютекс для mute()
+      cnt_.wDropped++;
+      return bytes;
+    }
     size_t n = frames < kChunkFrames ? frames : kChunkFrames;
     for (size_t i = 0; i < n; i++) {
       int32_t lv, rv;
@@ -177,7 +266,10 @@ size_t AudioOut::write(const void* data, size_t bytes, uint32_t timeoutMs) {
       lastR_ = buf_[2 * (wf - 1) + 1];
     }
     consumed += wf * fb;
-    if (e != ESP_OK || wf < n) break;
+    if (e != ESP_OK || wf < n) {
+      cnt_.wPartial++;
+      break;
+    }
     frames -= n;
     in += n * ch_;
   }
@@ -185,7 +277,8 @@ size_t AudioOut::write(const void* data, size_t bytes, uint32_t timeoutMs) {
 }
 
 void AudioOut::stop() {
+  cnt_.stopCalls++;
   mute();
-  Lock l(mtx_, portMAX_DELAY);
+  Lock l(mtx_, portMAX_DELAY, 's');
   if (ready_) i2s_zero_dma_buffer(kPort);
 }
