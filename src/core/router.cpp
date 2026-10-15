@@ -1,6 +1,5 @@
 #include "core/router.h"
 
-#include <stdlib.h>
 #include <string.h>
 
 #include "config.h"
@@ -15,11 +14,16 @@ namespace {
 constexpr const char* TAG = "router";
 QueueHandle_t s_q = nullptr;
 
+// Лише десяткові цифри (контракт, розд. 2): без пробілів, знаку, префіксів.
 bool parseInt(const char* s, long& v) {
   if (!s || !*s) return false;
-  char* e = nullptr;
-  v = strtol(s, &e, 10);
-  return *e == 0;
+  v = 0;
+  for (const char* p = s; *p; p++) {
+    if (*p < '0' || *p > '9') return false;
+    v = v * 10 + (*p - '0');
+    if (v > 100000) return false;  // усі валідні аргументи ≤ 2; захист від переповнення
+  }
+  return true;
 }
 
 bool parseSrc(const char* s, SrcId& out) {

@@ -3,6 +3,7 @@
 #include <unity.h>
 
 #include "proto/frame.h"
+#include "proto/proto_table.h"
 
 using namespace proto;
 
@@ -162,6 +163,321 @@ static void test_split_empty_fields() {
   TEST_ASSERT_EQUAL_STRING("c", m.args[2]);
 }
 
+// ---------------- M5c4: додаткові тести відповідності контракту ----------------
+
+static void test_escape_ctrl_chars() {
+  const char* txt = "a\r\nb\tc";
+  char buf[256];
+  Arg a[] = {Arg::T(txt)};
+  size_t len = encodeFrame(buf, sizeof buf, "META", a, 1);
+  TEST_ASSERT_GREATER_THAN(0, (int)len);
+  TEST_ASSERT_NOT_NULL(strstr(buf, "a%0D%0Ab%09c"));
+  for (size_t i = 1; i + 1 < len; i++) TEST_ASSERT_TRUE((uint8_t)buf[i] >= 0x20);  // у кадрі лише фінальний LF
+  Sink s;
+  FrameParser p(cb, &s);
+  p.feed((const uint8_t*)buf, len);
+  TEST_ASSERT_EQUAL_INT(1, s.n);
+  Msg m;
+  TEST_ASSERT_TRUE(splitBody(s.last, m));
+  TEST_ASSERT_EQUAL_STRING(txt, m.args[0]);
+}
+
+static void test_escape_no_raw_specials() {
+  char buf[256];
+  Arg a[] = {Arg::T("a,b*c$d%e")};
+  size_t len = encodeFrame(buf, sizeof buf, "META", a, 1);
+  int commas = 0, stars = 0, dollars = 0;
+  for (size_t i = 0; i < len; i++) {
+    if (buf[i] == ',') commas++;
+    if (buf[i] == '*') stars++;
+    if (buf[i] == '$') dollars++;
+  }
+  TEST_ASSERT_EQUAL_INT(1, commas);   // лише роздільник імені й поля
+  TEST_ASSERT_EQUAL_INT(1, stars);    // лише перед сумою
+  TEST_ASSERT_EQUAL_INT(1, dollars);  // лише початок кадру
+  TEST_ASSERT_NOT_NULL(strstr(buf, "a%2Cb%2Ac%24d%25e"));
+}
+
+static void test_empty_fields_encode() {
+  char buf[256];
+  Arg a[] = {Arg::T(""), Arg::T(""), Arg::T("")};
+  size_t len = encodeFrame(buf, sizeof buf, "META", a, 3);
+  TEST_ASSERT_GREATER_THAN(0, (int)len);
+  TEST_ASSERT_EQUAL_INT(0, strncmp(buf, "$META,,,*", 9));
+  Sink s;
+  FrameParser p(cb, &s);
+  p.feed((const uint8_t*)buf, len);
+  TEST_ASSERT_EQUAL_INT(1, s.n);
+  Msg m;
+  TEST_ASSERT_TRUE(splitBody(s.last, m));
+  TEST_ASSERT_EQUAL_UINT8(3, m.argc);
+  for (int i = 0; i < 3; i++) TEST_ASSERT_EQUAL_STRING("", m.args[i]);
+}
+
+static void test_hb_seq_wrap_text() {
+  char buf[256];
+  Arg a[] = {Arg::N(65535)};
+  encodeFrame(buf, sizeof buf, "HB", a, 1);
+  TEST_ASSERT_EQUAL_INT(0, strncmp(buf, "$HB,65535*", 10));
+  Arg z[] = {Arg::N(0)};
+  encodeFrame(buf, sizeof buf, "HB", z, 1);
+  TEST_ASSERT_EQUAL_INT(0, strncmp(buf, "$HB,0*", 6));
+}
+
+// Обрізання не розрізає escape-послідовність: поле з одних ',' (кожна → %2C, 3 Б).
+static void test_truncate_escape_boundary() {
+  char big[301];
+  memset(big, ',', 300);
+  big[300] = 0;
+  char buf[256];
+  Arg a[] = {Arg::T(big)};
+  size_t len = encodeFrame(buf, sizeof buf, "META", a, 1);
+  TEST_ASSERT_TRUE(len > 0 && len <= kMaxFrame);
+  Sink s;
+  FrameParser p(cb, &s);
+  p.feed((const uint8_t*)buf, len);
+  TEST_ASSERT_EQUAL_INT(1, s.n);
+  Msg m;
+  splitBody(s.last, m);
+  TEST_ASSERT_EQUAL_UINT8(1, m.argc);
+  size_t fl = strlen(m.args[0]);
+  TEST_ASSERT_EQUAL_size_t(81, fl);  // бюджет поля 245 Б → 81 × 3 = 243
+  for (size_t i = 0; i < fl; i++) TEST_ASSERT_EQUAL_INT(',', m.args[0][i]);  // жодного обрубка «%2»
+}
+
+// Довге ASCII-поле використовує кадр до межі: рівно 255 Б.
+static void test_truncate_ascii_fills_frame() {
+  char big[401];
+  memset(big, 'a', 400);
+  big[400] = 0;
+  char buf[256];
+  Arg a[] = {Arg::T(big)};
+  size_t len = encodeFrame(buf, sizeof buf, "META", a, 1);
+  TEST_ASSERT_EQUAL_size_t(255, len);
+  Sink s;
+  FrameParser p(cb, &s);
+  p.feed((const uint8_t*)buf, len);
+  TEST_ASSERT_EQUAL_INT(1, s.n);
+  Msg m;
+  splitBody(s.last, m);
+  TEST_ASSERT_EQUAL_size_t(245, strlen(m.args[0]));
+}
+
+// 3- і 4-байтові символи ріжуться лише цілими.
+static void test_truncate_multibyte() {
+  char big[700];
+  big[0] = 0;
+  for (int i = 0; i < 100; i++) strcat(big, "\xF0\x9F\x98\x80");  // U+1F600, 4 Б
+  char buf[256];
+  Arg a[] = {Arg::T(big)};
+  size_t len = encodeFrame(buf, sizeof buf, "META", a, 1);
+  TEST_ASSERT_TRUE(len > 0 && len <= kMaxFrame);
+  Sink s;
+  FrameParser p(cb, &s);
+  p.feed((const uint8_t*)buf, len);
+  Msg m;
+  splitBody(s.last, m);
+  size_t fl = strlen(m.args[0]);
+  TEST_ASSERT_TRUE(fl > 0 && fl % 4 == 0);
+  for (size_t i = 0; i < fl; i += 4) {
+    TEST_ASSERT_EQUAL_HEX8(0xF0, (uint8_t)m.args[0][i]);
+    TEST_ASSERT_EQUAL_HEX8(0x9F, (uint8_t)m.args[0][i + 1]);
+    TEST_ASSERT_EQUAL_HEX8(0x98, (uint8_t)m.args[0][i + 2]);
+    TEST_ASSERT_EQUAL_HEX8(0x80, (uint8_t)m.args[0][i + 3]);
+  }
+  big[0] = 0;
+  for (int i = 0; i < 200; i++) strcat(big, "\xE2\x82\xAC");  // €, 3 Б
+  Arg b[] = {Arg::T(big)};
+  len = encodeFrame(buf, sizeof buf, "META", b, 1);
+  TEST_ASSERT_TRUE(len > 0 && len <= kMaxFrame);
+  Sink s2;
+  FrameParser p2(cb, &s2);
+  p2.feed((const uint8_t*)buf, len);
+  splitBody(s2.last, m);
+  fl = strlen(m.args[0]);
+  TEST_ASSERT_TRUE(fl > 0 && fl % 3 == 0);
+}
+
+// Трьох довгих полів із екрануванням разом: кадр ≤ 255, кожне поле цілісне.
+static void test_truncate_three_fields_escaped() {
+  char a1[301], a2[301], a3[301];
+  memset(a1, ',', 300);
+  a1[300] = 0;
+  memset(a2, '%', 300);
+  a2[300] = 0;
+  a3[0] = 0;
+  for (int i = 0; i < 100; i++) strcat(a3, "Ї");
+  char buf[256];
+  Arg a[] = {Arg::T(a1), Arg::T(a2), Arg::T(a3)};
+  size_t len = encodeFrame(buf, sizeof buf, "META", a, 3);
+  TEST_ASSERT_TRUE(len > 0 && len <= kMaxFrame);
+  Sink s;
+  FrameParser p(cb, &s);
+  p.feed((const uint8_t*)buf, len);
+  TEST_ASSERT_EQUAL_INT(1, s.n);
+  Msg m;
+  splitBody(s.last, m);
+  TEST_ASSERT_EQUAL_UINT8(3, m.argc);
+  for (size_t i = 0; i < strlen(m.args[0]); i++) TEST_ASSERT_EQUAL_INT(',', m.args[0][i]);
+  for (size_t i = 0; i < strlen(m.args[1]); i++) TEST_ASSERT_EQUAL_INT('%', m.args[1][i]);
+  size_t l3 = strlen(m.args[2]);
+  TEST_ASSERT_TRUE(l3 > 0 && l3 % 2 == 0);
+}
+
+static void test_dollar_resync_variants() {
+  {
+    Sink s;
+    FrameParser p(cb, &s);
+    feedStr(p, "$SRC,s$PLAY*04\n");  // обірваний кадр + новий
+    TEST_ASSERT_EQUAL_INT(1, s.n);
+    TEST_ASSERT_EQUAL_STRING("PLAY", s.last);
+  }
+  {
+    Sink s;
+    FrameParser p(cb, &s);
+    feedStr(p, "$$$PLAY*04\n");  // кілька '$' підряд
+    TEST_ASSERT_EQUAL_INT(1, s.n);
+    TEST_ASSERT_EQUAL_STRING("PLAY", s.last);
+  }
+  {
+    Sink s;
+    FrameParser p(cb, &s);
+    feedStr(p, "$PLAY*04$HB,1*17\n");  // перший без LF втрачено, другий прийнято
+    TEST_ASSERT_EQUAL_INT(1, s.n);
+    TEST_ASSERT_EQUAL_STRING("HB,1", s.last);
+  }
+  {
+    Sink s;
+    FrameParser p(cb, &s);
+    feedStr(p, "$PLAY*04\nxx$PLAY*04\n");  // сміття між валідними кадрами
+    TEST_ASSERT_EQUAL_INT(2, s.n);
+  }
+}
+
+static void test_no_dollar_ignored() {
+  Sink s;
+  FrameParser p(cb, &s);
+  feedStr(p, "PLAY*04\n");
+  feedStr(p, "GET\n");
+  TEST_ASSERT_EQUAL_INT(0, s.n);
+  TEST_ASSERT_EQUAL_UINT32(0, p.bad());  // без '$' — не кадр, навіть не помилка
+  feedStr(p, "$PLAY*04\n");
+  TEST_ASSERT_EQUAL_INT(1, s.n);
+}
+
+static void test_cr_ignored_inside() {
+  Sink s;
+  FrameParser p(cb, &s);
+  feedStr(p, "$PLAY\r*04\r\n");  // CR ігнорується будь-де
+  TEST_ASSERT_EQUAL_INT(1, s.n);
+  TEST_ASSERT_EQUAL_STRING("PLAY", s.last);
+}
+
+static void test_oversize_far_and_recover() {
+  Sink s;
+  FrameParser p(cb, &s);
+  p.feed((const uint8_t*)"$", 1);
+  for (int i = 0; i < 700; i++) p.feed((uint8_t)'A');  // значно більше ліміту
+  feedStr(p, "*00\n");
+  TEST_ASSERT_EQUAL_INT(0, s.n);
+  feedStr(p, "$GET*XX\n");  // погана сума — теж мовчки
+  TEST_ASSERT_EQUAL_INT(0, s.n);
+  feedStr(p, "$PLAY*04\n");
+  TEST_ASSERT_EQUAL_INT(1, s.n);
+}
+
+static void test_err_frame_encode() {
+  char buf[256];
+  Arg a[] = {Arg::S("unknown_cmd"), Arg::T("A,B")};
+  size_t len = encodeFrame(buf, sizeof buf, "ERR", a, 2);
+  TEST_ASSERT_GREATER_THAN(0, (int)len);
+  TEST_ASSERT_NOT_NULL(strstr(buf, "$ERR,unknown_cmd,A%2CB*"));
+  Sink s;
+  FrameParser p(cb, &s);
+  p.feed((const uint8_t*)buf, len);
+  TEST_ASSERT_EQUAL_INT(1, s.n);
+  Arg b[] = {Arg::S("bad_arg")};
+  len = encodeFrame(buf, sizeof buf, "ERR", b, 1);
+  TEST_ASSERT_EQUAL_INT(0, strncmp(buf, "$ERR,bad_arg*", 13));  // без деталі — без зайвої коми
+}
+
+// Таблиця команд відповідає розд. 4 контракту (імена, кількість аргументів).
+static const proto::CmdDef* findCmd(const char* n) {
+  for (size_t i = 0; i < kCmdCount; i++)
+    if (!strcmp(kCmds[i].name, n)) return &kCmds[i];
+  return nullptr;
+}
+
+static void test_cmd_table_matches_contract() {
+  struct E { const char* n; int mn, mx; };
+  const E want[] = {{"HELLO", 1, 1}, {"GET", 0, 0},   {"SRC", 1, 1},   {"PLAY", 0, 0}, {"PAUSE", 0, 0},
+                    {"TOGGLE", 0, 0}, {"STOP", 0, 0}, {"NEXT", 0, 0},  {"PREV", 0, 0}, {"FNEXT", 0, 0},
+                    {"FPREV", 0, 0},  {"SHUF", 1, 1}, {"REP", 1, 1},   {"HB", 1, 1}};
+  for (const E& e : want) {
+    const CmdDef* d = findCmd(e.n);
+    TEST_ASSERT_NOT_NULL(d);
+    TEST_ASSERT_EQUAL_INT(e.mn, d->minArgs);
+    TEST_ASSERT_EQUAL_INT(e.mx, d->maxArgs);
+  }
+  // зарезервовані: є в таблиці (роутер відповідає not_implemented), інших команд зверх контракту нема
+  TEST_ASSERT_NOT_NULL(findCmd("LIST"));
+  TEST_ASSERT_NOT_NULL(findCmd("PLAYFILE"));
+  TEST_ASSERT_EQUAL_size_t(sizeof(want) / sizeof(want[0]) + 2, kCmdCount);
+  TEST_ASSERT_NULL(findCmd("play"));  // регістр значущий → unknown_cmd
+  TEST_ASSERT_NULL(findCmd("DBG"));   // DBG — лише UART0, не частина контракту
+}
+
+// Модель перевірки арності з роутера: ці випадки мають давати bad_arg.
+static bool arityOk(const char* body) {
+  char tmp[64];
+  strncpy(tmp, body, sizeof tmp - 1);
+  tmp[sizeof tmp - 1] = 0;
+  Msg m;
+  if (!splitBody(tmp, m)) return false;
+  const CmdDef* d = findCmd(m.name);
+  if (!d) return false;
+  return !m.tooMany && m.argc >= d->minArgs && m.argc <= d->maxArgs;
+}
+
+static void test_arity_model() {
+  TEST_ASSERT_TRUE(arityOk("SRC,sd"));
+  TEST_ASSERT_TRUE(arityOk("HELLO,1"));
+  TEST_ASSERT_TRUE(arityOk("PLAY"));
+  TEST_ASSERT_FALSE(arityOk("SRC"));       // немає аргументу
+  TEST_ASSERT_FALSE(arityOk("SRC,sd,x"));  // зайвий аргумент
+  TEST_ASSERT_FALSE(arityOk("PLAY,1"));
+  TEST_ASSERT_FALSE(arityOk("PLAY,"));     // порожній аргумент теж аргумент
+  TEST_ASSERT_FALSE(arityOk("SHUF"));
+  TEST_ASSERT_FALSE(arityOk("REP"));
+  TEST_ASSERT_FALSE(arityOk("FOO"));       // невідома команда
+}
+
+static void test_errc_codes_match_contract() {
+  TEST_ASSERT_EQUAL_STRING("unknown_cmd", errc::kUnknownCmd);
+  TEST_ASSERT_EQUAL_STRING("bad_arg", errc::kBadArg);
+  TEST_ASSERT_EQUAL_STRING("bad_state", errc::kBadState);
+  TEST_ASSERT_EQUAL_STRING("no_media", errc::kNoMedia);
+  TEST_ASSERT_EQUAL_STRING("read_fail", errc::kReadFail);
+  TEST_ASSERT_EQUAL_STRING("decode_fail", errc::kDecodeFail);
+  TEST_ASSERT_EQUAL_STRING("too_many_files", errc::kTooManyFiles);
+  TEST_ASSERT_EQUAL_STRING("not_implemented", errc::kNotImplemented);
+  TEST_ASSERT_EQUAL_STRING("bt_fail", errc::kBtFail);
+}
+
+static void test_split_edge_cases() {
+  char b1[] = "SHUF,1,2,3,4,5,6,7,8,9";  // 9 аргументів → tooMany
+  Msg m;
+  TEST_ASSERT_TRUE(splitBody(b1, m));
+  TEST_ASSERT_EQUAL_UINT8(kMaxArgs, m.argc);
+  TEST_ASSERT_TRUE(m.tooMany);
+  char b2[] = ",x";  // порожнє імʼя
+  TEST_ASSERT_FALSE(splitBody(b2, m));
+  char b3[] = "ERR,bad%2Carg";
+  TEST_ASSERT_TRUE(splitBody(b3, m));
+  TEST_ASSERT_EQUAL_STRING("bad,arg", m.args[0]);
+}
+
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_examples_parse);
@@ -174,5 +490,22 @@ int main(int, char**) {
   RUN_TEST(test_cr_and_garbage);
   RUN_TEST(test_truncate_utf8);
   RUN_TEST(test_split_empty_fields);
+  RUN_TEST(test_escape_ctrl_chars);
+  RUN_TEST(test_escape_no_raw_specials);
+  RUN_TEST(test_empty_fields_encode);
+  RUN_TEST(test_hb_seq_wrap_text);
+  RUN_TEST(test_truncate_escape_boundary);
+  RUN_TEST(test_truncate_ascii_fills_frame);
+  RUN_TEST(test_truncate_multibyte);
+  RUN_TEST(test_truncate_three_fields_escaped);
+  RUN_TEST(test_dollar_resync_variants);
+  RUN_TEST(test_no_dollar_ignored);
+  RUN_TEST(test_cr_ignored_inside);
+  RUN_TEST(test_oversize_far_and_recover);
+  RUN_TEST(test_err_frame_encode);
+  RUN_TEST(test_cmd_table_matches_contract);
+  RUN_TEST(test_arity_model);
+  RUN_TEST(test_errc_codes_match_contract);
+  RUN_TEST(test_split_edge_cases);
   return UNITY_END();
 }
