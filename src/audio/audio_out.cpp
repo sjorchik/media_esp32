@@ -22,10 +22,12 @@ constexpr int levelFor(bool unmuted) {
 
 // Запит на мʼют: write() негайно віддає мʼютекс. Без цього задача audio (вищий пріоритет) знову
 // захоплює мʼютекс у кожному write(), і mute() з app-задачі чекав секундами.
-volatile bool s_abortWrite = false;
+// M5c2/H1: лічильник глибини — вкладений mute() (setFormat у задачі mp3) не скидає abort чужого mute() з app.
+volatile uint32_t s_abortDepth = 0;
+inline bool abortOn() { return s_abortDepth != 0; }
 struct AbortGuard {
-  AbortGuard() { s_abortWrite = true; }
-  ~AbortGuard() { s_abortWrite = false; }
+  AbortGuard() { __atomic_fetch_add(&s_abortDepth, 1u, __ATOMIC_SEQ_CST); }
+  ~AbortGuard() { __atomic_fetch_sub(&s_abortDepth, 1u, __ATOMIC_SEQ_CST); }
 };
 
 // Діагностика мʼютекса (M5c1): хто тримає й хто чекає. s_owner/s_depth/s_op пише лише власник мʼютекса,
@@ -76,7 +78,7 @@ void AudioOut::earlyMute() {
   digitalWrite(PIN_XSMT, levelFor(false));
 }
 
-bool AudioOut::aborting() const { return s_abortWrite; }
+bool AudioOut::aborting() const { return abortOn(); }
 
 void AudioOut::mark(char kind) {
   cnt_.lastTrans = kind;
@@ -87,7 +89,7 @@ void AudioOut::dbgInfo(DbgInfo& o) const {
   const uint32_t now = millis();
   o.ready = ready_;
   o.muted = muted_;
-  o.aborting = s_abortWrite;
+  o.aborting = abortOn();
   o.channels = ch_;
   o.rate = rate_;
   o.gainPct = (uint8_t)((int64_t)gain_ * 100 / 32768);
@@ -223,7 +225,7 @@ bool AudioOut::setFormat(uint32_t rate, uint8_t bits, uint8_t channels) {
 
 size_t AudioOut::write(const void* data, size_t bytes, uint32_t timeoutMs) {
   if (!ready_ || bytes == 0) return 0;
-  if (muted_ || s_abortWrite) {               // замʼючено або йде мʼют — відкидаємо
+  if (muted_ || abortOn()) {               // замʼючено або йде мʼют — відкидаємо
     cnt_.wDropped++;
     return bytes;
   }
@@ -232,7 +234,7 @@ size_t AudioOut::write(const void* data, size_t bytes, uint32_t timeoutMs) {
     cnt_.wLockFail++;
     return 0;
   }
-  if (muted_ || s_abortWrite) {
+  if (muted_ || abortOn()) {
     cnt_.wDropped++;
     return bytes;
   }
@@ -240,7 +242,7 @@ size_t AudioOut::write(const void* data, size_t bytes, uint32_t timeoutMs) {
   const int16_t* in = (const int16_t*)data;
   size_t fb = (size_t)ch_ * 2, frames = bytes / fb, consumed = 0;
   while (frames) {
-    if (s_abortWrite) {                       // між порціями віддаємо мʼютекс для mute()
+    if (abortOn()) {                       // між порціями віддаємо мʼютекс для mute()
       cnt_.wDropped++;
       return bytes;
     }
@@ -282,3 +284,4 @@ void AudioOut::stop() {
   Lock l(mtx_, portMAX_DELAY, 's');
   if (ready_) i2s_zero_dma_buffer(kPort);
 }
+

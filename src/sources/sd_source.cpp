@@ -145,7 +145,8 @@ void SdSource::endSession() {
     g_audio.mute();  // тиша до зупинки продюсера
     dec_.stopSession();
   }
-  dec_.takeEvent();
+  // M5c2/H2: подію кінця, що не дійшла до pollPlayer, забираємо тут; продюсера вже нема → DAC не лишаємо розмʼюченим
+  if (dec_.takeEvent() != Mp3Player::Ev::None && !g_audio.isMuted()) g_audio.mute();
   takeTags(false);  // розбір міг завершитись між опитуваннями; cur_ ще відповідає сесії
   if (media_.reader().isOpen()) media_.reader().close();
 }
@@ -379,7 +380,7 @@ Res SdSource::startTrack(uint16_t n, uint32_t off, uint32_t ms) {
     if (job_ == Dbg::Read) job_ = Dbg::None;
   }
   endSession();  // Play→Play: мʼют, зупинка, закриття; з Stop/Pause/Eof/помилки — просто закриття
-  // Обхід M3c: після помилки сесії DAC лишається розмʼючений (endSession мʼютить лише живу сесію), причина зависання не доведена.
+  // Обхід M3c (M5c1). Після M5c2 збій сесії мʼютить DAC сам (onPlayError/endSession); прапорець лишено страховкою, дефолт 1.
   // 1 = сесія завжди стартує з замʼючено DAC (задача mp3 чекає розмʼюту), як у перевірених сценаріях; 0 = діагностична збірка.
   if (kAlwaysMuteOnTrackStart) g_audio.mute();  // ідемпотентно
   st_ = PlayState::Stop;  // status() = 0/0, доки сесія не стартувала (відкриття може не вдатись)
@@ -440,8 +441,9 @@ bool SdSource::countFail(Res r) {
   return false;
 }
 
-// Помилка під час гри (сесія вже завершена, state=stop): ERR і перехід до наступного за списком (REP не враховується).
+// Помилка під час гри (сесія вже завершена, state=stop): мʼют DAC, ERR і перехід до наступного за списком (REP не враховується).
 void SdSource::onPlayError(Res r) {
+  if (!g_audio.isMuted()) g_audio.mute();  // M5c2/H2: продюсера нема — рівно один мʼют; вже замʼючений — без дій
   if (!countFail(r)) return;
   Pick p = nav_.skip(cur_);
   playTrack(p.to, p.why, p.act);
@@ -983,3 +985,4 @@ void SdSource::dbgResume(bool clear) {
     LOGI(TAG, "resume: зараз #%u зсув=%u Б час=%u мс, останній запис зсув=%u Б", (unsigned)cur_ + 1, (unsigned)off, (unsigned)ms,
          (unsigned)rsmLastOff_);
 }
+
