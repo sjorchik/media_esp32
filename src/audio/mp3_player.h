@@ -73,6 +73,7 @@ class Mp3Player {
     uint32_t lastEndAgoMs;               // 0xFFFFFFFF = сесій ще не завершувалось
     int32_t cushUs;                      // оцінка запасу даних у DMA, мкс
     uint32_t inFill, posMs;
+    uint32_t waitLong;                   // M5c3: скільки разів waitUnmuted() чекав довше kUnmuteWaitWarnMs
   };
   void snap(Snap& o) const;
   static const char* whereName(uint8_t w);
@@ -117,6 +118,7 @@ class Mp3Player {
   volatile uint8_t where_ = 0;
   volatile uint32_t whereMs_ = 0, lastEndMs_ = 0;                           // lastEndMs_: millis()|1, 0 = не було
   volatile uint32_t nStart_ = 0, nEndEof_ = 0, nEndRead_ = 0, nEndDec_ = 0, nEndStop_ = 0;
+  volatile uint32_t nWaitLong_ = 0;    // M5c3: довгі очікування розмʼюту (+4 Б)
 #if SKIP_TEST_CMDS
   volatile uint8_t inj_ = 0;           // Ev штучної помилки (0 = нема)
 #endif

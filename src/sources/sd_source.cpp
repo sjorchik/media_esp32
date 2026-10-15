@@ -95,6 +95,10 @@ void SdSource::deactivate() {
 void SdSource::loop(uint32_t now) {
   service(now);
   if (!active_) return;
+  if (sus_ != Sus::None) {  // M5c3: чекаємо Removed; скан/відтворення не рухаємо
+    susStep(now);
+    return;
+  }
   if (st_ == PlayState::Scan) scanStep();
   else if (st_ == PlayState::Play || st_ == PlayState::Pause) pollPlayer(now);
 }
@@ -107,13 +111,31 @@ void SdSource::service(uint32_t now) {
 
 // ============================================================ hot-plug
 
+// M5c3. Дубль (відскок, повторна подія, DBG,media,ins): присутність уже така — нічого не зупиняємо й не мʼютимо.
+// Прийнята подія: мʼют (якщо SD активне) → зупинка скану/сесії, закриття файлу, скидання плейлиста/кола/історії.
+// NVS-резюме тут не пишеться. Помилки читання від зниклої картки не рахуються (див. sus_). BT активне: лише MEDIA.
 void SdSource::onMedia(MediaEvent ev) {
+  const bool ins = ev == MediaEvent::Inserted;
+  if (ins == DeviceState::sd()) {  // Inserted при вже змонтованому / Removed при вже відсутньому
+    if (ins) insDup_++;
+    else remDup_++;
+    LOGI(TAG, "картка: дубль %s ігноровано (state=%s)", ins ? "Inserted" : "Removed", stateName(st_));
+    return;
+  }
+  if (ins) insOk_++;
+  else remOk_++;
+  if (active_ && !ins && st_ != PlayState::Idle) g_audio.mute();  // тиша одразу, ще до зупинки сесії (ідемпотентно)
   stopJobs();
   pl_.clear();
   scanned_ = false;
   scanRetry_ = 0;
-  DeviceState::setMedia(media_.mounted(), DeviceState::usb());
-  LOGI(TAG, "картку %s", ev == MediaEvent::Inserted ? "вставлено" : "вийнято");
+  if (ins && active_ && st_ != PlayState::Idle) {  // страховка: після вставлення стан має бути idle, інакше «play без сесії»
+    LOGW(TAG, "вставлення при state=%s: скидання в idle", stateName(st_));
+    g_audio.mute();
+    st_ = PlayState::Idle;
+  }
+  DeviceState::setMedia(ins, DeviceState::usb());
+  LOGI(TAG, "картку %s", ins ? "вставлено" : "вийнято");
   g_sources.onMediaChanged();  // MEDIA, refreshMedia() активного SD, STATE
   Diag::logHeap("sd-media");
 }
@@ -135,6 +157,7 @@ void SdSource::stopJobs() {
   endSession();  // зупиняє декодер і закриває файл (це ж закриває й DBG,sdread)
   rdOpen_ = false;
   job_ = Dbg::None;
+  sus_ = Sus::None;    // M5c3: відкладений вердикт збою втрачає сенс
   errRun_ = 0;
   tagTrack_ = kNoTag;  // плейлист міг змінитись
   nav_.detach();       // коло й історія недійсні разом із плейлистом
@@ -181,14 +204,13 @@ void SdSource::finishScan(Scanner::St r) {
        (unsigned)s.foldersWithTracks, (unsigned)pl_.used(), (unsigned)Playlist::capacity());
   Diag::logHeap("sd-scan");
   if (r == Scanner::St::Failed) {
-    if (media_.mounted() && scanRetry_ < kSdScanRetries) {  // частоту могло бути знижено — пробуємо ще
-      scanRetry_++;
-      LOGW(TAG, "помилка скану, повтор %u/%u", (unsigned)scanRetry_, (unsigned)kSdScanRetries);
-      startScan();
+    if (scanRetry_ == 0) {  // M5c3: перший збій міг бути від виймання картки — чекаємо Removed (st_ лишається scan)
+      sus_ = Sus::Scan;
+      susAt_ = millis();
+      LOGI(TAG, "скан: збій, вердикт відкладено на %u мс (картка?)", (unsigned)kCardLossGraceMs);
       return;
     }
-    st_ = PlayState::Idle;  // якщо носій зник — Removed повідомить hot-plug
-    if (media_.mounted()) Events::err(proto::errc::kReadFail, "scan");
+    scanFailed();
     return;
   }
   if (pl_.tracks() == 0) {
@@ -213,6 +235,28 @@ void SdSource::finishScan(Scanner::St r) {
   Pick p = nav_.play(cur_);             // як PLAY зі stop: історія й коло shuffle ведуться звично
   playTrack(p.to, p.why, p.act, off, ms);
   Diag::logHeap("resume");
+}
+
+// Збій скану (після відкладеного вердикту або повторний): повтор або idle + ERR.
+void SdSource::scanFailed() {
+  if (media_.mounted() && scanRetry_ < kSdScanRetries) {  // частоту могло бути знижено — пробуємо ще
+    scanRetry_++;
+    LOGW(TAG, "помилка скану, повтор %u/%u", (unsigned)scanRetry_, (unsigned)kSdScanRetries);
+    startScan();
+    return;
+  }
+  st_ = PlayState::Idle;  // якщо носій зник — Removed повідомить hot-plug
+  if (media_.mounted()) Events::err(proto::errc::kReadFail, "scan");
+}
+
+// Кінець очікування Removed (M5c3): картка на місці → збій справжній, обробка як раніше.
+void SdSource::susStep(uint32_t now) {
+  if (!due(now, susAt_ + kCardLossGraceMs)) return;
+  const Sus s = sus_;
+  sus_ = Sus::None;
+  LOGI(TAG, "Removed не надійшов за %u мс — збій %s справжній", (unsigned)kCardLossGraceMs, s == Sus::Scan ? "скану" : "читання");
+  if (s == Sus::Scan) scanFailed();
+  else onPlayError(Res::ReadFail);
 }
 
 // ============================================================ події треку (M3c)
@@ -380,6 +424,7 @@ Res SdSource::startTrack(uint16_t n, uint32_t off, uint32_t ms) {
     if (job_ == Dbg::Read) job_ = Dbg::None;
   }
   endSession();  // Play→Play: мʼют, зупинка, закриття; з Stop/Pause/Eof/помилки — просто закриття
+  sus_ = Sus::None;  // M5c3: новий старт скасовує відкладений вердикт
   // Обхід M3c (M5c1). Після M5c2 збій сесії мʼютить DAC сам (onPlayError/endSession); прапорець лишено страховкою, дефолт 1.
   // 1 = сесія завжди стартує з замʼючено DAC (задача mp3 чекає розмʼюту), як у перевірених сценаріях; 0 = діагностична збірка.
   if (kAlwaysMuteOnTrackStart) g_audio.mute();  // ідемпотентно
@@ -494,6 +539,7 @@ Res SdSource::pause() {
 Res SdSource::stop() {
   if (st_ == PlayState::Scan) return Res::BadState;
   errRun_ = 0;
+  sus_ = Sus::None;  // M5c3: STOP скасовує відкладений вердикт (інакше після очікування стартував би наступний трек)
   if (st_ == PlayState::Play || st_ == PlayState::Pause) {
     endSession();
     st_ = PlayState::Stop;
@@ -507,6 +553,7 @@ Res SdSource::stop() {
 void SdSource::pollPlayer(uint32_t now) {
   takeTags(true);  // теги нового треку → повторний META (лише якщо змінився)
   if (st_ == PlayState::Play && errRun_ && dec_.posMs() >= kPlayOkMs) errRun_ = 0;  // новий трек відіграв ≥ 1 с
+  const bool act = dec_.sessionActive();  // M5c3: ДО takeEvent (finish() ставить ev_ раніше за st_=Idle, тож «нема сесії й нема події» — справжня аномалія)
   Mp3Player::Ev ev = dec_.takeEvent();
   if (ev != Mp3Player::Ev::None) {
     if (media_.reader().isOpen()) media_.reader().close();
@@ -516,9 +563,12 @@ void SdSource::pollPlayer(uint32_t now) {
         LOGI(TAG, "кінець треку #%u", (unsigned)cur_ + 1);
         onTrackEnd();
         break;
-      case Mp3Player::Ev::ReadFail:
-        LOGW(TAG, "помилка читання під час відтворення #%u", (unsigned)cur_ + 1);
-        onPlayError(Res::ReadFail);
+      case Mp3Player::Ev::ReadFail:  // M5c3: може бути наслідком виймання картки — вердикт відкладено (susStep)
+        LOGW(TAG, "помилка читання під час відтворення #%u: вердикт відкладено на %u мс (картка?)", (unsigned)cur_ + 1,
+             (unsigned)kCardLossGraceMs);
+        if (!g_audio.isMuted()) g_audio.mute();  // продюсера нема — тиша одразу
+        sus_ = Sus::Play;
+        susAt_ = now;
         break;
       default:
         LOGW(TAG, "помилка декодування #%u", (unsigned)cur_ + 1);
@@ -528,6 +578,14 @@ void SdSource::pollPlayer(uint32_t now) {
     return;
   }
   if (st_ != PlayState::Play) return;
+  if (!act) {  // M5c3: сторожа — state=play без сесії («зомбі»: звуку нема, команди «ніби працюють»)
+    guardN_++;
+    LOGW(TAG, "сторожа: state=play без сесії (#%u) -> stop, мʼют", (unsigned)guardN_);
+    g_audio.mute();
+    endSession();
+    st_ = PlayState::Stop;
+    return;
+  }
   uint32_t seq = dec_.infoSeq();
   if (seq != infoSeq_ || due(now, nextTimeAt_)) {  // одразу, коли зʼявилась тривалість, далі раз на секунду
     infoSeq_ = seq;
@@ -985,4 +1043,3 @@ void SdSource::dbgResume(bool clear) {
     LOGI(TAG, "resume: зараз #%u зсув=%u Б час=%u мс, останній запис зсув=%u Б", (unsigned)cur_ + 1, (unsigned)off, (unsigned)ms,
          (unsigned)rsmLastOff_);
 }
-

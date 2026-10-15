@@ -9,7 +9,8 @@
 
 // SD-джерело: hot-plug, скан, плейлист (M3a); відтворення MP3 (M3b); навігація, repeat, події треку,
 // обробка помилок відтворення (M3c); ID3-теги в META (M3d); shuffle без повторів та історія для PREV (M5a, media/shuffle);
-// резюме треку й позиції в NVS (M5b1, storage/resume_store).
+// резюме треку й позиції в NVS (M5b1, storage/resume_store); hot-plug SD: виймання/вставлення/дубль, відкладений вердикт
+// збою читання, сторожа «play без сесії» (M5c3).
 // Працює через IMedia&, тому про SD не знає. Усе (скан, DBG-завдання) виконується в задачі app порціями.
 class SdSource : public ISource {
  public:
@@ -46,6 +47,11 @@ class SdSource : public ISource {
   uint8_t failLeft() const { return failN_; }
   bool failIsDecode() const { return failMode_ != 0; }
 
+  // M5c3: лічильники hot-plug для DBG,media (без блокувань, з консольної задачі)
+  struct MediaCnt { uint16_t insOk, insDup, remOk, remDup, guard; };
+  MediaCnt mediaCnt() const { return MediaCnt{insOk_, insDup_, remOk_, remDup_, guardN_}; }
+  bool active() const { return active_; }
+
  private:
   enum class Nav : uint8_t { Next, Prev, FNext, FPrev };
   struct Hist {
@@ -58,6 +64,8 @@ class SdSource : public ISource {
   void startScan();
   void scanStep();
   void finishScan(Scanner::St r);
+  void scanFailed();                       // M5c3: повтор скану або idle (після відкладеного вердикту)
+  void susStep(uint32_t now);              // M5c3: кінець очікування Removed → звичайна обробка збою
   void stopJobs();
   void runDbg();
   void dbgInfo();
@@ -105,6 +113,13 @@ class SdSource : public ISource {
   PlayState st_ = PlayState::Idle;
   bool active_ = false, scanned_ = false;
   uint8_t scanRetry_ = 0;
+  // M5c3: збій читання (play) або скану може бути наслідком виймання картки; Removed приходить із затримкою антидребезгу.
+  // Вердикт відкладаємо на kCardLossGraceMs: Removed → це не збій треку; інакше звичайна обробка.
+  enum class Sus : uint8_t { None, Play, Scan };
+  Sus sus_ = Sus::None;
+  uint32_t susAt_ = 0;
+  uint16_t insOk_ = 0, insDup_ = 0, remOk_ = 0, remDup_ = 0;  // події носія: прийнято / дубль
+  uint8_t guardN_ = 0;                     // скільки разів спрацювала сторожа «play без сесії»
   uint16_t cur_ = 0;
   uint8_t rep_ = 0;
   ShufNav nav_;                            // shuffle-коло (перестановка в арені плейлиста), історія, політика вибору

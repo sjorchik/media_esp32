@@ -34,6 +34,11 @@ uint8_t s_speed = 0;         // індекс у kSdSpiMhz
 uint8_t s_errStreak = 0;
 uint32_t s_errTotal = 0;
 uint32_t s_lastOkAt = 0;
+uint32_t s_cdBounce = 0;     // M5c3: зміни card-detect, що зникли раніше за kSdDebounceMs
+uint32_t s_simCnt = 0;       // M5c3: події, видані poll() за імітацією
+#if SKIP_TEST_CMDS
+volatile uint8_t s_sim = 0;  // M5c3: (uint8_t)MediaEvent, що чекає на poll(); 0 = нема
+#endif
 
 // card-detect
 bool s_cdRaw = false, s_cdStable = false;
@@ -139,6 +144,30 @@ void okOp() {
   s_lastOkAt = millis();
 }
 
+#if SKIP_TEST_CMDS
+// Імітація hot-plug (M5c3) із тією ж зміною стану, що й справжня подія. Removed — справжнє відмонтування (далі poll() сам
+// змонтує картку знову, якщо вона фізично є); Inserted при змонтованій картці — дубль без дій. None = повторити на наступному poll().
+MediaEvent simEvent() {
+  Guard g;
+  if (!g.ok) return MediaEvent::None;  // SPI зайнятий читанням файлу
+  const MediaEvent ev = (MediaEvent)s_sim;
+  if (ev == MediaEvent::Removed) {
+    if (s_mounted) unmountInternal(false);
+    s_present = false;
+  } else {
+    if (!s_mounted && !mountInternal()) {
+      s_sim = 0;
+      LOGW(TAG, "імітація ins: mount не вдався (картки немає?)");
+      return MediaEvent::None;
+    }
+    s_present = true;
+  }
+  s_sim = 0;
+  s_simCnt++;
+  return ev;
+}
+#endif
+
 }  // namespace
 
 // ============================================================ SdMedia
@@ -175,9 +204,16 @@ MediaEvent SdMedia::poll(uint32_t now) {
     s_present = false;
     return MediaEvent::Removed;
   }
+#if SKIP_TEST_CMDS
+  if (s_sim) return simEvent();
+#endif
   if constexpr (SD_CD_PIN >= 0) {
     bool raw = cdActive();
-    if (raw != s_cdRaw) { s_cdRaw = raw; s_cdSince = now; }
+    if (raw != s_cdRaw) {
+      if (s_cdRaw != s_cdStable && raw == s_cdStable) s_cdBounce++;  // зміна не дожила до kSdDebounceMs
+      s_cdRaw = raw;
+      s_cdSince = now;
+    }
     if (raw != s_cdStable && (uint32_t)(now - s_cdSince) >= kSdDebounceMs) {
       s_cdStable = raw;
       if (!raw) { s_blocked = false; s_mountFailLogged = false; }
@@ -225,6 +261,32 @@ MediaEvent SdMedia::poll(uint32_t now) {
     return MediaEvent::None;
   }
 }
+
+void SdMedia::dbgSnap(DbgSnap& o) {
+  o.present = s_present;
+  o.mounted = s_mounted;
+  o.cdStable = s_cdStable;
+  o.blocked = s_blocked;
+  o.lostPending = s_lostPending;
+  o.cdPin = SD_CD_PIN;
+  o.cdLevel = -1;
+  if constexpr (SD_CD_PIN >= 0) o.cdLevel = digitalRead(SD_CD_PIN);
+  o.bounce = s_cdBounce;
+  o.sim = s_simCnt;
+#if SKIP_TEST_CMDS
+  o.simPend = s_sim;
+#else
+  o.simPend = 0;
+#endif
+}
+
+#if SKIP_TEST_CMDS
+bool SdMedia::dbgInject(MediaEvent ev) {
+  if (ev == MediaEvent::None || s_sim) return false;
+  s_sim = (uint8_t)ev;
+  return true;
+}
+#endif
 
 int SdMedia::openDir(const char* path) {
   Guard g;

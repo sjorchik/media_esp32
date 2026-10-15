@@ -142,10 +142,6 @@ void SourceManager::handle(const Cmd& c) {
       persist();
       publish(false);
       return;
-    case CmdId::DbgMedia:
-      DeviceState::setMedia(c.arg & 1, (c.arg & 2) != 0);
-      onMediaChanged();
-      return;
     default:
       break;
   }

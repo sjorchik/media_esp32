@@ -9,6 +9,7 @@
 #include "core/app.h"
 #include "core/device_state.h"
 #include "core/router.h"
+#include "media/sd_media.h"
 #include "proto/link.h"
 #include "storage/storage_dbg.h"
 #include "util/diag.h"
@@ -30,7 +31,10 @@ void help() {
   LOGI(TAG, "Формат: NAME,арг,… або $BODY*XX");
   LOGI(TAG, "DBG,help | DBG,heap | DBG,tasks | DBG,state");
   LOGI(TAG, "DBG,tone[,Гц[,мс]] — тест-тон (лише при src=off), типово 440 Гц 1500 мс");
-  LOGI(TAG, "DBG,media,<sd>,<usb> — імітація hot-plug носіїв (0/1)");
+  LOGI(TAG, "DBG,media — присутність SD, сирий рівень card-detect, лічильники Inserted/Removed (прийнято/дубль/дребезг), state джерела");
+#if SKIP_TEST_CMDS
+  LOGI(TAG, "DBG,media,ins | DBG,media,rem — імітація події картки через SdMedia::poll (rem = справжнє відмонтування, далі авто-mount)");
+#endif
   LOGI(TAG, "DBG,bt — стан BT, кодек, частота, лічильники PCM, метадані");
   LOGI(TAG, "DBG,bt,pair — вікно видимості 120 с | DBG,bt,forget — забути телефон | DBG,bt,reset — скинути лічильники");
   LOGI(TAG, "DBG,sd — присутність, SPI, тип/FS/обсяг | DBG,scan — підсумок останнього скану");
@@ -86,11 +90,30 @@ void aout() {
        (unsigned)(a.dmaFrames * 1000u / (a.rate ? a.rate : kDefaultRate)), (int)d.cushUs);
   LOGI(TAG, "mp3: st=%s req=%u ev=%s | місце: %s, %u мс", mp3St(d.st), (unsigned)d.req, mp3Ev(d.ev),
        Mp3Player::whereName(d.where), (unsigned)d.whereAgoMs);
+  LOGI(TAG, "mp3: waitUnmuted довше %u мс: %u разів (лише діагностика)", (unsigned)kUnmuteWaitWarnMs, (unsigned)d.waitLong);
   LOGI(TAG, "mp3: сесій старт=%u eof=%u read=%u dec=%u stop=%u | остання завершена %d мс тому | вхід=%u Б поз=%u мс",
        (unsigned)d.starts, (unsigned)d.endEof, (unsigned)d.endRead, (unsigned)d.endDec, (unsigned)d.endStop,
        d.lastEndAgoMs == 0xFFFFFFFFu ? -1 : (int)d.lastEndAgoMs, (unsigned)d.inFill, (unsigned)d.posMs);
   LOGI(TAG, "aout: збірка: ALWAYS_MUTE_ON_TRACK_START=%d SKIP_TEST_CMDS=%d", (int)kAlwaysMuteOnTrackStart, SKIP_TEST_CMDS);
   Diag::logHeap("aout");
+}
+
+// DBG,media (M5c3): лише читання без блокувань і без черги до app.
+void media() {
+  SdMedia::DbgSnap s;
+  SdMedia::dbgSnap(s);
+  SdSource::MediaCnt c = g_sd.mediaCnt();
+  if (s.cdPin >= 0)
+    LOGI(TAG, "media: змонтовано=%d присутність=%d | CD GPIO%d рівень=%d (активний %s) стабільний=%d | заблоковано=%d lost=%d", s.mounted,
+         s.present, s.cdPin, s.cdLevel, SD_CD_ACTIVE_LOW ? "LOW" : "HIGH", s.cdStable, s.blocked, s.lostPending);
+  else LOGI(TAG, "media: змонтовано=%d присутність=%d | card-detect немає (опитування %u мс) заблоковано=%d lost=%d", s.mounted, s.present,
+            (unsigned)kSdPollMs, s.blocked, s.lostPending);
+  LOGI(TAG, "media: Inserted прийнято=%u дубль=%u | Removed прийнято=%u дубль=%u | відкинуто дебаунсом=%u (kSdDebounceMs=%u мс)",
+       (unsigned)c.insOk, (unsigned)c.insDup, (unsigned)c.remOk, (unsigned)c.remDup, (unsigned)s.bounce, (unsigned)kSdDebounceMs);
+  LOGI(TAG, "media: src=%s sd-активне=%d state=%s | імітацій=%u очікує=%u | сторожа(play без сесії)=%u | DeviceState sd=%d usb=%d",
+       srcName(g_sources.current()), g_sd.active(), stateName(g_sd.playState()), (unsigned)s.sim, (unsigned)s.simPend, (unsigned)c.guard,
+       DeviceState::sd(), DeviceState::usb());
+  Diag::logHeap("media");
 }
 
 }  // namespace
@@ -125,12 +148,22 @@ void DebugCmds::handle(const proto::Msg& m) {
     if (g_sources.current() != SrcId::Off) { LOGW(TAG, "тон лише при src=off"); return; }
     if (!AudioTask::requestTone((uint16_t)hz, (uint16_t)ms)) LOGW(TAG, "аудіо зайняте");
   } else if (!strcasecmp(c, "media")) {
-    long sd, usb;
-    if (m.argc != 3 || !toInt(m.args[1], sd) || !toInt(m.args[2], usb) || (sd | usb) & ~1L) {
-      LOGW(TAG, "DBG,media,<0|1>,<0|1>");
-      return;
+    if (m.argc == 1) {
+      media();
+#if SKIP_TEST_CMDS
+    } else if (m.argc == 2 && (!strcasecmp(m.args[1], "ins") || !strcasecmp(m.args[1], "rem"))) {
+      const bool ins = !strcasecmp(m.args[1], "ins");
+      if (SdMedia::dbgInject(ins ? MediaEvent::Inserted : MediaEvent::Removed))
+        LOGI(TAG, "media: імітація %s поставлена (виконає app через SdMedia::poll)", ins ? "ins" : "rem");
+      else LOGW(TAG, "media: попередня імітація ще не виконана");
+#endif
+    } else {
+#if SKIP_TEST_CMDS
+      LOGW(TAG, "DBG,media | DBG,media,ins|rem");
+#else
+      LOGW(TAG, "DBG,media");
+#endif
     }
-    Router::post(Cmd{proto::CmdId::DbgMedia, (int16_t)(sd | (usb << 1)), Origin::Console});
   } else if (!strcasecmp(c, "bt")) {
     if (m.argc == 1) g_bt.dump();
     else if (!strcasecmp(m.args[1], "pair")) g_bt.requestPair();

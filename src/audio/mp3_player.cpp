@@ -257,6 +257,7 @@ void Mp3Player::snap(Snap& o) const {
   o.cushUs = sx.cushUs;
   o.inFill = sx.inLen - sx.inPos;
   o.posMs = posMs_;
+  o.waitLong = nWaitLong_;
 }
 
 // ============================================================ задача «mp3»
@@ -409,11 +410,21 @@ bool Mp3Player::seekResume(uint32_t off, uint32_t ms) {
 // без блокувань «промотав» би трек, не даючи app (prio 1) завершити mute() — це був живий лок на залізі.
 bool Mp3Player::waitUnmuted() {
   const TickType_t tick = pdMS_TO_TICKS(2) ? pdMS_TO_TICKS(2) : 1;  // ніколи не 0 (busy-loop)
-  if (out_->isMuted() || out_->aborting()) mark(kWWaitUnmute);
+  uint32_t t0 = 0;       // M5c3: лише діагностика, поведінку не змінює
+  bool warned = false;
+  if (out_->isMuted() || out_->aborting()) {
+    mark(kWWaitUnmute);
+    t0 = millis();
+  }
   while (out_->isMuted() || out_->aborting()) {
     if (req_ != kReqNone) return false;
     ulTaskNotifyTake(pdTRUE, tick);
     sx.fastRun = 0;
+    if (!warned && (uint32_t)(millis() - t0) > kUnmuteWaitWarnMs) {  // одне попередження на очікування
+      warned = true;
+      nWaitLong_ = nWaitLong_ + 1;
+      LOGW(TAG, "waitUnmuted: DAC замʼючений вже > %u мс (state=play без розмʼюту?)", (unsigned)kUnmuteWaitWarnMs);
+    }
   }
   return true;
 }

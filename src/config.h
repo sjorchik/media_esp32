@@ -137,6 +137,8 @@ inline constexpr uint8_t  kSdPollFails = 2;            // невдалих пр�
 inline constexpr uint32_t kSdRemountMs = 3000;         // пауза між невдалими mount, поки CD каже «картка є»
 inline constexpr uint8_t  kSdScanRetries = 2;          // автоповтори скану після помилки читання
 inline constexpr uint32_t kSdLockWaitMs = 1000;        // очікування мʼютекса SdFat у poll()/mount (читання ≤ ~300 мс)
+inline constexpr uint32_t kCardLossGraceMs = 400;      // M5c3: збій читання/скану може бути наслідком виймання картки — вердикт відкладається на цей час, поки антидребезг видасть Removed
+static_assert(kCardLossGraceMs >= kSdDebounceMs + 100, "kCardLossGraceMs має покривати антидребезг card-detect + очікування мʼютекса");
 
 inline constexpr size_t   kPlaylistArenaBytes = 16384; // ОДНА статична арена плейлиста (кратна 4, ≤ 65535)
 inline constexpr int      kScanMaxDepth = 3;           // корінь = рівень 0; глибші каталоги ігноруються
@@ -188,6 +190,7 @@ inline constexpr uint32_t kBootStableMs = 60000;       // безперервна
 #define ALWAYS_MUTE_ON_TRACK_START 1   // 1: обхід M3c (мʼют на старті кожного треку); 0: діагностична збірка (-DALWAYS_MUTE_ON_TRACK_START=0)
 #endif
 inline constexpr bool kAlwaysMuteOnTrackStart = ALWAYS_MUTE_ON_TRACK_START != 0;  // SdSource::startTrack: mute() завжди перед стартом сесії
+inline constexpr uint32_t kUnmuteWaitWarnMs = 3000;   // M5c3: Mp3Player::waitUnmuted() чекає розмʼюту довше за це → одне LOGW і лічильник у DBG,aout (лише діагностика)
 
 // ---- Задачі ----
 inline constexpr int kCoreProto = 0;
