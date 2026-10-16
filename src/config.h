@@ -76,6 +76,43 @@ inline constexpr int      kI2sDmaCount = 8;
 inline constexpr int      kI2sDmaLen = 128;     // кадрів на буфер
 inline constexpr float    kToneAmpl = 0.25f;
 
+// ---- EQ і цифровий рівень виходу (M6a) ----
+// 5-смуговий peaking-EQ (RBJ) і послаблення в PCM до I2S. Порядок: декодування → EQ → рівень → одне насичення → I2S.
+namespace eq_cfg {
+constexpr uint8_t kBandCount = 5;
+constexpr uint16_t kBandFreqHz[kBandCount] = {60, 250, 1000, 4000, 12000};  // за зростанням, інтервал ≈ 2 октави
+constexpr int kGainMinDb = -12;       // цілі дБ; 0 = смуга прозора (не обчислюється)
+constexpr int kGainMaxDb = 12;
+constexpr int kGainStepDb = 1;
+constexpr double kQ = 1.0;            // ширина ≈ 1,4 окт.: сусідні смуги плавно перекриваються
+constexpr uint32_t kDefaultSampleRateHz = 44100;
+constexpr uint32_t kMinSampleRateHz = 8000;    // значення поза межами ігноруються
+constexpr uint32_t kMaxSampleRateHz = 96000;
+constexpr double kMaxFreqRatio = 0.45;         // смуга з f0 > ratio·fs вимикається (12 кГц мовчить при fs < 26,7 кГц)
+
+static_assert(kBandCount >= 1, "потрібна хоча б одна смуга");
+static_assert(kGainMinDb < 0 && kGainMaxDb > 0, "діапазон має містити 0 дБ");
+static_assert(kGainMinDb >= -127 && kGainMaxDb <= 127, "підсилення має влізати в int8_t");
+static_assert(kGainStepDb >= 1 && (kGainMaxDb - kGainMinDb) % kGainStepDb == 0, "діапазон кратний кроку");
+static_assert(kBandFreqHz[0] > 0 && kBandFreqHz[0] < kBandFreqHz[1] && kBandFreqHz[1] < kBandFreqHz[2] &&
+                  kBandFreqHz[2] < kBandFreqHz[3] && kBandFreqHz[3] < kBandFreqHz[4],
+              "частоти смуг мають зростати");
+static_assert(kQ > 0.1 && kQ < 10.0, "Q поза розумним діапазоном");
+static_assert(kMinSampleRateHz > 0 && kMinSampleRateHz < kMaxSampleRateHz, "діапазон частот дискретизації");
+static_assert(kDefaultSampleRateHz >= kMinSampleRateHz && kDefaultSampleRateHz <= kMaxSampleRateHz, "типова частота в діапазоні");
+static_assert(kMaxFreqRatio > 0.0 && kMaxFreqRatio < 0.5, "ratio нижче Найквіста");
+}  // namespace eq_cfg
+
+// Цифровий рівень (аналог output_trim на S3): лише послаблення, цілі дБ, три слоти за джерелами.
+inline constexpr int      kLevelMinDb = -40;
+inline constexpr int      kLevelMaxDb = 0;
+inline constexpr int      kLevelDefaultDb = 0;      // 0 дБ = блок не чіпається (поведінка не змінюється)
+inline constexpr uint32_t kLevelRampMs = 10;        // рампа на весь діапазон коефіцієнта 0→1
+inline constexpr int32_t  kLevelRampFrames = (int32_t)(kDefaultRate * kLevelRampMs / 1000);  // 441 кадр @44,1 кГц
+static_assert(kLevelMinDb < kLevelMaxDb && kLevelMaxDb == 0, "рівень лише послаблює: максимум 0 дБ");
+static_assert(kLevelDefaultDb >= kLevelMinDb && kLevelDefaultDb <= kLevelMaxDb, "типовий рівень у діапазоні");
+static_assert(kLevelRampFrames >= 1, "рампа має бути ≥ 1 кадру");
+
 // ---- Потік PCM (BT → AudioOut) ----
 inline constexpr size_t   kBtRingBytes = 16384;     // степінь двійки; ≈93 мс при 44,1 кГц стерео
 static_assert((kBtRingBytes & (kBtRingBytes - 1)) == 0, "kBtRingBytes має бути степенем двійки");
@@ -214,4 +251,5 @@ inline constexpr int kPrioDecoder = 5;   // нижче за audio (6), вище 
 
 // ---- Діагностика ----
 inline constexpr uint32_t kDiagPeriodMs = 60000;
+
 

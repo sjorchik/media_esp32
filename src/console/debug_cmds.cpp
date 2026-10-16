@@ -1,10 +1,13 @@
 #include "console/debug_cmds.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <strings.h>
 
 #include "audio/audio_out.h"
 #include "audio/audio_task.h"
+#include "audio/eq.h"
+#include "audio/level.h"
 #include "audio/mp3_player.h"
 #include "core/app.h"
 #include "core/device_state.h"
@@ -52,6 +55,8 @@ void help() {
   LOGI(TAG, "DBG,settings — збережені last_src/shuf/rep (CRC) | DBG,settings,clear — стерти set_v1");
   LOGI(TAG, "DBG,link[,reset] — втрати черг, злиті TIME, час відправки кадру (UART1+дзеркало)");
   LOGI(TAG, "DBG,console[,reset] — M5c5: заповнення RX UART0 (cap/peak/high), рядки ok/long, макс. довжина, байти");
+  LOGI(TAG, "DBG,eq — пресет EQ і активні смуги | DBG,eq,<g1>,<g2>,<g3>,<g4>,<g5> — дБ -12..12 для 60/250/1000/4000/12000 Гц");
+  LOGI(TAG, "DBG,lvl — рівень виходу bt/sd/usb | DBG,lvl,<bt|sd|usb>,<-40..0> — послаблення, дБ (лише RAM, після перезапуску 0)");
   LOGI(TAG, "DBG,aout — стан AudioOut (мʼют, лічильники, власник мʼютекса) і задачі mp3 (де стоїть); читає без app, працює й при завислому app");
 #if SKIP_TEST_CMDS
   LOGI(TAG, "DBG,failnext,<n>[,read|decode] — наступні n стартів треку штучно завершуються read_fail (типово) або decode_fail");
@@ -67,6 +72,37 @@ const char* mp3Ev(Mp3Player::Ev e) {
     case Mp3Player::Ev::DecodeFail: return "decode_fail";
     default: return "-";
   }
+}
+
+// M6a: DBG,eq / DBG,lvl. Лише атомарні читання/записи, без черги до app. Рядки короткі (буфер логера 192 Б).
+const char* const kLvlNames[level::kSlots] = {"bt", "sd", "usb"};
+
+void eqShow() {
+  int8_t g[eq_cfg::kBandCount];
+  eq::getAllDb(g);
+  LOGI(TAG, "eq: пресет %d %d %d %d %d дБ (60/250/1000/4000/12000 Гц) fs=%u Гц", (int)g[0], (int)g[1], (int)g[2],
+       (int)g[3], (int)g[4], (unsigned)eq::sampleRate());
+  char act[48];
+  size_t n = 0;
+  act[0] = 0;
+  for (uint8_t b = 0; b < eq_cfg::kBandCount; b++) {
+    if (!eq::bandActive(b)) continue;
+    int w = snprintf(act + n, sizeof act - n, "%s%u", n ? " " : "", (unsigned)eq_cfg::kBandFreqHz[b]);
+    if (w < 0 || (size_t)w >= sizeof act - n) break;
+    n += (size_t)w;
+  }
+  LOGI(TAG, "eq: активні смуги (Гц): %s", n ? act : "немає (блок не чіпається)");
+  Mp3Stats st;
+  g_sd.dec().stats(st);
+  LOGI(TAG, "eq: час EQ+рівня на кадр SD: сер. %u макс. %u мкс (остання сесія; 0 = SD не грало)", (unsigned)st.fxAvgUs,
+       (unsigned)st.fxMaxUs);
+}
+
+void lvlShow() {
+  const int last = level::lastSlot();
+  LOGI(TAG, "lvl: bt=%d sd=%d usb=%d дБ | останній активний слот: %s", (int)level::getDb(level::Slot::Bt),
+       (int)level::getDb(level::Slot::Sd), (int)level::getDb(level::Slot::Usb),
+       last >= 0 && last < (int)level::kSlots ? kLvlNames[last] : "-");
 }
 
 // DBG,aout (M5c1): лише читання volatile-станів, без черги до app — відповідає й тоді, коли app завис на мʼютексі AudioOut.
@@ -196,6 +232,39 @@ void DebugCmds::handle(const proto::Msg& m) {
       return;
     }
     if (!g_sd.dbg(k, (int)n)) LOGW(TAG, "SD: попередня DBG-команда ще виконується");
+  } else if (!strcasecmp(c, "eq")) {
+    if (m.argc == 1) {
+      eqShow();
+      return;
+    }
+    long v[eq_cfg::kBandCount];
+    bool ok = m.argc == 1 + eq_cfg::kBandCount;
+    for (uint8_t b = 0; ok && b < eq_cfg::kBandCount; b++)
+      ok = toInt(m.args[1 + b], v[b]) && v[b] >= eq_cfg::kGainMinDb && v[b] <= eq_cfg::kGainMaxDb;
+    if (!ok) {
+      LOGW(TAG, "DBG,eq[,g1,g2,g3,g4,g5] (кожне ціле %d..%d дБ)", eq_cfg::kGainMinDb, eq_cfg::kGainMaxDb);
+      return;
+    }
+    int8_t g[eq_cfg::kBandCount];
+    for (uint8_t b = 0; b < eq_cfg::kBandCount; b++) g[b] = (int8_t)v[b];
+    eq::setAllDb(g);
+    eqShow();
+  } else if (!strcasecmp(c, "lvl")) {
+    if (m.argc == 1) {
+      lvlShow();
+      return;
+    }
+    long db = 0;
+    int slot = -1;
+    if (m.argc == 3)
+      for (int i = 0; i < (int)level::kSlots; i++)
+        if (!strcasecmp(m.args[1], kLvlNames[i])) slot = i;
+    if (slot < 0 || !toInt(m.args[2], db) || db < kLevelMinDb || db > kLevelMaxDb) {
+      LOGW(TAG, "DBG,lvl[,<bt|sd|usb>,<%d..%d>]", kLevelMinDb, kLevelMaxDb);
+      return;
+    }
+    level::setDb((level::Slot)slot, (int8_t)db);
+    lvlShow();
   } else if (!strcasecmp(c, "aout")) {
     aout();
   } else if (!strcasecmp(c, "console")) {
@@ -283,4 +352,5 @@ void DebugCmds::handle(const proto::Msg& m) {
     LOGW(TAG, "невідома DBG-команда '%s' (DBG,help)", c);
   }
 }
+
 

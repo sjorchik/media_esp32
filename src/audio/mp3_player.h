@@ -18,6 +18,7 @@ struct Mp3Stats {
   uint32_t pcmBytes;                     // розмір останнього PCM-кадру
   uint32_t inFill, inCap;                // заповнення вхідного буфера
   uint32_t rdBytes, rdBusyUs, rdMaxUs;   // читання файлу
+  uint32_t fxAvgUs, fxMaxUs;             // M6a: час EQ+рівня на кадр (eq::process), мкс
 };
 
 // MP3-декодер SD (minimp3) в окремій задачі (ядро 1, prio kPrioDecoder). Конвеєр:
@@ -123,3 +124,4 @@ class Mp3Player {
   volatile uint8_t inj_ = 0;           // Ev штучної помилки (0 = нема)
 #endif
 };
+

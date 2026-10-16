@@ -5,6 +5,8 @@
 
 #include "esp_timer.h"
 
+#include "audio/eq.h"
+#include "audio/level.h"
 #include "audio/pcm_ring.h"
 #include "config.h"
 #include "util/diag.h"
@@ -20,7 +22,7 @@ int16_t s_buf[kChunkFrames * 2];
 
 // ---- помпа PCM ----
 PcmRing* s_ring = nullptr;
-uint8_t s_pcm[kPumpBytes];
+alignas(4) uint8_t s_pcm[kPumpBytes];   // M6a: вирівняно під int16 (EQ/рівень працюють на місці)
 bool s_buffering = true;       // чекаємо пребуфер
 uint64_t s_frames = 0;         // кадрів віддано від початку відтворення
 int64_t s_t0 = 0;              // мкс, початок відтворення
@@ -75,6 +77,8 @@ void pump() {
     s_buffering = false;
     s_frames = 0;
     s_t0 = now;
+    eq::setSampleRate(s_rate);  // M6a: частота A2DP (44,1/48 кГц) і чисті стани фільтрів для нового потоку
+    eq::reset();
   } else {
     // I2S-голодування: «програно» за годинником більше, ніж віддано (з запасом на DMA)
     uint64_t played = (uint64_t)(now - s_t0) * s_rate / 1000000ULL;
@@ -87,6 +91,9 @@ void pump() {
   for (;;) {
     size_t n = r->read(s_pcm, sizeof s_pcm);
     if (!n) break;
+    // M6a: EQ → рівень (слот bt) → одне насичення на місці; формат BT завжди 16 біт стерео
+    const int32_t fr = (int32_t)(n / 4);
+    if (fr > 0) eq::process(reinterpret_cast<int16_t*>(s_pcm), fr, 2, level::advance(level::Slot::Bt, fr));
     int64_t t = esp_timer_get_time();
     size_t w = s_out->write(s_pcm, n, kPcmWriteTimeoutMs);
     uint32_t dt = (uint32_t)(esp_timer_get_time() - t);
