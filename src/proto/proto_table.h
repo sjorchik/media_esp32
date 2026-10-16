@@ -2,12 +2,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
-// Таблиця команд і подій контракту proto_ver=1. Змінювати лише разом із контрактом.
+// Таблиця команд і подій контракту proto_ver=2. Змінювати лише разом із контрактом.
 namespace proto {
 
 enum class CmdId : uint8_t {
   Hello, Get, Src, Play, Pause, Toggle, Stop, Next, Prev, FNext, FPrev,
   Shuf, Rep, Hb, List, PlayFile,
+  Eq, Lvl,   // M6b: виконуються в роутері одразу (лише RAM), у чергу до app не потрапляють
   DbgMedia   // ВНУТРІШНЯ (не з контракту, немає в kCmds): імітація hot-plug з DBG
 };
 
@@ -28,6 +29,8 @@ inline constexpr CmdDef kCmds[] = {
   {"SHUF",     1, 1, CmdId::Shuf},
   {"REP",      1, 1, CmdId::Rep},
   {"HB",       1, 1, CmdId::Hb},
+  {"EQ",       5, 5, CmdId::Eq},        // M6b: g1..g5, цілі дБ -12..12
+  {"LVL",      2, 2, CmdId::Lvl},       // M6b: <bt|sd|usb>,<дБ -40..0>
   {"LIST",     0, 8, CmdId::List},      // зарезервовано → ERR,not_implemented
   {"PLAYFILE", 0, 8, CmdId::PlayFile},  // зарезервовано → ERR,not_implemented
 };

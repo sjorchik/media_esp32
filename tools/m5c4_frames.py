@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""M5c4/M5c4b: перевірка протоколу UART1 медіамодуля WROOM (контракт proto_ver=1) на залізі.
+"""M5c4/M5c4b/M6b: перевірка протоколу UART1 медіамодуля WROOM (контракт proto_ver=2) на залізі.
 
 Підключення: USB-UART адаптер (3,3 В) до UART1 модуля:
   адаптер TX -> GPIO32 (RX модуля), адаптер RX <- GPIO33 (TX модуля), спільна земля.
@@ -9,6 +9,7 @@ S3 має бути ВІДКЛЮЧЕНИЙ від GPIO32/33 (див. hwcheck_M5c4
 Запуск:  python tools/m5c4_frames.py COMx
 Скрипт шле кадри з правильною XOR-сумою й друкує PASS / FAIL / SKIP / INFO по кожному сценарію.
 Код виходу 0 — немає FAIL; 1 — є FAIL; 2 — не вдалось відкрити порт / не зайшла передумова.
+Сценарії eq_lvl / eq_lvl_bad (M6b) лишають EQ 0 дБ і LVL 0 дБ; застосовані значення видно лише в UART0 (DBG,eq, DBG,lvl).
 Ручні сценарії (src_sd_nomedia, src_sd_nomedia_repeat) потребують вийнятої картки SD, інакше SKIP.
 Звичайні сценарії (крім SKIP) залишають модуль у SRC,off із початковими shuf/rep.
 """
@@ -23,6 +24,7 @@ except ImportError:  # пояснення замість traceback
     serial = None
 
 MAX_FRAME = 255
+PROTO_VER = 2  # M6b: v1 → v2 (додано EQ, LVL)
 
 
 # ---------------------------------------------------------------- кадри
@@ -358,29 +360,32 @@ def sc_off_controls(ctx):
 
 
 def sc_hello(ctx):
-    fr = cmd(ctx, "HELLO,1")
-    ok, d = expect(fr, [("READY", [None, "1"]), ("STATE", ["off", "idle", ctx.base["shuf"], ctx.base["rep"]]),
+    fr = cmd(ctx, "HELLO,%d" % PROTO_VER)
+    ok, d = expect(fr, [("READY", [None, str(PROTO_VER)]), ("STATE", ["off", "idle", ctx.base["shuf"], ctx.base["rep"]]),
                         ("MEDIA", [None, None]), ("BT", [None, None])])
     if not ok:
-        return FAIL, "HELLO,1: " + d
+        return FAIL, "HELLO,%d: %s" % (PROTO_VER, d)
     if not fr[0].args[0]:
         return FAIL, "READY без версії прошивки"
-    return PASS, "HELLO,1 → READY(fw=%s,proto=1) + повний стан: %s" % (fr[0].args[0], fmt(fr[1:]))
+    return PASS, "HELLO,%d → READY(fw=%s,proto=%d) + повний стан: %s" % (PROTO_VER, fr[0].args[0], PROTO_VER, fmt(fr[1:]))
 
 
 def sc_hello_wrong_ver(ctx):
-    """HELLO,2 (чужа proto_ver) → лише READY,<fw>,1: без STATE/MEDIA/BT і без ERR (Q2); HELLO,abc / HELLO, → bad_arg."""
-    fr = cmd(ctx, "HELLO,2")
-    ok, d = expect(fr, [("READY", [None, "1"])])
-    if not ok:
-        return FAIL, "HELLO,2: " + d
-    if not fr[0].args[0]:
-        return FAIL, "READY без версії прошивки"
+    """HELLO,1 (стара) і HELLO,3 (чужа proto_ver) → лише READY,<fw>,2: без STATE/MEDIA/BT і без ERR (Q2); HELLO,abc / HELLO, → bad_arg."""
+    fw = None
+    for ver in (1, 3):
+        fr = cmd(ctx, "HELLO,%d" % ver)
+        ok, d = expect(fr, [("READY", [None, str(PROTO_VER)])])
+        if not ok:
+            return FAIL, "HELLO,%d: %s" % (ver, d)
+        if not fr[0].args[0]:
+            return FAIL, "READY без версії прошивки"
+        fw = fr[0].args[0]
     for body in ("HELLO,abc", "HELLO,"):
         ok2, d2 = expect(cmd(ctx, body), [("ERR", ["bad_arg", "HELLO"])])
         if not ok2:
             return FAIL, "%s: %s" % (body, d2)
-    return PASS, "HELLO,2 → лише READY(fw=%s,proto=1); HELLO,abc і HELLO, → ERR,bad_arg,HELLO" % fr[0].args[0]
+    return PASS, "HELLO,1 і HELLO,3 → лише READY(fw=%s,proto=%d); HELLO,abc і HELLO, → ERR,bad_arg,HELLO" % (fw, PROTO_VER)
 
 
 def sc_get(ctx):
@@ -483,6 +488,65 @@ def sc_shuf_rep(ctx):
         settle(ctx, 0.5)
 
 
+EQ_OK = ["EQ,3,0,0,0,3", "EQ,-12,-12,-12,-12,-12", "EQ,12,12,12,12,12", "EQ,-1,-2,-3,-4,-5", "EQ,12,-12,6,-6,0"]
+LVL_OK = ["LVL,sd,-20", "LVL,bt,-40", "LVL,usb,-1", "LVL,sd,0"]
+EQ_BAD = ["EQ", "EQ,1,2,3,4", "EQ,1,2,3,4,5,6", "EQ,1,2,3,4,x", "EQ,1,2,3,4,", "EQ,1,2,3,4,13", "EQ,-13,0,0,0,0",
+          "EQ,1,2,3,4,+5", "EQ,1,2,3,4, 5", "EQ,1,2,3,4,5.5", "EQ,9,9,9,9,99"]
+LVL_BAD = ["LVL", "LVL,sd", "LVL,sd,-20,1", "LVL,off,-10", "LVL,SD,-10", "LVL,,-10", "LVL,sd,x", "LVL,sd,",
+           "LVL,sd,-41", "LVL,sd,1", "LVL,sd,+0", "LVL,sd,-2.5"]
+
+
+def reset_audio(ctx):
+    for b in ("EQ,0,0,0,0,0", "LVL,bt,0", "LVL,sd,0", "LVL,usb,0"):
+        send(ctx, b)
+    settle(ctx, 0.3)
+
+
+def get_unchanged(ctx):
+    """GET після EQ/LVL: у STATE/MEDIA/BT нічого не додано, shuf/rep ті самі."""
+    fr = cmd(ctx, "GET")
+    ok, d = expect(fr, [("STATE", ["off", "idle", ctx.base["shuf"], ctx.base["rep"]]), ("MEDIA", [None, None]), ("BT", [None, None])])
+    if not ok:
+        return False, "GET після EQ/LVL: " + d
+    if len(fr[0].args) != 4 or len(fr[1].args) != 2:
+        return False, "у STATE/MEDIA з'явились зайві поля: " + fmt(fr)
+    return True, ""
+
+
+def sc_eq_lvl(ctx):
+    """EQ/LVL (v2): валідні кадри пачкою, як після HELLO у S3 → тиша (підтверджень і подій немає); GET без змін."""
+    try:
+        mark = ctx.rx.count()
+        for body in EQ_OK + LVL_OK:
+            send(ctx, body)
+        fr = silence(ctx, mark, 1.0)
+        if fr:
+            return FAIL, "валідні EQ/LVL дали кадри (мало бути тихо): " + fmt(fr)
+        ok, d = get_unchanged(ctx)
+        if not ok:
+            return FAIL, d
+        return PASS, "%d валідних EQ і %d LVL при src=off — тиша, GET без змін (значення дивись у UART0: DBG,eq / DBG,lvl)" % (len(EQ_OK), len(LVL_OK))
+    finally:
+        reset_audio(ctx)
+
+
+def sc_eq_lvl_bad(ctx):
+    """EQ/LVL (v2): неправильна арність, не число, поза діапазоном, невідомий слот → ERR,bad_arg,<EQ|LVL>."""
+    try:
+        for body in EQ_BAD + LVL_BAD:
+            nm = body.split(",")[0]
+            ok, d = expect(cmd(ctx, body), [("ERR", ["bad_arg", nm])])
+            if not ok:
+                return FAIL, "%s: %s" % (body, d)
+        ok, d = get_unchanged(ctx)
+        if not ok:
+            return FAIL, d
+        return PASS, "%d некоректних EQ/LVL → ERR,bad_arg,<EQ|LVL>; стан не змінився (атомарність EQ — у UART0: DBG,eq, див. hwcheck_M6b.md)" % (
+            len(EQ_BAD) + len(LVL_BAD))
+    finally:
+        reset_audio(ctx)
+
+
 def sc_meta_escape(ctx):
     exp = ctx.args.expect_title
     if not exp:
@@ -570,13 +634,15 @@ SCENARIOS = [
     ("src_sd_nomedia", sc_src_sd_nomedia),
     ("src_sd_nomedia_repeat", sc_src_sd_nomedia_repeat),
     ("shuf_rep", sc_shuf_rep),
+    ("eq_lvl", sc_eq_lvl),
+    ("eq_lvl_bad", sc_eq_lvl_bad),
     ("meta_escape", sc_meta_escape),
     ("final", sc_final),
 ]
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="M5c4: перевірка UART-протоколу модуля (UART1, 921600 8N1)")
+    ap = argparse.ArgumentParser(description="M5c4/M6b: перевірка UART-протоколу модуля (UART1, 921600 8N1), proto_ver=2")
     ap.add_argument("port", nargs="?", help="COM-порт USB-UART адаптера, напр. COM7")
     ap.add_argument("--baud", type=int, default=921600)
     ap.add_argument("--only", help="імена сценаріїв через кому (precond додається автоматично)")
@@ -641,3 +707,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+

@@ -31,7 +31,8 @@ bool toInt(const char* s, long& v) {
 }
 
 void help() {
-  LOGI(TAG, "Команди контракту: HELLO,1 GET SRC,<bt|sd|usb|off> PLAY PAUSE TOGGLE STOP NEXT PREV FNEXT FPREV SHUF,<0|1> REP,<0|1|2>");
+  LOGI(TAG, "Команди контракту: HELLO,%d GET SRC,<bt|sd|usb|off> PLAY PAUSE TOGGLE STOP NEXT PREV FNEXT FPREV SHUF,<0|1> REP,<0|1|2>", kProtoVer);
+  LOGI(TAG, "Також: EQ,<g1>,<g2>,<g3>,<g4>,<g5> (-12..12 дБ) | LVL,<bt|sd|usb>,<-40..0> (proto_ver=%d; показ: DBG,eq / DBG,lvl)", kProtoVer);
   LOGI(TAG, "Формат: NAME,арг,… або $BODY*XX");
   LOGI(TAG, "DBG,help | DBG,heap | DBG,tasks | DBG,state");
   LOGI(TAG, "DBG,tone[,Гц[,мс]] — тест-тон (лише при src=off), типово 440 Гц 1500 мс");
@@ -352,5 +353,6 @@ void DebugCmds::handle(const proto::Msg& m) {
     LOGW(TAG, "невідома DBG-команда '%s' (DBG,help)", c);
   }
 }
+
 
 

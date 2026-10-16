@@ -5,6 +5,7 @@
 #include "config.h"
 #include "console/debug_cmds.h"
 #include "core/events.h"
+#include "proto/cmd_args.h"
 #include "proto/frame.h"
 #include "proto/proto_table.h"
 #include "util/log.h"
@@ -14,17 +15,8 @@ namespace {
 constexpr const char* TAG = "router";
 QueueHandle_t s_q = nullptr;
 
-// Лише десяткові цифри (контракт, розд. 2): без пробілів, знаку, префіксів.
-bool parseInt(const char* s, long& v) {
-  if (!s || !*s) return false;
-  v = 0;
-  for (const char* p = s; *p; p++) {
-    if (*p < '0' || *p > '9') return false;
-    v = v * 10 + (*p - '0');
-    if (v > 100000) return false;  // усі валідні аргументи ≤ 2; захист від переповнення
-  }
-  return true;
-}
+// Лише десяткові цифри (контракт, розд. 2); логіка в proto::parseUInt (тестується в native).
+bool parseInt(const char* s, long& v) { return proto::parseUInt(s, v); }
 
 bool parseSrc(const char* s, SrcId& out) {
   if (!strcmp(s, "bt")) out = SrcId::BT;
@@ -78,18 +70,20 @@ void Router::dispatch(char* body, Origin o) {
   switch (d->id) {
     case CmdId::Hb:
       return;  // лише ознака живості (час останнього валідного кадру оновлює link)
-    case CmdId::Hello:
-      if (!parseInt(m.args[0], v)) {  // нечислова / порожня версія
+    case CmdId::Hello: {
+      const proto::HelloVerdict hv = proto::helloVerdict(m.args[0], kProtoVer, v);
+      if (hv == proto::HelloVerdict::BadArg) {  // нечислова / порожня версія
         Events::err(proto::errc::kBadArg, d->name);
         return;
       }
-      if (v != kProtoVer) {  // M5c4b/Q2: чужа версія — лише READY (S3 бачить proto у READY); без стану й ERR
+      if (hv == proto::HelloVerdict::ReadyOnly) {  // M5c4b/Q2: чужа версія — лише READY (S3 бачить proto у READY); без стану й ERR
         LOGW(TAG, "HELLO,%ld: proto_ver не збігається (наша %d), лише READY", v, kProtoVer);
         Events::ready();
         return;
       }
       c.arg = (int16_t)v;
       break;
+    }
     case CmdId::Src: {
       SrcId s;
       if (!parseSrc(m.args[0], s)) { Events::err(proto::errc::kBadArg, d->name); return; }
@@ -104,8 +98,17 @@ void Router::dispatch(char* body, Origin o) {
       if (!parseInt(m.args[0], v) || v < 0 || v > 2) { Events::err(proto::errc::kBadArg, d->name); return; }
       c.arg = (int16_t)v;
       break;
+    case CmdId::Eq:  // M6b: будь-який state і src=off; значення лише в RAM, підтверджень і подій немає
+      // Без черги до app: eq::setAllDb() — атомарні слова, безпечно з link_rx/console (як DBG,eq).
+      // Усе або нічого: некоректний кадр не змінює жодної смуги.
+      if (!proto::applyEq(m)) Events::err(proto::errc::kBadArg, d->name);
+      return;
+    case CmdId::Lvl:  // M6b: те саме для level::setDb() (атомарний байт слота)
+      if (!proto::applyLvl(m)) Events::err(proto::errc::kBadArg, d->name);
+      return;
     default:
       break;
   }
   post(c);
 }
+

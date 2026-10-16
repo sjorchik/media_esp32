@@ -1,6 +1,6 @@
 # Медіамодуль WROOM (ESP32-WROOM-32, без PSRAM)
 
-Прошивка `FW_VERSION = 0.3.0`, `proto_ver = 1`. Контракт із головним S3: [docs/UART_CONTRACT.md](docs/UART_CONTRACT.md).
+Прошивка `FW_VERSION = 0.3.0`, `proto_ver = 2`. Контракт із головним S3: [docs/UART_CONTRACT.md](docs/UART_CONTRACT.md).
 
 ## 1. Призначення
 
@@ -10,7 +10,7 @@
 - **SD**: MP3 з картки (SdFat, hot-plug, плейлист, shuffle, резюме).
 - **USB**: через CH376S. Поки заглушка (`ENABLE_USB_CH376 = 0`, у `MEDIA` завжди `usb=0`).
 
-Звук виводиться по I2S на ЦАП. Гучністю, тембром і входом керує лише S3 (TDA7318). WROOM мʼютить свій ЦАП сам.
+Звук виводиться по I2S на ЦАП. Гучністю, тембром і входом керує лише S3 (TDA7318); цифровий EQ і послаблення виходу S3 задає командами `EQ` і `LVL` (M6b). WROOM мʼютить свій ЦАП сам.
 
 ## 2. Апаратура і піни
 
@@ -43,7 +43,7 @@
 
 - `esp32dev` — **реліз** (за замовчуванням). `BOOT_TEST_CMDS=0`, `SKIP_TEST_CMDS=0`.
 - `esp32dev_test` — стенд. Успадковує `esp32dev` і додає `-DBOOT_TEST_CMDS=1 -DSKIP_TEST_CMDS=1`. Не для релізу.
-- `native` — юніт-тести (`pio test -e native`). Збирає `proto/frame`, `media/id3`, `media/shuffle`, `storage/resume_record`, `storage/settings_record`, `storage/boot_guard`.
+- `native` — юніт-тести (`pio test -e native`). Збирає `proto/frame`, `proto/cmd_args`, `media/id3`, `media/shuffle`, `storage/resume_record`, `storage/settings_record`, `storage/boot_guard`.
 
 Команди (COM-порт підставити свій):
 
@@ -108,6 +108,15 @@ SdFat не потокобезпечний: усі виклики серіалі�
 
 Кадр: `$BODY*XX\n`, XOR-сума двома hex-цифрами, LF. Максимум 255 Б. Повний опис, команди, події, семантика і приклади: [docs/UART_CONTRACT.md](docs/UART_CONTRACT.md). Будь-яка зміна контракту — нова `proto_ver` і одночасне оновлення обох сторін.
 
+**proto_ver = 2 (M6b).** Історія: v1 → v2 — додано `EQ` і `LVL`. Константа `kProtoVer` лише в `src/config.h`.
+
+- Після `HELLO,2`: `READY` і повний стан, далі S3 шле `SHUF`, `REP`, потім `EQ` і три `LVL`. `HELLO` з іншою версією (зокрема `HELLO,1`) — лише `READY` (у ньому proto = 2), без стану й `ERR`.
+- `EQ,<g1>,<g2>,<g3>,<g4>,<g5>` — смуги 60/250/1000/4000/12000 Гц, цілі дБ −12…12, рівно 5 аргументів, діє на всі джерела.
+- `LVL,<bt|sd|usb>,<дБ>` — цифрове послаблення виходу слота, ціле −40…0; діє, коли це джерело активне.
+- Обидві приймаються в будь-якому `state` і при `src=off`, без підтверджень і подій; у `STATE`/`GET` нічого не додається. Некоректні → `ERR,bad_arg,<EQ|LVL>`, нічого не застосовується (для `EQ` або всі 5, або жодного).
+- Значення лише в RAM (NVS не пишемо): після перезавантаження 0 дБ, поки S3 не надішле їх знову.
+- Виконує роутер у задачі `link_rx`/`console` (без черги до `app`): `eq::setAllDb` і `level::setDb` атомарні, як і в `DBG,eq`/`DBG,lvl`. Консоль UART0 приймає ті самі рядки: `EQ,3,0,0,0,3`, `LVL,sd,-20`; застосоване показують `DBG,eq` і `DBG,lvl`.
+
 ## 6. Можливості й ліміти
 
 - **Формати:** лише `.mp3` (регістр не важливий). Приховані файли й імена з крапки ігноруються.
@@ -162,6 +171,8 @@ SdFat не потокобезпечний: усі виклики серіалі�
 | `DBG,link[,reset]` | Втрати черг, злиті TIME, час відправки кадру |
 | `DBG,console[,reset]` | Заповнення RX UART0 (cap/peak/high), рядки ok/long |
 | `DBG,aout` | Стан AudioOut (мʼют, лічильники, власник мʼютекса), задача mp3 |
+| `DBG,eq[,g1,g2,g3,g4,g5]` | Пресет EQ і активні смуги / задати пресет (дБ −12…12) |
+| `DBG,lvl[,<bt\|sd\|usb>,<дБ>]` | Рівні виходу bt/sd/usb і останній активний слот / задати рівень (дБ −40…0) |
 | `DBG,failnext,<n>[,read\|decode]` | **[test]** Наступні n стартів треку штучно завершуються збоєм |
 
 Приклад (реліз, `esp32dev`): `DBG,failnext,1` → `DBG,failnext вимкнено (SKIP_TEST_CMDS=0)`.
@@ -171,7 +182,7 @@ SdFat не потокобезпечний: усі виклики серіалі�
 Усі скрипти потребують `pyserial` (`pip install pyserial`). Адаптер USB-UART 3,3 В: TX → GPIO32, RX ← GPIO33, спільна земля. S3 має бути відʼєднаний від GPIO32/33.
 
 - `tools/m5c1_series.py COMx [серій=20] [read|decode]` — серія `DBG,failnext,1` + `NEXT` через UART0. **Потребує `esp32dev_test`.** Лог: `m5c1_series.log`.
-- `tools/m5c4_frames.py COMx [--only a,b] [--list] [--usb-expected 0|1] [--expect-title назва] [--max-next 5]` — перевірка протоколу UART1: PASS/FAIL/SKIP/INFO. Код виходу: 0 — без FAIL, 1 — є FAIL, 2 — порт або передумова.
+- `tools/m5c4_frames.py COMx [--only a,b] [--list] [--usb-expected 0|1] [--expect-title назва] [--max-next 5]` — перевірка протоколу UART1 (proto_ver = 2, зокрема сценарії `eq_lvl`, `eq_lvl_bad`): PASS/FAIL/SKIP/INFO. Код виходу: 0 — без FAIL, 1 — є FAIL, 2 — порт або передумова.
 - `tools/m5c5_src_stress.py --ctl COMx --dbg COMy [--cycles 100] [--seed 1] [--settle 15] [--no-usb] [--no-bt] [--warmup 2]` — стрес SRC (UART1 + UART0). Код виходу: 0 — без FAIL.
 - `tools/m5c5_src_stress.py --dbg COMy --burst 50` (і `--burst 200`) — пачка рядків у UART0, без `--ctl`. Код виходу 1, якщо є втрати.
 
@@ -213,3 +224,4 @@ SdFat не потокобезпечний: усі виклики серіалі�
 - **Плата перезавантажується при відкритті UART0.** Відкриття порту може скинути ESP32 через DTR/RTS. Це очікувано, не помилка.
 - **Помилка «модуль недоступний» на S3.** Немає валідного кадру 3 с. Перевірити лінію GPIO32/33 і рівні 3,3 В. Перевірити `DBG,link`.
 - **Незнайомий ключ NVS у логах.** Після оновлення перший запуск пише `застарілий ключ last_src стерто`. Далі рядка немає.
+

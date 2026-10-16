@@ -20,7 +20,7 @@
 // ============================================================
 
 #define FW_VERSION "0.3.0"
-inline constexpr int kProtoVer = 1;
+inline constexpr int kProtoVer = 2;   // proto_ver: єдине місце (M6b: 1→2, додано EQ і LVL)
 
 // ---- Прапорці збірки ----
 #ifndef AUTO_RESUME_SOURCE
@@ -251,5 +251,6 @@ inline constexpr int kPrioDecoder = 5;   // нижче за audio (6), вище 
 
 // ---- Діагностика ----
 inline constexpr uint32_t kDiagPeriodMs = 60000;
+
 
 
