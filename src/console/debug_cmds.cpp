@@ -16,6 +16,7 @@
 #include "media/sd_media.h"
 #include "proto/link.h"
 #include "storage/storage_dbg.h"
+#include "usb/ch376_diag.h"
 #include "util/diag.h"
 #include "util/log.h"
 
@@ -59,6 +60,11 @@ void help() {
   LOGI(TAG, "DBG,eq — пресет EQ і активні смуги | DBG,eq,<g1>,<g2>,<g3>,<g4>,<g5> — дБ -12..12 для 60/250/1000/4000/12000 Гц");
   LOGI(TAG, "DBG,lvl — рівень виходу bt/sd/usb | DBG,lvl,<bt|sd|usb>,<-40..0> — послаблення, дБ (лише RAM, після перезапуску 0)");
   LOGI(TAG, "DBG,aout — стан AudioOut (мʼют, лічильники, власник мʼютекса) і задачі mp3 (де стоїть); читає без app, працює й при завислому app");
+#if ENABLE_USB_CH376
+  LOGI(TAG, "DBG,usb — стан CH376S | DBG,usb,init — повна послідовність з мкс");
+  LOGI(TAG, "DBG,usb,reset — скид і повернення на 9600 | DBG,usb,ping,<N> — N× CHECK_EXIST");
+  LOGI(TAG, "DBG,usb,baud — перебір дільників | DBG,usb,baud,<бод>,<K hex> — одна спроба");
+#endif
 #if SKIP_TEST_CMDS
   LOGI(TAG, "DBG,failnext,<n>[,read|decode] — наступні n стартів треку штучно завершуються read_fail (типово) або decode_fail");
 #endif
@@ -349,10 +355,17 @@ void DebugCmds::handle(const proto::Msg& m) {
     LOGI(TAG, "link: tx=%u втрати hi=%u lo=%u | TIME злито=%u | макс. відправка=%u мкс, з них дзеркало UART0=%u мкс",
          (unsigned)s.txItems, (unsigned)s.lostHi, (unsigned)s.lostLo, (unsigned)s.timeCoalesced,
          (unsigned)s.txMaxUs, (unsigned)s.mirrorMaxUs);
+  } else if (!strcasecmp(c, "usb")) {
+#if ENABLE_USB_CH376
+    Ch376Diag::handle(m);
+#else
+    LOGW(TAG, "DBG,usb вимкнено (ENABLE_USB_CH376=0)");
+#endif
   } else {
     LOGW(TAG, "невідома DBG-команда '%s' (DBG,help)", c);
   }
 }
+
 
 
 

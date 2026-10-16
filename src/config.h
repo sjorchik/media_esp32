@@ -66,6 +66,67 @@ inline constexpr size_t   kTxLoDepth = 12;    // TRACK, FOLDER, META (TIME — �
 inline constexpr uint32_t kTxWaitMs = 30;     // скільки send() чекає місця в черзі до фіксації втрати
 inline constexpr size_t   kCmdQueueDepth = 16;
 
+// ---- CH376S (M4a): драйвер USB-хоста, протокольний рівень ----
+// УВАГА: значення нижче взяті з памʼяті про даташит CH376S (даташита в проєкті немає). Позначка
+// «звірити» означає: значення треба перевірити за даташитом або на залізі. Рівень впевненості
+// вказано в таблиці звіту (report_M4a.md). Невірна константа проявляється як відсутність відповіді
+// або відкат швидкості, а не як пошкодження даних на диску.
+inline constexpr uint8_t  kCh376Sync0 = 0x57;         // звірити: префікс команди, впевненість висока
+inline constexpr uint8_t  kCh376Sync1 = 0xAB;         // звірити: висока
+inline constexpr uint8_t  kCh376CmdSetBaud = 0x02;    // звірити: SET_BAUDRATE, середня
+inline constexpr uint8_t  kCh376CmdReset = 0x05;      // звірити: RESET_ALL, середня
+inline constexpr uint8_t  kCh376CmdCheckExist = 0x06; // звірити: CHECK_EXIST, середня-висока
+inline constexpr uint8_t  kCh376CmdSetUsbMode = 0x15; // звірити: SET_USB_MODE, середня
+inline constexpr uint8_t  kCh376CmdGetStatus = 0x22;  // звірити: GET_STATUS, середня
+inline constexpr uint8_t  kCh376CmdDiskConnect = 0x30; // звірити: DISK_CONNECT, середня
+inline constexpr uint8_t  kCh376CmdDiskMount = 0x31;   // звірити: DISK_MOUNT, середня
+inline constexpr uint8_t  kCh376CheckByte = 0x55;     // байт-тест CHECK_EXIST (будь-який, для відповіді)
+inline constexpr uint8_t  kCh376CheckXor = 0xFF;      // звірити: CHECK_EXIST повертає x XOR 0xFF, висока
+inline constexpr uint8_t  kCh376ModeHost = 0x06;      // звірити: SET_USB_MODE хост з авто-SOF, СЕРЕДНЬО-ВИСОКА (0x05 — хост без SOF, 0x07 — з скидом шини)
+inline constexpr uint8_t  kCh376RetSuccess = 0x51;    // звірити: код успіху відповіді, середня
+inline constexpr uint8_t  kCh376RetAbort = 0x5F;      // звірити: код відмови відповіді, середня
+inline constexpr uint8_t  kCh376IntNone = 0x00;       // звірити: GET_STATUS без події, НИЗЬКА
+inline constexpr uint8_t  kCh376IntSuccess = 0x14;    // звірити: USB_INT_SUCCESS, середня
+inline constexpr uint8_t  kCh376IntConnect = 0x15;    // звірити: USB_INT_CONNECT, середня
+inline constexpr uint8_t  kCh376IntDisconnect = 0x16; // звірити: USB_INT_DISCONNECT, середня
+inline constexpr uint8_t  kCh376ErrDiskDisc = 0x82;   // звірити: ERR_DISK_DISCON (немає диска), НИЗЬКА
+
+inline constexpr bool     kCh376IntPin = false;       // 1: очікування подій за лінією INT (потрібен CH_INT_PIN ≥ 0); типово опитування статусу
+inline constexpr size_t   kCh376RxBuf = 512;          // RX-буфер Serial2, виділяється в heap лише при старті драйвера
+inline constexpr uint32_t kCh376DefaultBaud = 9600;   // швидкість після скиду (умова завдання), середня
+inline constexpr uint32_t kCh376ReplyMs = 50;         // очікування однобайтової відповіді, НИЗЬКА (підбирається на залізі)
+inline constexpr uint32_t kCh376ResetWaitMs = 60;     // пауза після RESET_ALL, НИЗЬКА
+inline constexpr uint32_t kCh376RstPulseMs = 10;      // тривалість імпульсу RST, НИЗЬКА
+inline constexpr bool     kCh376RstActiveHigh = true; // звірити: RST активний HIGH, НИЗЬКА (інакше — false)
+inline constexpr uint32_t kCh376ModeWaitMs = 20;      // пауза після SET_USB_MODE, НИЗЬКА
+inline constexpr uint32_t kCh376PollMs = 5;           // крок опитування статусу
+inline constexpr uint32_t kCh376ConnectWaitMs = 3000; // очікування підключення і DISK_CONNECT (≤ 3 с, умова завдання)
+inline constexpr uint32_t kCh376MountWaitMs = 1500;   // очікування DISK_MOUNT, НИЗЬКА
+inline constexpr uint8_t  kCh376JunkMax = 16;         // сміття перед очікуваною відповіддю, байтів; далі BadReply
+
+// Дільники SET_BAUDRATE: ГІПОТЕЗА, впевненість низька-середня. Звірити на залізі (DBG,usb,baud).
+// Команда 0x02 з двома байтами: перший kCh376BaudDivPrefix (0x03), другий K.
+// Швидкість = 6 000 000 / (256 − K). Поля структури: lo — перший байт (0x03), hi — K.
+//   1 000 000 ← K = 0xFA (точно); 460 800 ← 0xF3 (461 538, +0,2 %);
+//   230 400 ← 0xE6 (230 769, +0,2 %); 115 200 ← 0xCC (115 385, +0,2 %).
+// 921600 не вмикаємо: точного дільника немає. Порядок — від більшої швидкості до меншої.
+// Відкат на kCh376DefaultBaud (9600) обовʼязковий: negotiateBaud повертає порт і чіп на 9600 при невдачі.
+inline constexpr uint8_t kCh376BaudDivPrefix = 0x03;
+struct Ch376BaudDiv {
+  uint32_t baud;
+  uint8_t lo;
+  uint8_t hi;
+};
+inline constexpr Ch376BaudDiv kCh376BaudTable[] = {
+    {1000000, kCh376BaudDivPrefix, 0xFA},
+    {460800, kCh376BaudDivPrefix, 0xF3},
+    {230400, kCh376BaudDivPrefix, 0xE6},
+    {115200, kCh376BaudDivPrefix, 0xCC},
+};
+inline constexpr size_t kCh376BaudTableN = sizeof(kCh376BaudTable) / sizeof(kCh376BaudTable[0]);
+static_assert(kCh376BaudTableN >= 1, "таблиця швидкостей CH376S порожня");
+static_assert(kCh376RxBuf >= 64 && kCh376RxBuf <= 2048, "kCh376RxBuf: 64..2048 Б");
+
 // ---- Аудіо ----
 inline constexpr uint32_t kDefaultRate = 44100;
 inline constexpr uint32_t kFadeMs = 8;          // fade-in / хвіст fade-out
@@ -251,6 +312,3 @@ inline constexpr int kPrioDecoder = 5;   // нижче за audio (6), вище 
 
 // ---- Діагностика ----
 inline constexpr uint32_t kDiagPeriodMs = 60000;
-
-
-
