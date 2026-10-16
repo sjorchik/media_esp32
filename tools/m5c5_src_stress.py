@@ -12,6 +12,13 @@
 
 Кодування кадрів, розбір UART1 і XOR-сума беруться з tools/m5c4_frames.py (імпорт, без копії).
 Код виходу: 0 — без FAIL; 1 — є FAIL (або в режимі --burst є втрати); 2 — не вдалось відкрити порт / немає HB.
+FAIL — функціональні помилки (STATE, перезавантаження, HB, мʼют, невідомі ERR, underrun>0) та порушення правил M5c6b:
+  heap  : пороги залежать від стану джерела (sd/off free>=20 КБ; bt з телефоном free>=15 КБ; для всіх largest>=12 КБ);
+          витік = free монотонно падає на >=3 послідовних контрольних точках одного ключа і сумарно >=2048 Б;
+  стеки : мінімальний вільний запас будь-якої задачі < 1024 Б.
+INFO (не впливає на код виходу): одиничні просідання heap, просідання стеків відносно прогрітої бази (>128 Б).
+Контрольна точка чекає --cp-delay (2,5 с) перед DBG,heap; --idle-tail N додає точку heap після N с спокою в off.
+Довший тренд: --cycles 300 (контрольні точки кожні 10 циклів). Перевірка правил без заліза: --selftest.
 Увага: відкриття UART0 на деяких платах скидає ESP32 через DTR/RTS; скрипт вимикає DTR/RTS до відкриття
 й чекає старту, а перезавантаження до початку прогону не рахує.
 """
@@ -172,6 +179,152 @@ def parse_decode(lines):
         if m:
             d["wto"] = int(m.group(1))
     return d if "underrun" in d else None
+
+
+# ---------------------------------------------------------------- оцінка heap/стеків (M5c6b, чисті функції)
+def thresholds_from_args(a):
+    """Збирає використані пороги в один словник (друкується в підсумку)."""
+    return {
+        "free_sd": a.free_min_sd,          # src=sd і off
+        "free_bt_phone": a.free_min_bt,    # src=bt з підключеним телефоном
+        "free_other": a.free_min_other,    # bt без телефону, usb та невідомий стан
+        "largest": a.largest_min,          # усі стани
+        "leak_steps": a.leak_steps,        # скільки послідовних просідань free = ознака витоку
+        "leak_bytes": a.leak_bytes,        # мінімальне сумарне падіння для витоку
+        "leak_step_min": a.leak_step_min,  # мінімальне падіння одного кроку, щоб він рахувався в серії (відсікає шум)
+        "leak_recover": a.leak_recover,    # серія не витік, якщо пізніше free повернувся до старту серії з цим допуском
+        "info": a.heap_drift,              # поріг INFO для одиничного просідання free між точками одного ключа
+        "stack_min": a.stack_min,          # FAIL, якщо мін. вільно < цього
+        "stack_tol": a.stack_tol,          # INFO, якщо просідання від бази > цього
+    }
+
+
+def heap_free_req(key, th):
+    """Поріг free для ключа стану: sd/off — 20 КБ, bt+phone — 15 КБ, решта — free_other."""
+    if key == "bt+phone":
+        return th["free_bt_phone"]
+    if key in ("sd", "off"):
+        return th["free_sd"]
+    return th["free_other"]
+
+
+def eval_heap(samples, th):
+    """samples: список dict(key, free, largest, minfree, base, tag) у порядку знімання.
+    Повертає (рядки таблиці, FAIL-рядки, INFO-рядки)."""
+    fails, infos, rows = [], [], []
+    keys = []
+    for smp in samples:
+        if smp["key"] not in keys:
+            keys.append(smp["key"])
+    for k in keys:
+        ss = [x for x in samples if x["key"] == k]
+        base = next((x for x in ss if x["base"]), ss[0])
+        after = ss[ss.index(base):]
+        dfree = base["free"] - min(x["free"] for x in after)
+        dlarg = base["largest"] - min(x["largest"] for x in after)
+        rows.append((k, len(ss), base["free"], min(x["free"] for x in ss), dfree, base["largest"],
+                     min(x["largest"] for x in ss), dlarg))
+        # 1) пороги за станом джерела
+        # точки прогріву (base) лише INFO: BT звільняє памʼять із затримкою, а база ще не усталена
+        req = heap_free_req(k, th)
+        for x in ss:
+            if not x["base"]:
+                continue
+            if x["free"] < req or x["largest"] < th["largest"]:
+                infos.append("прогрів heap[%s]: free %d / largest %d нижче порогів (%d / %d), точка %s — не оцінюється" % (
+                    k, x["free"], x["largest"], req, th["largest"], x["tag"]))
+        chk = [x for x in ss if not x["base"]]
+        if chk:
+            worst = min(chk, key=lambda x: x["free"])
+            if worst["free"] < req:
+                fails.append("heap[%s]: free %d Б < %d Б (точка %s)" % (k, worst["free"], req, worst["tag"]))
+            worst_l = min(chk, key=lambda x: x["largest"])
+            if worst_l["largest"] < th["largest"]:
+                fails.append("heap[%s]: largest %d Б < %d Б (точка %s)" % (k, worst_l["largest"], th["largest"],
+                                                                          worst_l["tag"]))
+        # 2) тренд: максимальні серії строго спадного free між послідовними точками ключа
+        in_leak = set()  # індекси кроків (i-1 -> i), які входять у FAIL-серію
+        r = 0
+        for i in range(1, len(ss) + 1):
+            if i < len(ss) and ss[i - 1]["free"] - ss[i]["free"] >= th["leak_step_min"]:
+                continue  # крок вниз не менше leak_step_min — серія триває (дрібний шум серію обриває)
+            steps, total = i - 1 - r, ss[r]["free"] - ss[i - 1]["free"]
+            if steps >= th["leak_steps"] and total >= th["leak_bytes"]:
+                txt = "free монотонно падає %d кроків поспіль, -%d Б (%d→%d, точки %s…%s)" % (
+                    steps, total, ss[r]["free"], ss[i - 1]["free"], ss[r]["tag"], ss[i - 1]["tag"])
+                # якщо пізніше free повернувся до рівня старту серії — це не витік (тимчасово зайнята памʼять, напр. BT)
+                if any(x["free"] >= ss[r]["free"] - th["leak_recover"] for x in ss[i:]):
+                    infos.append("heap[%s]: %s, але далі відновився — не витік" % (k, txt))
+                else:
+                    fails.append("heap[%s]: витік? %s, без відновлення" % (k, txt))
+                in_leak.update(range(r + 1, i))
+            r = i
+        # 3) одиничні просідання — лише INFO
+        for i in range(1, len(ss)):
+            drop = ss[i - 1]["free"] - ss[i]["free"]
+            if drop >= th["info"] and i not in in_leak:
+                infos.append("heap[%s]: одиничне просідання free на %d Б (%d→%d, %s→%s)" % (
+                    k, drop, ss[i - 1]["free"], ss[i]["free"], ss[i - 1]["tag"], ss[i]["tag"]))
+    return rows, fails, infos
+
+
+def eval_stacks(samples, th):
+    """samples: список (tag, base, {задача: мін. вільно}). Повертає (рядки, FAIL, INFO).
+    FAIL — лише абсолютний мінімум; просідання від прогрітої бази — INFO."""
+    fails, infos, rows = [], [], []
+    base_stack, worst = {}, {}
+    for tag, base, t in samples:  # база: мін. по зразках прогріву (watermark лише спадає)
+        if base:
+            for name, v in t.items():
+                base_stack[name] = min(base_stack.get(name, v), v)
+    for tag, base, t in samples:
+        for name, v in t.items():
+            base_stack.setdefault(name, v)  # задача зʼявилась пізніше (напр. mp3) — база = перший зразок
+            worst[name] = min(worst.get(name, v), v)
+    for name in sorted(base_stack):
+        drop = base_stack[name] - worst[name]
+        rows.append((name, base_stack[name], worst[name], drop))
+        if worst[name] < th["stack_min"]:
+            fails.append("стек %s: мін. вільно %d Б < %d Б" % (name, worst[name], th["stack_min"]))
+        if drop > th["stack_tol"]:
+            infos.append("стек %s: просів на %d Б (база %d → %d Б)" % (name, drop, base_stack[name], worst[name]))
+    return rows, fails, infos
+
+
+def run_selftest(args):
+    """Сухий прогін оцінки на синтетичних контрольних точках (без портів і заліза)."""
+    th = thresholds_from_args(args)
+
+    def mk(key, frees, largest=14000):
+        return [{"key": key, "free": f, "largest": largest, "minfree": f, "base": i == 0, "tag": "p%d" % i}
+                for i, f in enumerate(frees)]
+
+    cases = [
+        ("BT з телефоном 17,8 КБ (стабільно) → PASS", "heap", mk("bt+phone", [17800, 17850, 17790, 17810]), False, False),
+        ("монотонне падіння 4 точки по ≥600 Б → FAIL", "heap", mk("sd", [28000, 27400, 26800, 26200, 25600]), True, False),
+        ("одиничне просідання 1,4 КБ → INFO", "heap", mk("sd", [28000, 26600, 28000, 27900]), False, True),
+        ("піла з відновленням (3 падіння, далі назад) → INFO, не FAIL", "heap",
+         mk("sd", [24976, 24852, 21744, 21456, 24852]), False, True),
+        ("дрібний шум 8 Б на кроці не рахується серією → без FAIL", "heap", mk("sd", [24996, 24988, 24980, 24972, 24964]), False, False),
+        ("прогрів нижче порога (BT ще звільняє) → лише INFO", "heap", mk("off", [14960, 24852, 24900]), False, True),
+        ("sd free 19 КБ (< 20 КБ; перша точка — прогрів, INFO) → FAIL", "heap", mk("sd", [19000, 19000]), True, True),
+        ("largest 11 КБ (< 12 КБ) → FAIL", "heap", mk("off", [30000, 30000], largest=11000), True, True),
+        ("стек 1 КБ → 900 Б → FAIL", "stack", [("w", True, {"t": 1024}), ("c", False, {"t": 900})], True, False),
+        ("стек 180 Б просідання при запасі ≈3 КБ → INFO", "stack",
+         [("w", True, {"t": 3200}), ("c", False, {"t": 3020})], False, True),
+    ]
+    bad = 0
+    for title, kind, data, want_fail, want_info in cases:
+        _, f, i = eval_heap(data, th) if kind == "heap" else eval_stacks(data, th)
+        ok = bool(f) == want_fail and bool(i) == want_info
+        bad += not ok
+        print("[%s] %s | FAIL=%d INFO=%d" % ("ok" if ok else "НЕВІРНО", title, len(f), len(i)))
+        for x in f:
+            print("      FAIL: " + x)
+        for x in i:
+            print("      INFO: " + x)
+    print("САМОТЕСТ: %s" % ("УСПІХ" if not bad else "ПРОВАЛ (%d)" % bad))
+    return 1 if bad else 0
 
 
 # ---------------------------------------------------------------- режим --burst (частина B)
@@ -445,6 +598,8 @@ class Stress:
         fails = []
         src = self.cur_src() or "?"
         key = src + ("+phone" if src == "bt" and self.bt_conn() else "")
+        if self.a.cp_delay > 0:
+            time.sleep(self.a.cp_delay)  # дати heap «осісти» після перемикання (напр. BT звільняє памʼять із затримкою)
         h = self.dbg_heap()
         if h is None:
             fails.append("DBG,heap без відповіді")
@@ -518,6 +673,11 @@ class Stress:
             self.global_fail.append("фінал off: " + "; ".join(reasons))
         for f in self.checkpoint("final-off"):
             self.global_fail.append("фінал: " + f)
+        if self.a.idle_tail > 0:  # діагностика: чи повертається heap до бази після спокою в off
+            self.log("   [idle-tail] спокій у off %.0f с..." % self.a.idle_tail)
+            time.sleep(self.a.idle_tail)
+            for f in self.checkpoint("tail-off"):
+                self.global_fail.append("хвіст off: " + f)
 
     # ---- підсумок
     def summary(self):
@@ -555,53 +715,21 @@ class Stress:
         if self.mute["fail"]:
             fails.append("мʼют: %d невідповідностей" % self.mute["fail"])
 
-        # heap: дрейф по ключах (джерело[+phone]) від базової точки (прогрів), мінімуми
-        keys = []
-        for s in self.heap:
-            if s["key"] not in keys:
-                keys.append(s["key"])
-        rows = []
-        for k in keys:
-            ss = [s for s in self.heap if s["key"] == k]
-            base = next((s for s in ss if s["base"]), ss[0])
-            after = ss[ss.index(base):]
-            dfree = base["free"] - min(s["free"] for s in after)
-            dlarg = base["largest"] - min(s["largest"] for s in after)
-            rows.append((k, len(ss), base["free"], min(s["free"] for s in ss), dfree, base["largest"],
-                         min(s["largest"] for s in ss), dlarg))
-            if dfree > self.a.heap_drift:
-                fails.append("heap[%s]: free просів на %d Б (> %d)" % (k, dfree, self.a.heap_drift))
-            if dlarg > self.a.heap_drift:
-                fails.append("heap[%s]: largest просів на %d Б (> %d)" % (k, dlarg, self.a.heap_drift))
+        # heap: пороги за станом джерела + тренд витоку (одиничні просідання — INFO)
+        th = thresholds_from_args(self.a)
+        rows, hf, hi = eval_heap(self.heap, th)
+        fails += hf
+        infos = list(hi)
         min_free_dev = min([s["minfree"] for s in self.heap] or [0])
         min_free_obs = min([s["free"] for s in self.heap] or [0])
         min_larg_obs = min([s["largest"] for s in self.heap] or [0])
-        if self.heap:
-            if min(min_free_dev, min_free_obs) < 20480:
-                fails.append("free < 20 КБ (min_free пристрою %d, спостережений %d)" % (min_free_dev, min_free_obs))
-            if min_larg_obs < 12288:
-                fails.append("largest < 12 КБ (%d)" % min_larg_obs)
-        else:
+        if not self.heap:
             fails.append("жодного зразка DBG,heap")
 
-        # стеки: просідання відносно базової точки, абсолютний мінімум
-        base_stack, worst = {}, {}
-        for tag, base, t in self.stack_samples:  # база: мін. по зразках прогріву (watermark лише спадає)
-            if base:
-                for name, v in t.items():
-                    base_stack[name] = min(base_stack.get(name, v), v)
-        for tag, base, t in self.stack_samples:
-            for name, v in t.items():
-                base_stack.setdefault(name, v)  # задача зʼявилась пізніше (напр. mp3) — база = перший зразок
-                worst[name] = min(worst.get(name, v), v)
-        stack_rows = []
-        for name in sorted(base_stack):
-            drop = base_stack[name] - worst[name]
-            stack_rows.append((name, base_stack[name], worst[name], drop))
-            if drop > self.a.stack_tol:
-                fails.append("стек %s просів на %d Б (> %d)" % (name, drop, self.a.stack_tol))
-            if worst[name] < self.a.stack_min:
-                fails.append("стек %s: мін. вільно %d Б < %d" % (name, worst[name], self.a.stack_min))
+        # стеки: FAIL лише абсолютний мінімум; просідання від бази — INFO
+        stack_rows, sf, si = eval_stacks(self.stack_samples, th)
+        fails += sf
+        infos += si
         if self.under and max(self.under) > 0:
             fails.append("underrun=%d" % max(self.under))
 
@@ -615,13 +743,19 @@ class Stress:
         L("Heap по джерелах (Б):  ключ        n   free_base free_min dFree | largest_base largest_min dLargest")
         for r in rows:
             L("   %-12s %3d %10d %8d %6d | %12d %11d %8d" % r)
-        L("   min_free пристрою=%d, мін. спостережений free=%d, largest=%d (пороги 20480 / 12288)" % (
-            min_free_dev, min_free_obs, min_larg_obs))
+        L("   мін. спостережений free=%d, largest=%d; min_free пристрою=%d (за весь час роботи, лише інформативно)" % (
+            min_free_obs, min_larg_obs, min_free_dev))
         L("underrun (decode, зразків %d): макс. %s; write_timeout макс. %s" % (
             len(self.under), max(self.under) if self.under else "н/д", max(self.wto) if self.wto else "н/д"))
         L("Стеки (мін. вільно, Б):  задача      база  найгірше  просідання")
         for r in stack_rows:
             L("   %-10s %8d %9d %10d" % r)
+        L("Пороги heap: free >= %d (sd, off), >= %d (bt з телефоном), >= %d (bt без телефону, usb); largest >= %d (усі стани)" % (
+            th["free_sd"], th["free_bt_phone"], th["free_other"], th["largest"]))
+        L("   витік (FAIL): free монотонно падає >= %d кроків поспіль і сумарно >= %d Б; INFO: одиничне просідання >= %d Б" % (
+            th["leak_steps"], th["leak_bytes"], th["info"]))
+        L("Пороги стеків: FAIL якщо мін. вільно < %d Б; INFO якщо просідання від бази > %d Б" % (
+            th["stack_min"], th["stack_tol"]))
         L("Мʼют: перевірок %d (з них «sd play ≥1,5 с» %d), пропущено %d, невідповідностей %d; waitUnmuted макс. %d" % (
             self.mute["checks"], self.mute["sticky"], self.mute["skip"], self.mute["fail"], self.waitun_max))
         L("ERR-гістограма: %s" % (", ".join("%s=%d" % kv for kv in sorted(errs.items())) or "порожня"))
@@ -629,6 +763,11 @@ class Stress:
             L("")
             L("FAIL:")
             for f in fails:
+                L("  - " + f)
+        if infos:
+            L("")
+            L("INFO (не впливає на результат):")
+            for f in infos:
                 L("  - " + f)
         L("")
         L("ПІДСУМОК: %s" % ("УСПІХ" if not fails else "ПРОВАЛ (%d)" % len(fails)))
@@ -693,19 +832,45 @@ def run_stress(args):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="M5c5: стрес SRC (UART1+UART0) і пачка в UART0 (--burst)")
+    ap = argparse.ArgumentParser(description="M5c5/M5c6b: стрес SRC (UART1+UART0) і пачка в UART0 (--burst); пороги heap — за станом джерела")
     ap.add_argument("--ctl", help="COM-порт USB-UART адаптера на UART1 модуля (921600)")
     ap.add_argument("--dbg", help="COM-порт штатного USB плати (UART0, 460800)")
-    ap.add_argument("--cycles", type=int, default=100)
+    ap.add_argument("--cycles", type=int, default=100,
+                    help="кількість циклів SRC (за замовч. 100; для довшого тренду — 300, контрольні точки кожні 10 циклів)")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--settle", type=float, default=15.0, help="таймаут очікування STATE≠scan після SRC, с")
     ap.add_argument("--no-usb", action="store_true", help="не вибирати SRC,usb")
     ap.add_argument("--no-bt", action="store_true", help="не вибирати SRC,bt")
     ap.add_argument("--warmup", type=int, default=2, help="проходів прогріву по всіх джерелах до базових точок")
     ap.add_argument("--dwell", type=float, default=1.0, help="макс. випадкова пауза після SRC, с")
-    ap.add_argument("--heap-drift", type=int, default=1024, help="допустимий дрейф free/largest вниз, Б")
-    ap.add_argument("--stack-tol", type=int, default=128, help="допустиме просідання запасу стека, Б")
-    ap.add_argument("--stack-min", type=int, default=512, help="абсолютний мінімум запасу стека, Б")
+    ap.add_argument("--free-min-sd", type=int, default=20480,
+                    help="FAIL-поріг heap free для src=sd і off, Б (за замовч. 20480 = 20 КБ)")
+    ap.add_argument("--free-min-bt", type=int, default=15360,
+                    help="FAIL-поріг heap free для src=bt З телефоном, Б (за замовч. 15360 = 15 КБ; норма ≈17,8 КБ)")
+    ap.add_argument("--free-min-other", type=int, default=15360,
+                    help="FAIL-поріг heap free для bt без телефону, usb і невідомого стану, Б (за замовч. 15360)")
+    ap.add_argument("--largest-min", type=int, default=12288,
+                    help="FAIL-поріг heap largest для всіх станів, Б (за замовч. 12288 = 12 КБ)")
+    ap.add_argument("--leak-steps", type=int, default=3,
+                    help="витік: скільки послідовних просідань free одного ключа (за замовч. 3)")
+    ap.add_argument("--leak-bytes", type=int, default=2048,
+                    help="витік: мінімальне сумарне падіння free за серію, Б (за замовч. 2048); FAIL лише при обох умовах")
+    ap.add_argument("--leak-step-min", type=int, default=64,
+                    help="витік: мінімальне падіння одного кроку, щоб рахуватись у серії, Б (за замовч. 64; відсікає шум)")
+    ap.add_argument("--leak-recover", type=int, default=1024,
+                    help="витік: серія не FAIL, якщо пізніше free повернувся до старту серії з допуском, Б (за замовч. 1024)")
+    ap.add_argument("--heap-drift", type=int, default=1024,
+                    help="INFO (не FAIL): друкувати одиничне просідання free між точками одного ключа від цього значення, Б")
+    ap.add_argument("--stack-tol", type=int, default=128,
+                    help="INFO (не FAIL): просідання запасу стека від прогрітої бази більше за це, Б")
+    ap.add_argument("--stack-min", type=int, default=1024,
+                    help="FAIL-поріг: мінімальний вільний запас будь-якої задачі, Б (за замовч. 1024)")
+    ap.add_argument("--cp-delay", dest="cp_delay", type=float, default=2.5,
+                    help="пауза перед DBG,heap у кожній контрольній точці, с (за замовч. 2.5; 0 — без паузи)")
+    ap.add_argument("--idle-tail", dest="idle_tail", type=float, default=0.0,
+                    help="діагностика: після прогону лишити SRC,off на N с і зняти ще одну точку heap (0 — вимкнено)")
+    ap.add_argument("--selftest", action="store_true",
+                    help="сухий прогін оцінки heap/стеків на синтетичних точках (без портів)")
     ap.add_argument("--no-final-sd", dest="final_sd", action="store_false", help="не робити фінальний sd-play із DBG,decode")
     ap.add_argument("--log", help="дублювати вивід у файл")
     ap.add_argument("--burst", type=int, metavar="N", help="режим частини B: N рядків DBG одним записом у UART0")
@@ -718,6 +883,8 @@ def main(argv=None):
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:  # noqa: BLE001
         pass
+    if args.selftest:
+        return run_selftest(args)
     if serial is None:
         print("Потрібен pyserial:  pip install pyserial")
         return 2
