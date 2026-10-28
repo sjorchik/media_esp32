@@ -104,13 +104,11 @@ inline constexpr uint32_t kCh376ConnectWaitMs = 3000; // очікування п
 inline constexpr uint32_t kCh376MountWaitMs = 1500;   // очікування DISK_MOUNT, НИЗЬКА
 inline constexpr uint8_t  kCh376JunkMax = 16;         // сміття перед очікуваною відповіддю, байтів; далі BadReply
 
-// Дільники SET_BAUDRATE: ГІПОТЕЗА, впевненість низька-середня. Звірити на залізі (DBG,usb,baud).
-// Команда 0x02 з двома байтами: перший kCh376BaudDivPrefix (0x03), другий K.
-// Швидкість = 6 000 000 / (256 − K). Поля структури: lo — перший байт (0x03), hi — K.
-//   1 000 000 ← K = 0xFA (точно); 460 800 ← 0xF3 (461 538, +0,2 %);
-//   230 400 ← 0xE6 (230 769, +0,2 %); 115 200 ← 0xCC (115 385, +0,2 %).
-// 921600 не вмикаємо: точного дільника немає. Порядок — від більшої швидкості до меншої.
-// Відкат на kCh376DefaultBaud (9600) обовʼязковий: negotiateBaud повертає порт і чіп на 9600 при невдачі.
+// Дільники SET_BAUDRATE: ГІПОТЕЗА, впевненість низька-середня, звірити на залізі (DBG,usb,baud / baudraw).
+// Команда 0x02 з двома байтами: перший kCh376BaudDivPrefix (0x03, змінна — звірити), другий K.
+// Швидкість = 6 000 000 / (256 − K). Поля: lo — перший байт, hi — K.
+// kCh376BaudTable — усі відомі K (відкат шукає чіп на цих швидкостях і на 9600).
+// kCh376NegotiateTable — порядок спроб negotiateBaud. 921600 не вмикаємо (немає точного дільника).
 inline constexpr uint8_t kCh376BaudDivPrefix = 0x03;
 struct Ch376BaudDiv {
   uint32_t baud;
@@ -118,13 +116,27 @@ struct Ch376BaudDiv {
   uint8_t hi;
 };
 inline constexpr Ch376BaudDiv kCh376BaudTable[] = {
+    {2000000, kCh376BaudDivPrefix, 0xFD},
+    {1500000, kCh376BaudDivPrefix, 0xFC},
     {1000000, kCh376BaudDivPrefix, 0xFA},
+    {750000, kCh376BaudDivPrefix, 0xF8},
+    {500000, kCh376BaudDivPrefix, 0xF4},
     {460800, kCh376BaudDivPrefix, 0xF3},
     {230400, kCh376BaudDivPrefix, 0xE6},
     {115200, kCh376BaudDivPrefix, 0xCC},
 };
 inline constexpr size_t kCh376BaudTableN = sizeof(kCh376BaudTable) / sizeof(kCh376BaudTable[0]);
-static_assert(kCh376BaudTableN >= 1, "таблиця швидкостей CH376S порожня");
+inline constexpr Ch376BaudDiv kCh376NegotiateTable[] = {
+    {1000000, kCh376BaudDivPrefix, 0xFA},
+    {750000, kCh376BaudDivPrefix, 0xF8},
+    {500000, kCh376BaudDivPrefix, 0xF4},
+    {460800, kCh376BaudDivPrefix, 0xF3},
+    {230400, kCh376BaudDivPrefix, 0xE6},
+    {115200, kCh376BaudDivPrefix, 0xCC},
+};
+inline constexpr size_t kCh376NegotiateN = sizeof(kCh376NegotiateTable) / sizeof(kCh376NegotiateTable[0]);
+static_assert(kCh376NegotiateN >= 1, "таблиця спроб CH376S порожня");
+inline constexpr uint32_t kCh376RawWinMs = 30;  // вікно прослуховування сирих байтів (DBG,usb,baudraw)
 static_assert(kCh376RxBuf >= 64 && kCh376RxBuf <= 2048, "kCh376RxBuf: 64..2048 Б");
 
 // ---- Аудіо ----

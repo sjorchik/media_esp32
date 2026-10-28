@@ -5,12 +5,13 @@
 #if ENABLE_USB_CH376
 
 #include <Arduino.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <strings.h>
 
+#include "pins.h"
 #include "usb/ch376.h"
 #include "usb/ch376_uart.h"
-#include "pins.h"
 #include "util/diag.h"
 #include "util/log.h"
 
@@ -29,36 +30,69 @@ bool toInt(const char* s, long& v, int base) {
   return *e == 0;
 }
 
+// Текст для логів: рівень INT, перший байт відповіді, сирі байти.
+void intText(int v, char* b, size_t cap) {
+  if (v < 0) snprintf(b, cap, "-");
+  else snprintf(b, cap, "%d", v);
+}
+void rxText(int rx, char* b, size_t cap) {
+  if (rx < 0) snprintf(b, cap, "--");
+  else snprintf(b, cap, "%02X", (unsigned)rx);
+}
+void hexText(const uint8_t* d, size_t n, char* b, size_t cap) {
+  if (n == 0) {
+    snprintf(b, cap, "-");
+    return;
+  }
+  size_t p = 0;
+  for (size_t i = 0; i < n && p + 4 < cap; i++) {
+    int w = snprintf(b + p, cap - p, i ? " %02X" : "%02X", (unsigned)d[i]);
+    if (w < 0) break;
+    p += (size_t)w;
+  }
+}
+
 void usbHelp() {
-  LOGI(TAG, "DBG,usb | DBG,usb,init | DBG,usb,reset | DBG,usb,ping,<N 1..50>");
-  LOGI(TAG, "DBG,usb,baud (список) | DBG,usb,baud,<бод>,<K hex>");
-  LOGI(TAG, "K hex 00..FF, бод 9600..1000000; формула 6000000/(256-K)");
+  LOGI(TAG, "DBG,usb | init | reset | ping,<N 1..50> | stop");
+  LOGI(TAG, "baud | baud,<бод>,<K hex> | baudraw,<C hex>,<K hex>[,<бод>]");
+  LOGI(TAG, "K hex 00..FF, швидкість 6000000/(256-K), C — перший байт (звичайно 03)");
 }
 
 // Стан драйвера без звернення до чіпа.
 void usbState() {
   Ch376& d = ch376_uart::driver();
+  char ib[8];
+  intText(ch376_uart::intLevel(), ib, sizeof ib);
   LOGI(TAG, "usb: запуск=%d швидкість=%u флешка=%d остання=%s подія=0x%02X", ch376_uart::started() ? 1 : 0,
        (unsigned)d.baud(), s_present ? 1 : 0, ch376ErrName(s_lastErr), (unsigned)d.lastEvent());
-  LOGI(TAG, "usb: RX=%u Б RST_PIN=%d INT_PIN=%d режим=%s", (unsigned)kCh376RxBuf, (int)CH_RST_PIN, (int)CH_INT_PIN,
-       kCh376IntPin ? "INT" : "опитування");
-  LOGI(TAG, "usb: версія чіпа не читається (GET_IC_VER не реалізовано)");
+  LOGI(TAG, "usb: RX=%u Б RST_PIN=%d INT_PIN=%d INT=%s режим=%s", (unsigned)kCh376RxBuf, (int)CH_RST_PIN,
+       (int)CH_INT_PIN, ib, kCh376IntPin ? "INT" : "опитування");
+  LOGI(TAG, "usb: втрачено=%d відкат_на=%u", d.chipLost() ? 1 : 0, (unsigned)d.recoveredAt());
 }
 
-// Рядок кроку init: номер, назва, результат, тривалість у мкс (≤ ~70 Б).
+// Рядок кроку init (без INT).
 void usbStep(int n, const char* name, Ch376Err e, uint32_t t0) {
   s_lastErr = e;
   LOGI(TAG, "init %d %s: %s, %u мкс", n, name, ch376ErrName(e), (unsigned)(micros() - t0));
 }
 
+// Рядок кроку init з рівнем INT до і після кроку.
+void usbStepI(int n, const char* name, Ch376Err e, uint32_t t0, int i0, int i1) {
+  s_lastErr = e;
+  char a[8], b[8];
+  intText(i0, a, sizeof a);
+  intText(i1, b, sizeof b);
+  LOGI(TAG, "init %d %s: %s, %u мкс, INT %s>%s", n, name, ch376ErrName(e), (unsigned)(micros() - t0), a, b);
+}
+
 // Повна послідовність: скид → CHECK_EXIST → режим host → підключення (≤3 с) → DISK_CONNECT → DISK_MOUNT.
-// DISK_CONNECT додано понад план: DISK_MOUNT без нього, за типовою схемою CH376, не працює (середня впевненість).
 void usbInit() {
   ch376_uart::begin();
   Ch376& d = ch376_uart::driver();
   s_present = false;
+  Ch376Err e = Ch376Err::Ok;
   uint32_t t0 = micros();
-  Ch376Err e = d.reset();
+  e = d.reset();
   usbStep(1, "reset", e, t0);
   if (e == Ch376Err::Ok) {
     t0 = micros();
@@ -72,8 +106,9 @@ void usbInit() {
   }
   if (e == Ch376Err::Ok) {
     t0 = micros();
+    const int i0 = ch376_uart::intLevel();
     e = d.waitConnect(kCh376ConnectWaitMs);
-    usbStep(4, "connect", e, t0);
+    usbStepI(4, "connect", e, t0, i0, ch376_uart::intLevel());
   }
   if (e == Ch376Err::Ok) {
     t0 = micros();
@@ -82,8 +117,9 @@ void usbInit() {
   }
   if (e == Ch376Err::Ok) {
     t0 = micros();
+    const int i0 = ch376_uart::intLevel();
     e = d.diskMount();
-    usbStep(6, "mount", e, t0);
+    usbStepI(6, "mount", e, t0, i0, ch376_uart::intLevel());
     s_present = (e == Ch376Err::Ok);
   }
   LOGI(TAG, "init: %s", e == Ch376Err::Ok ? "готово" : "зупинено на помилці");
@@ -100,7 +136,7 @@ void resetCmd() {
   LOGI(TAG, "reset: %s, порт %u Бод, %u мкс", ch376ErrName(e), (unsigned)d.baud(), (unsigned)(micros() - t0));
 }
 
-// Оцінка затримки командного обміну: N разів CHECK_EXIST, середнє і максимум успішних.
+// Затримка командного обміну: N × CHECK_EXIST, середнє і максимум успішних.
 void usbPing(long n) {
   ch376_uart::begin();
   Ch376& d = ch376_uart::driver();
@@ -122,8 +158,17 @@ void usbPing(long n) {
   if (ok < n) LOGI(TAG, "ping: остання помилка %s", ch376ErrName(s_lastErr));
 }
 
-// Перебір таблиці kCh376BaudTable після скиду. Кожна спроба — рядок лога з K.
-void baudAll() {
+// Підсумок відкату: або втрата чіпа (помітне попередження), або на якій швидкості знайдено.
+void usbRecovery(const Ch376& d) {
+  if (d.chipLost()) {
+    LOGW(TAG, "ЧІП ВТРАЧЕНО: вимкни живлення модуля (порт 9600)");
+    return;
+  }
+  if (d.recoveredAt()) LOGI(TAG, "відкат: чіп знайдено на %u, повернуто на 9600", (unsigned)d.recoveredAt());
+}
+
+// Перебір таблиці kCh376NegotiateTable після скиду; у кожній спробі — сирий перший байт відповіді.
+void usbBaudAll() {
   ch376_uart::begin();
   Ch376& d = ch376_uart::driver();
   Ch376Err e = d.reset();
@@ -132,31 +177,83 @@ void baudAll() {
     LOGI(TAG, "baud: скид не вдався (%s)", ch376ErrName(e));
     return;
   }
-  Ch376Attempt att[kCh376BaudTableN];
+  Ch376Attempt att[kCh376NegotiateN];
   size_t nAtt = 0;
-  e = d.negotiateBaud(kCh376BaudTable, kCh376BaudTableN, att, kCh376BaudTableN, nAtt);
-  for (size_t i = 0; i < nAtt && i < kCh376BaudTableN; i++) {
-    LOGI(TAG, "baud %u K=%02X: %s", (unsigned)att[i].baud, (unsigned)kCh376BaudTable[i].hi, ch376ErrName(att[i].res));
+  e = d.negotiateBaud(kCh376NegotiateTable, kCh376NegotiateN, att, kCh376NegotiateN, nAtt);
+  for (size_t i = 0; i < nAtt && i < kCh376NegotiateN; i++) {
+    char rb[8];
+    rxText(att[i].rx, rb, sizeof rb);
+    LOGI(TAG, "baud %u K=%02X: %s, rx=%s", (unsigned)att[i].baud, (unsigned)kCh376NegotiateTable[i].hi,
+         ch376ErrName(att[i].res), rb);
   }
+  usbRecovery(d);
   s_lastErr = e;
   LOGI(TAG, "baud: итог %u Бод (%s), спроб %u", (unsigned)d.baud(), ch376ErrName(e), (unsigned)nAtt);
 }
 
-// Одна явна пара (бод, K) для підбору дільника на залізі. Той самий шлях negotiateBaud з одним елементом.
-void baudOne(uint32_t bod, uint8_t k) {
+// Одна спроба з явною парою (бод, K): reset → спроба → відкат, з сирим байтом.
+void usbBaudOne(uint32_t bod, uint8_t k) {
   ch376_uart::begin();
   Ch376& d = ch376_uart::driver();
   Ch376Err e = d.reset();
-  Ch376Err res = e;  // результат самої спроби (без відкату); для reset — його результат
+  int rx = -1;
+  Ch376Err res = e;
   if (e == Ch376Err::Ok) {
     Ch376BaudDiv t{bod, kCh376BaudDivPrefix, k};
     Ch376Attempt att[1];
     size_t n = 0;
     e = d.negotiateBaud(&t, 1, att, 1, n);
     res = att[0].res;
+    rx = att[0].rx;
   }
   s_lastErr = res;
-  LOGI(TAG, "baud1 %u K=%02X: %s, порт %u Бод", (unsigned)bod, (unsigned)k, ch376ErrName(res), (unsigned)d.baud());
+  char rb[8];
+  rxText(rx, rb, sizeof rb);
+  LOGI(TAG, "baud1 %u K=%02X: %s, rx=%s, порт %u Бод", (unsigned)bod, (unsigned)k, ch376ErrName(res), rb,
+       (unsigned)d.baud());
+  usbRecovery(d);
+}
+
+// Сирий обмін для з'ясування, що відповідає чіп на SET_BAUDRATE.
+// A — відповідь на поточній швидкості (9600); B — після перемикання порту на newBod.
+// Після кожної спроби — програмний відкат.
+void usbBaudRaw(uint8_t c, uint8_t k, uint32_t newBod) {
+  ch376_uart::begin();
+  Ch376& d = ch376_uart::driver();
+  const uint32_t tried = newBod ? newBod : 6000000u / (256u - k);
+  if (d.portTo(kCh376DefaultBaud) != Ch376Err::Ok) {
+    LOGW(TAG, "baudraw: порт не прийняв 9600");
+    return;
+  }
+  const uint8_t args[2] = {c, k};
+  uint8_t buf[16];
+  size_t n = 0;
+  char hb[64];
+  if (newBod == 0) {
+    n = d.rawExchange(kCh376CmdSetBaud, args, 2, kCh376RawWinMs, buf, sizeof buf);
+    hexText(buf, n < sizeof buf ? n : sizeof buf, hb, sizeof hb);
+    LOGI(TAG, "raw A 02 %02X %02X на 9600: %u байт, %s", (unsigned)c, (unsigned)k, (unsigned)n, hb);
+  } else {
+    n = d.rawSwitchExchange(kCh376CmdSetBaud, args, 2, newBod, kCh376RawWinMs, buf, sizeof buf);
+    hexText(buf, n < sizeof buf ? n : sizeof buf, hb, sizeof hb);
+    LOGI(TAG, "raw B 02 %02X %02X, порт %u: %u байт, %s", (unsigned)c, (unsigned)k, (unsigned)newBod, (unsigned)n,
+         hb);
+  }
+  d.rollback(tried);
+  if (d.chipLost() || d.recoveredAt()) {
+    usbRecovery(d);
+  } else {
+    LOGI(TAG, "відкат: чіп на 9600");
+  }
+  s_lastErr = d.chipLost() ? Ch376Err::BaudFail : Ch376Err::Ok;
+}
+
+// Зупинка драйвера: закрити Serial2 (звільнити RX-буфер) і показати heap.
+void usbStop() {
+  ch376_uart::stop();
+  s_present = false;
+  Diag::logHeap("usb-stop");
+  LOGI(TAG, "stop: драйвер зупинено, порт закрито");
 }
 
 }  // namespace
@@ -179,14 +276,24 @@ void Ch376Diag::handle(const proto::Msg& m) {
     }
     usbPing(n);
   } else if (!strcasecmp(s, "baud") && m.argc == 2) {
-    baudAll();
+    usbBaudAll();
   } else if (!strcasecmp(s, "baud") && m.argc == 4) {
     long bod = 0, k = 0;
-    if (!toInt(m.args[2], bod, 10) || bod < 9600 || bod > 1000000 || !toInt(m.args[3], k, 16) || k < 0 || k > 255) {
-      LOGW(TAG, "DBG,usb,baud,<9600..1000000>,<K hex 00..FF>");
+    if (!toInt(m.args[2], bod, 10) || bod < 9600 || bod > 2000000 || !toInt(m.args[3], k, 16) || k < 0 || k > 255) {
+      LOGW(TAG, "DBG,usb,baud,<9600..2000000>,<K hex 00..FF>");
       return;
     }
-    baudOne((uint32_t)bod, (uint8_t)k);
+    usbBaudOne((uint32_t)bod, (uint8_t)k);
+  } else if (!strcasecmp(s, "baudraw") && (m.argc == 4 || m.argc == 5)) {
+    long c = 0, k = 0, nb = 0;
+    if (!toInt(m.args[2], c, 16) || c < 0 || c > 255 || !toInt(m.args[3], k, 16) || k < 0 || k > 255 ||
+        (m.argc == 5 && (!toInt(m.args[4], nb, 10) || nb < 9600 || nb > 2000000))) {
+      LOGW(TAG, "DBG,usb,baudraw,<C hex>,<K hex>[,<бод 9600..2000000>]");
+      return;
+    }
+    usbBaudRaw((uint8_t)c, (uint8_t)k, (uint32_t)nb);
+  } else if (!strcasecmp(s, "stop") && m.argc == 2) {
+    usbStop();
   } else {
     usbHelp();
   }

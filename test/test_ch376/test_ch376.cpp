@@ -27,6 +27,8 @@ struct Faults {
   bool dieAfterBaud = false;   // після SET_BAUDRATE з перемиканням чіп мовчить до апаратного скиду
   int vanishAt = -1;           // номер команди (з 1), після якої пристрій зникає назавжди
   bool rstPresent = true;      // чи є RST (hwReset)
+  bool replyOnOldBaud = true;  // false: відповідь на SET_BAUDRATE приходить лише після перемикання порту
+  uint32_t forceBaud = 0;      // >0: після будь-якого SET_BAUDRATE чіп стає на цій швидкості
 };
 
 class MockLink : public Ch376Link {
@@ -55,6 +57,7 @@ class MockLink : public Ch376Link {
   bool abortFlag = false;
   Faults f;
   std::vector<uint8_t> rx;
+  bool pendingSet = false;
 
   void write(const uint8_t* d, size_t n) override {
     frames.emplace_back(d, d + n);
@@ -79,18 +82,20 @@ class MockLink : public Ch376Link {
       case 0x15:  // SET_USB_MODE
         replyFiltered(f.badMode ? 0x5F : 0x51);
         break;
-      case 0x02: {  // SET_BAUDRATE: відповідь ще на старій швидкості
-        replyFiltered(0x51);
+      case 0x02: {  // SET_BAUDRATE
+        if (f.replyOnOldBaud) replyFiltered(0x51);
+        else pendingSet = true;
         if (d[3] == 0x03) {
           const uint32_t b = 6000000u / (256u - d[4]);
-          for (uint32_t s : supported) {
-            if (sameBaud(s, b)) {
+          for (uint32_t s2 : supported) {
+            if (sameBaud(s2, b)) {
               chipBaud = b;
               break;
             }
           }
-          if (f.dieAfterBaud && chipBaud != 9600) dead = true;
         }
+        if (f.forceBaud) chipBaud = f.forceBaud;
+        if (f.dieAfterBaud && chipBaud != 9600) dead = true;
         break;
       }
       case 0x22:  // GET_STATUS: повертає першу видиму подію і стирає її
@@ -108,6 +113,10 @@ class MockLink : public Ch376Link {
   }
 
   bool readByte(uint8_t& b, uint32_t tmoMs) override {
+    if (pendingSet && sameBaud(portBaud, chipBaud)) {  // відповідь приходить на новій швидкості
+      pendingSet = false;
+      replyFiltered(0x51);
+    }
     if (!rx.empty()) {
       b = rx.front();
       rx.erase(rx.begin());
@@ -389,9 +398,9 @@ void test_negotiate_reaches_1000000() {
   allSupported(L);
   Ch376 d(L);
   TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)d.reset());
-  Ch376Attempt att[kCh376BaudTableN];
+  Ch376Attempt att[kCh376NegotiateN];
   size_t n = 0;
-  TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)d.negotiateBaud(kCh376BaudTable, kCh376BaudTableN, att, kCh376BaudTableN, n));
+  TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)d.negotiateBaud(kCh376NegotiateTable, kCh376NegotiateN, att, kCh376NegotiateN, n));
   TEST_ASSERT_EQUAL_UINT32(1, n);
   TEST_ASSERT_EQUAL_UINT32(1000000, d.baud());
   TEST_ASSERT_EQUAL_UINT32(1000000, L.portBaud);
@@ -403,26 +412,28 @@ void test_negotiate_fallback_to_230400() {
   L.supported = {230400, 115200};
   Ch376 d(L);
   TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)d.reset());
-  Ch376Attempt att[kCh376BaudTableN];
+  Ch376Attempt att[kCh376NegotiateN];
   size_t n = 0;
-  TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)d.negotiateBaud(kCh376BaudTable, kCh376BaudTableN, att, kCh376BaudTableN, n));
-  TEST_ASSERT_EQUAL_UINT32(3, n);
+  TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)d.negotiateBaud(kCh376NegotiateTable, kCh376NegotiateN, att, kCh376NegotiateN, n));
+  TEST_ASSERT_EQUAL_UINT32(5, n);
   TEST_ASSERT_EQUAL_UINT32(1000000, att[0].baud);
-  TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)att[2].res);
+  TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)att[4].res);
   TEST_ASSERT_EQUAL_UINT32(230400, d.baud());
   TEST_ASSERT_EQUAL_UINT32(230400, L.portBaud);
 }
 
 void test_negotiate_chip_silent_stays_9600() {
+  // Чіп мовчить: після першої невдалої спроби відкат не знаходить його — перебір зупиняється.
   MockLink L;
   allSupported(L);
   L.f.silent = true;
   Ch376 d(L);
-  TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)d.reset());  // reset не потребує відповіді
-  Ch376Attempt att[kCh376BaudTableN];
+  TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)d.reset());
+  Ch376Attempt att[kCh376NegotiateN];
   size_t n = 0;
-  TEST_ASSERT_EQUAL_INT((int)Ch376Err::BaudFail, (int)d.negotiateBaud(kCh376BaudTable, kCh376BaudTableN, att, kCh376BaudTableN, n));
-  TEST_ASSERT_EQUAL_UINT32(kCh376BaudTableN, n);
+  TEST_ASSERT_EQUAL_INT((int)Ch376Err::BaudFail, (int)d.negotiateBaud(kCh376NegotiateTable, kCh376NegotiateN, att, kCh376NegotiateN, n));
+  TEST_ASSERT_EQUAL_UINT32(1, n);
+  TEST_ASSERT_TRUE(d.chipLost());
   TEST_ASSERT_EQUAL_UINT32(9600, d.baud());
   TEST_ASSERT_EQUAL_UINT32(9600, L.portBaud);
 }
@@ -432,10 +443,10 @@ void test_negotiate_no_supported_stays_9600() {
   MockLink L;
   Ch376 d(L);
   TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)d.reset());
-  Ch376Attempt att[kCh376BaudTableN];
+  Ch376Attempt att[kCh376NegotiateN];
   size_t n = 0;
-  TEST_ASSERT_EQUAL_INT((int)Ch376Err::BaudFail, (int)d.negotiateBaud(kCh376BaudTable, kCh376BaudTableN, att, kCh376BaudTableN, n));
-  TEST_ASSERT_EQUAL_UINT32(kCh376BaudTableN, n);
+  TEST_ASSERT_EQUAL_INT((int)Ch376Err::BaudFail, (int)d.negotiateBaud(kCh376NegotiateTable, kCh376NegotiateN, att, kCh376NegotiateN, n));
+  TEST_ASSERT_EQUAL_UINT32(kCh376NegotiateN, n);
   TEST_ASSERT_EQUAL_UINT32(9600, d.baud());
   TEST_ASSERT_EQUAL_UINT32(9600, L.portBaud);
   TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)d.checkExist());  // після відкату працює
@@ -454,7 +465,7 @@ void test_negotiate_bad_args() {
 // ---------------------------------------------------------------- відкат
 
 void test_rollback_hw_reset() {
-  // Чіп перемкнувся на 1 000 000 і вийшов із ладу: відкат доходить до апаратного скиду.
+  // Чіп перемкнувся на 1 000 000 і вийшов із ладу. RST у платі немає: програмний відкат його не знаходить.
   MockLink L;
   L.supported = {1000000};
   L.f.dieAfterBaud = true;
@@ -464,10 +475,10 @@ void test_rollback_hw_reset() {
   Ch376Attempt att[1];
   size_t n = 0;
   TEST_ASSERT_EQUAL_INT((int)Ch376Err::BaudFail, (int)d.negotiateBaud(one, 1, att, 1, n));
-  TEST_ASSERT_EQUAL_INT(1, L.hwResets);
+  TEST_ASSERT_TRUE(d.chipLost());
+  TEST_ASSERT_EQUAL_INT(0, L.hwResets);
   TEST_ASSERT_EQUAL_UINT32(9600, d.baud());
   TEST_ASSERT_EQUAL_UINT32(9600, L.portBaud);
-  TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)d.checkExist());
 }
 
 void test_rollback_no_rst_gives_baudfail() {
@@ -495,9 +506,9 @@ void test_negotiate_with_junk_still_works() {
   L.f.junkBefore = 3;
   Ch376 d(L);
   TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)d.reset());
-  Ch376Attempt att[kCh376BaudTableN];
+  Ch376Attempt att[kCh376NegotiateN];
   size_t n = 0;
-  TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)d.negotiateBaud(kCh376BaudTable, kCh376BaudTableN, att, kCh376BaudTableN, n));
+  TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)d.negotiateBaud(kCh376NegotiateTable, kCh376NegotiateN, att, kCh376NegotiateN, n));
   TEST_ASSERT_EQUAL_UINT32(1000000, d.baud());
 }
 
@@ -524,6 +535,106 @@ void test_err_names() {
   }
   TEST_ASSERT_EQUAL_STRING("ok", ch376ErrName(Ch376Err::Ok));
   TEST_ASSERT_EQUAL_STRING("baudfail", ch376ErrName(Ch376Err::BaudFail));
+}
+
+
+// ---------------------------------------------------------------- M4a2: сирі байти, програмний відкат
+
+void test_raw_mode_a_reply_bytes() {
+  MockLink L;
+  L.supported = {115200};
+  Ch376 d(L);
+  TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)d.portTo(9600));
+  const uint8_t args[2] = {0x03, 0xCC};
+  uint8_t buf[16] = {0};
+  size_t n = d.rawExchange(kCh376CmdSetBaud, args, 2, kCh376RawWinMs, buf, sizeof buf);
+  TEST_ASSERT_EQUAL_UINT32(1, n);
+  TEST_ASSERT_EQUAL_INT(0x51, buf[0]);
+}
+
+void test_raw_mode_a_silent_gives_zero_bytes() {
+  MockLink L;
+  L.f.silent = true;
+  Ch376 d(L);
+  const uint8_t args[2] = {0x03, 0xCC};
+  uint8_t buf[16] = {0};
+  TEST_ASSERT_EQUAL_UINT32(0, d.rawExchange(kCh376CmdSetBaud, args, 2, kCh376RawWinMs, buf, sizeof buf));
+}
+
+void test_raw_mode_b_reply_after_switch() {
+  // Відповідь з'являється лише на новій швидкості: режим B після перемикання порту її ловить.
+  MockLink L;
+  L.supported = {115200};
+  L.f.replyOnOldBaud = false;
+  Ch376 d(L);
+  const uint8_t args[2] = {0x03, 0xCC};
+  uint8_t buf[16] = {0};
+  size_t n = d.rawSwitchExchange(kCh376CmdSetBaud, args, 2, 115200, kCh376RawWinMs, buf, sizeof buf);
+  TEST_ASSERT_EQUAL_UINT32(1, n);
+  TEST_ASSERT_EQUAL_INT(0x51, buf[0]);
+}
+
+void test_raw_mode_b_no_switch_no_reply() {
+  // Чіп не перемкнувся: після переходу порту на 115200 відповіді нема.
+  MockLink L;
+  L.f.replyOnOldBaud = false;
+  Ch376 d(L);
+  const uint8_t args[2] = {0x03, 0xCC};
+  uint8_t buf[16] = {0};
+  TEST_ASSERT_EQUAL_UINT32(0, d.rawSwitchExchange(kCh376CmdSetBaud, args, 2, 115200, kCh376RawWinMs, buf, sizeof buf));
+}
+
+void test_attempt_records_raw_reply() {
+  MockLink L;
+  L.supported = {1000000};
+  Ch376 d(L);
+  TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)d.reset());
+  const Ch376BaudDiv one[1] = {{1000000, 0x03, 0xFA}};
+  Ch376Attempt att[1];
+  size_t n = 0;
+  TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)d.negotiateBaud(one, 1, att, 1, n));
+  TEST_ASSERT_EQUAL_INT(0x51, att[0].rx);
+}
+
+void test_recover_finds_chip_elsewhere() {
+  // Чіп став на 460 800, хоча спроба була 1 000 000: відкат знаходить його, скидає і повертає на 9600.
+  MockLink L;
+  L.f.forceBaud = 460800;
+  Ch376 d(L);
+  TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)d.reset());
+  const Ch376BaudDiv one[1] = {{1000000, 0x03, 0xFA}};
+  Ch376Attempt att[1];
+  size_t n = 0;
+  TEST_ASSERT_EQUAL_INT((int)Ch376Err::BaudFail, (int)d.negotiateBaud(one, 1, att, 1, n));
+  TEST_ASSERT_EQUAL_UINT32(460800, d.recoveredAt());
+  TEST_ASSERT_FALSE(d.chipLost());
+  TEST_ASSERT_EQUAL_UINT32(9600, L.chipBaud);
+  TEST_ASSERT_EQUAL_UINT32(9600, L.portBaud);
+  TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)d.checkExist());
+}
+
+void test_recover_lost_on_unknown_speed() {
+  // Чіп на швидкості поза таблицею: відкат нічого не знаходить, стан «втрачено», порт на 9600.
+  MockLink L;
+  L.f.forceBaud = 250000;
+  Ch376 d(L);
+  TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)d.reset());
+  const Ch376BaudDiv one[1] = {{1000000, 0x03, 0xFA}};
+  Ch376Attempt att[1];
+  size_t n = 0;
+  TEST_ASSERT_EQUAL_INT((int)Ch376Err::BaudFail, (int)d.negotiateBaud(one, 1, att, 1, n));
+  TEST_ASSERT_TRUE(d.chipLost());
+  TEST_ASSERT_EQUAL_UINT32(0, d.recoveredAt());
+  TEST_ASSERT_EQUAL_UINT32(9600, L.portBaud);
+}
+
+void test_rollback_on_clean_chip() {
+  MockLink L;
+  Ch376 d(L);
+  TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)d.reset());
+  TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)d.rollback(1000000));
+  TEST_ASSERT_FALSE(d.chipLost());
+  TEST_ASSERT_EQUAL_UINT32(0, d.recoveredAt());
 }
 
 int main(int, char**) {
@@ -562,6 +673,14 @@ int main(int, char**) {
   RUN_TEST(test_rollback_no_rst_gives_baudfail);
   RUN_TEST(test_negotiate_with_junk_still_works);
   RUN_TEST(test_reset_twice_after_switch_returns_9600);
+  RUN_TEST(test_raw_mode_a_reply_bytes);
+  RUN_TEST(test_raw_mode_a_silent_gives_zero_bytes);
+  RUN_TEST(test_raw_mode_b_reply_after_switch);
+  RUN_TEST(test_raw_mode_b_no_switch_no_reply);
+  RUN_TEST(test_attempt_records_raw_reply);
+  RUN_TEST(test_recover_finds_chip_elsewhere);
+  RUN_TEST(test_recover_lost_on_unknown_speed);
+  RUN_TEST(test_rollback_on_clean_chip);
   RUN_TEST(test_err_names);
   return UNITY_END();
 }

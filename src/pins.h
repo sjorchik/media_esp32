@@ -15,7 +15,7 @@ inline constexpr int SD_CD_PIN   = 21;    // -1 якщо нема card-detect
 inline constexpr int PIN_CH_RX  = 16;     // ← TXD CH376S (через дільник 5В→3,3В)
 inline constexpr int PIN_CH_TX  = 17;     // → RXD CH376S
 inline constexpr int CH_INT_PIN = 4;      // -1 якщо нема
-inline constexpr int CH_RST_PIN = 13;     // -1 якщо нема
+inline constexpr int CH_RST_PIN = -1;     // -1 якщо нема
 
 inline constexpr int PIN_LINK_RX = 32;    // ← TX S3 (GPIO42)
 inline constexpr int PIN_LINK_TX = 33;    // → RX S3 (GPIO48)

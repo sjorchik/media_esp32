@@ -1,6 +1,6 @@
 #include "config.h"
 
-#if ENABLE_USB_CH376  // типова збірка ESP32 компілює src/ цілком: без прапорця код не потрапляє в бінарник
+#if ENABLE_USB_CH376
 
 #include "usb/ch376.h"
 
@@ -33,14 +33,16 @@ Ch376Err Ch376::sendCmd(uint8_t cmd, const uint8_t* args, size_t na) {
 }
 
 // Чекає одного з байтів ok[0..nok). Сміття пропускає; ліміт kCh376JunkMax.
-// Нічого не прийшло → NoReply; прийшло лише сміття → BadReply.
+// Перший прочитаний байт запамʼятовує в firstRx_ (для сирого друку).
 Ch376Err Ch376::readReply(const uint8_t* ok, size_t nok, uint32_t tmoMs, uint8_t& out) {
   size_t junk = 0;
   bool any = false;
+  firstRx_ = -1;
   for (;;) {
     if (link_.abortRequested()) return Ch376Err::Aborted;
     uint8_t b = 0;
     if (!link_.readByte(b, tmoMs)) return any ? Ch376Err::BadReply : Ch376Err::NoReply;
+    if (!any) firstRx_ = b;
     any = true;
     for (size_t i = 0; i < nok; i++) {
       if (b == ok[i]) {
@@ -65,7 +67,7 @@ Ch376Err Ch376::checkExist() {
   const uint8_t x = kCh376CheckByte;
   Ch376Err e = sendCmd(kCh376CmdCheckExist, &x, 1);
   if (e != Ch376Err::Ok) return e;
-  const uint8_t want = (uint8_t)(x ^ kCh376CheckXor);  // інверсія байта
+  const uint8_t want = (uint8_t)(x ^ kCh376CheckXor);
   uint8_t r = 0;
   return readReply(&want, 1, kCh376ReplyMs, r);
 }
@@ -92,8 +94,7 @@ Ch376Err Ch376::getStatus(uint8_t& st) {
   return Ch376Err::Ok;
 }
 
-// Опитування статусу (або INT, якщо увімкнено). Відсутність події до тайм-ауту → Timeout.
-// NoReply від GET_STATUS вважаємо «подій ще немає» і опитуємо далі.
+// Опитування статусу (або INT, якщо увімкнено). NoReply від GET_STATUS — «події ще немає».
 Ch376Err Ch376::waitEvent(uint8_t& ev, uint32_t tmoMs) {
   const uint32_t t0 = link_.nowUs();
   const uint32_t limitUs = tmoMs * 1000u;
@@ -145,57 +146,119 @@ Ch376Err Ch376::diskMount() {
   return Ch376Err::BadFs;
 }
 
-// SET_BAUDRATE: команда і відповідь іще на старій швидкості; потім перемикаємо порт.
+// SET_BAUDRATE: кадр іде на поточній швидкості. Відповідь НЕ вимагається: чіп може переключитись,
+// а відповідь прийти на старій швидкості або не прийти взагалі. Успіх визначає CHECK_EXIST на новій
+// швидкості. Перший байт відповіді (якщо прийшов протягом kCh376ReplyMs) зберігаємо для діагностики.
 Ch376Err Ch376::setChipBaud(uint8_t lo, uint8_t hi) {
   const uint8_t a[2] = {lo, hi};
   Ch376Err e = sendCmd(kCh376CmdSetBaud, a, 2);
   if (e != Ch376Err::Ok) return e;
-  const uint8_t ok = kCh376RetSuccess;
-  uint8_t r = 0;
-  return readReply(&ok, 1, kCh376ReplyMs, r);
+  uint8_t b = 0;
+  setRx_ = link_.readByte(b, kCh376ReplyMs) ? (int)b : -1;
+  return Ch376Err::Ok;
 }
 
-// Відкат після невдалої спроби на швидкості toBaud. Кожен наступний крок застосовується,
-// лише якщо попередній не повернув звʼязок. Після відкату порт завжди на kCh376DefaultBaud.
-//  а) чіп не перемкнувся: порт назад на 9600, перевірка;
-//  б) чіп перемкнувся: порт на його швидкість, програмний скид (він повертає 9600), перевірка;
-//  в) є RST: апаратний скид, порт на 9600, перевірка;
-//  г) нічого не допомогло: порт на 9600, стан невідомий (чіп може не відповідати).
-void Ch376::rollbackTo(uint32_t toBaud) {
-  link_.setBaud(kCh376DefaultBaud);
-  if (checkExist() == Ch376Err::Ok) {
-    baud_ = kCh376DefaultBaud;
-    return;
+Ch376Err Ch376::portTo(uint32_t baud) {
+  if (!link_.setBaud(baud)) return Ch376Err::BaudFail;
+  baud_ = baud;
+  return Ch376Err::Ok;
+}
+
+// Прослуховування: читає всі байти за windowMs; повертає загальну кількість, у out — до cap.
+size_t Ch376::listen(uint32_t windowMs, uint8_t* out, size_t cap) {
+  size_t n = 0;
+  const uint32_t t0 = link_.nowUs();
+  const uint32_t lim = windowMs * 1000u;
+  while ((uint32_t)(link_.nowUs() - t0) < lim) {
+    uint8_t b = 0;
+    if (link_.readByte(b, 1)) {
+      if (out && n < cap) out[n] = b;
+      n++;
+    }
   }
-  link_.setBaud(toBaud);
-  if (reset() == Ch376Err::Ok && checkExist() == Ch376Err::Ok) return;  // reset() сам ставить 9600
-  if (link_.hwReset()) {
-    link_.delayMs(kCh376ResetWaitMs);
+  return n;
+}
+
+size_t Ch376::rawExchange(uint8_t cmd, const uint8_t* args, size_t na, uint32_t windowMs, uint8_t* out, size_t cap) {
+  if (sendCmd(cmd, args, na) != Ch376Err::Ok) return 0;
+  return listen(windowMs, out, cap);
+}
+
+size_t Ch376::rawSwitchExchange(uint8_t cmd, const uint8_t* args, size_t na, uint32_t newBaud, uint32_t windowMs,
+                                uint8_t* out, size_t cap) {
+  if (sendCmd(cmd, args, na) != Ch376Err::Ok) return 0;
+  if (portTo(newBaud) != Ch376Err::Ok) return 0;
+  return listen(windowMs, out, cap);
+}
+
+// Програмний відкат. Порядок пошуку: 9600, tried, далі відомі швидкості з kCh376BaudTable.
+// Знайдено на 9600 — нічого не робимо. Знайдено на іншій швидкості — порт туди, RESET_ALL,
+// порт на 9600 і CHECK_EXIST. Ніде — lost_ = true, порт на 9600 (RST у платі відсутній).
+Ch376Err Ch376::recover(uint32_t tried) {
+  uint32_t order[2 + kCh376BaudTableN];
+  size_t no = 0;
+  order[no++] = kCh376DefaultBaud;
+  if (tried != kCh376DefaultBaud) order[no++] = tried;
+  for (size_t i = 0; i < kCh376BaudTableN; i++) {
+    const uint32_t b = kCh376BaudTable[i].baud;
+    if (b != kCh376DefaultBaud && b != tried) order[no++] = b;
+  }
+  uint32_t found = 0;
+  for (size_t i = 0; i < no && found == 0; i++) {
+    if (!link_.setBaud(order[i])) continue;
+    baud_ = order[i];
+    if (checkExist() == Ch376Err::Ok) found = order[i];
+  }
+  if (found == 0) {
     link_.setBaud(kCh376DefaultBaud);
-    link_.flushRx();
     baud_ = kCh376DefaultBaud;
-    if (checkExist() == Ch376Err::Ok) return;
+    link_.flushRx();
+    lost_ = true;
+    return Ch376Err::BaudFail;
   }
-  link_.setBaud(kCh376DefaultBaud);
-  link_.flushRx();
-  baud_ = kCh376DefaultBaud;
+  if (found != kCh376DefaultBaud) {
+    link_.setBaud(found);
+    baud_ = found;
+    sendCmd(kCh376CmdReset, nullptr, 0);
+    link_.delayMs(kCh376ResetWaitMs);
+    if (!link_.setBaud(kCh376DefaultBaud)) {
+      lost_ = true;
+      return Ch376Err::BaudFail;
+    }
+    baud_ = kCh376DefaultBaud;
+    link_.flushRx();
+    if (checkExist() != Ch376Err::Ok) {
+      lost_ = true;
+      return Ch376Err::BaudFail;
+    }
+    recAt_ = found;
+  }
+  return Ch376Err::Ok;
+}
+
+Ch376Err Ch376::rollback(uint32_t tried) {
+  lost_ = false;
+  recAt_ = 0;
+  return recover(tried);
 }
 
 Ch376Err Ch376::negotiateBaud(const Ch376BaudDiv* table, size_t n, Ch376Attempt* att, size_t maxAtt, size_t& nAtt) {
   nAtt = 0;
+  lost_ = false;
+  recAt_ = 0;
   if (!table || n == 0) return Ch376Err::BadArg;
   for (size_t i = 0; i < n; i++) {
     const Ch376BaudDiv& t = table[i];
     Ch376Err r = setChipBaud(t.lo, t.hi);
     if (r == Ch376Err::Ok && !link_.setBaud(t.baud)) r = Ch376Err::BaudFail;
     if (r == Ch376Err::Ok) r = checkExist();
-    if (att && nAtt < maxAtt) att[nAtt] = Ch376Attempt{t.baud, r};
+    if (att && nAtt < maxAtt) att[nAtt] = Ch376Attempt{t.baud, r, setRx_};
     nAtt++;
     if (r == Ch376Err::Ok) {
       baud_ = t.baud;
       return Ch376Err::Ok;
     }
-    rollbackTo(t.baud);
+    if (recover(t.baud) != Ch376Err::Ok) return Ch376Err::BaudFail;
   }
   return Ch376Err::BaudFail;
 }
