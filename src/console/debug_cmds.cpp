@@ -64,6 +64,13 @@ void help() {
   LOGI(TAG, "DBG,usb — стан CH376S | DBG,usb,init — повна послідовність з мкс");
   LOGI(TAG, "DBG,usb,reset — скид і повернення на 9600 | DBG,usb,ping,<N> — N× CHECK_EXIST");
   LOGI(TAG, "DBG,usb,baud — перебір дільників | DBG,usb,baud,<бод>,<K hex> — одна спроба");
+  LOGI(TAG, "DBG,usb,init[,<бод>|auto] — з узгодженням швидкості (1000000/460800/115200) | DBG,usb,stop — закрити порт");
+  LOGI(TAG, "DBG,usb,ls[,<каталог>] — перелік (імʼя 8.3, тип, розмір; до 64) | DBG,usb,wait[,int|poll] — очікування статусу");
+  LOGI(TAG, "DBG,usb,read,<шлях>[,<КБ>] — швидкість читання, блоки, помилки | DBG,usb,seek,<шлях>,<зсув>[,<N>] — seek і читання");
+  LOGI(TAG, "DBG,usb,seq,<шлях>[,<КБ>] — читання «як у плеєра» (≈1,1 КБ / 26 мс): чи тримається потік 40 КБ/с");
+  LOGI(TAG, "DBG,usb,trace,on|off|dump — кадри UART до/від чіпа | DBG,usb,gap[,<мкс>] — пауза імʼя→open");
+  LOGI(TAG, "DBG,usb,fopen,<імʼя> — сирий FILE_OPEN | DBG,usb,cmd,<hex>[,<hex арг>] — довільна команда");
+  LOGI(TAG, "DBG,usb,sec,<LBA>[,<блок 0..7>] — сирий сектор (DISK_READ), для розбору розкладки тому");
 #endif
 #if SKIP_TEST_CMDS
   LOGI(TAG, "DBG,failnext,<n>[,read|decode] — наступні n стартів треку штучно завершуються read_fail (типово) або decode_fail");
@@ -365,6 +372,7 @@ void DebugCmds::handle(const proto::Msg& m) {
     LOGW(TAG, "невідома DBG-команда '%s' (DBG,help)", c);
   }
 }
+
 
 
 

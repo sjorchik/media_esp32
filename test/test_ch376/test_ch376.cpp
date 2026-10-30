@@ -406,8 +406,8 @@ void test_negotiate_reaches_1000000() {
   TEST_ASSERT_EQUAL_UINT32(1000000, L.portBaud);
 }
 
-void test_negotiate_fallback_to_230400() {
-  // Чіп приймає лише 230400 і 115200: 1 000 000 і 460 800 відкочуються, 230 400 досягається.
+void test_negotiate_fallback_to_115200() {
+  // M4b1: список 1000000 → 460800 → 115200. Чіп приймає лише 115200: дві невдачі, третя спроба успішна.
   MockLink L;
   L.supported = {230400, 115200};
   Ch376 d(L);
@@ -415,11 +415,12 @@ void test_negotiate_fallback_to_230400() {
   Ch376Attempt att[kCh376NegotiateN];
   size_t n = 0;
   TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)d.negotiateBaud(kCh376NegotiateTable, kCh376NegotiateN, att, kCh376NegotiateN, n));
-  TEST_ASSERT_EQUAL_UINT32(5, n);
+  TEST_ASSERT_EQUAL_UINT32(3, n);
   TEST_ASSERT_EQUAL_UINT32(1000000, att[0].baud);
-  TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)att[4].res);
-  TEST_ASSERT_EQUAL_UINT32(230400, d.baud());
-  TEST_ASSERT_EQUAL_UINT32(230400, L.portBaud);
+  TEST_ASSERT_EQUAL_UINT32(460800, att[1].baud);
+  TEST_ASSERT_EQUAL_INT((int)Ch376Err::Ok, (int)att[2].res);
+  TEST_ASSERT_EQUAL_UINT32(115200, d.baud());
+  TEST_ASSERT_EQUAL_UINT32(115200, L.portBaud);
 }
 
 void test_negotiate_chip_silent_stays_9600() {
@@ -637,6 +638,8 @@ void test_rollback_on_clean_chip() {
   TEST_ASSERT_EQUAL_UINT32(0, d.recoveredAt());
 }
 
+void run_fs_tests();  // test_ch376_fs.cpp (M4b1)
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_bytes_check_exist);
@@ -665,7 +668,7 @@ int main(int, char**) {
   RUN_TEST(test_disk_mount_no_disk);
   RUN_TEST(test_disk_mount_bad_fs);
   RUN_TEST(test_negotiate_reaches_1000000);
-  RUN_TEST(test_negotiate_fallback_to_230400);
+  RUN_TEST(test_negotiate_fallback_to_115200);
   RUN_TEST(test_negotiate_chip_silent_stays_9600);
   RUN_TEST(test_negotiate_no_supported_stays_9600);
   RUN_TEST(test_negotiate_bad_args);
@@ -682,5 +685,7 @@ int main(int, char**) {
   RUN_TEST(test_recover_lost_on_unknown_speed);
   RUN_TEST(test_rollback_on_clean_chip);
   RUN_TEST(test_err_names);
+  run_fs_tests();
   return UNITY_END();
 }
+

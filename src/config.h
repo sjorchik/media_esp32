@@ -108,7 +108,8 @@ inline constexpr uint8_t  kCh376JunkMax = 16;         // сміття перед
 // Команда 0x02 з двома байтами: перший kCh376BaudDivPrefix (0x03, змінна — звірити), другий K.
 // Швидкість = 6 000 000 / (256 − K). Поля: lo — перший байт, hi — K.
 // kCh376BaudTable — усі відомі K (відкат шукає чіп на цих швидкостях і на 9600).
-// kCh376NegotiateTable — порядок спроб negotiateBaud. 921600 не вмикаємо (немає точного дільника).
+// kCh376NegotiateTable — порядок спроб negotiateBaud (M4b1: 1000000 → 460800 → 115200, K = FA, F3, CC; перевірено на залізі).
+// Решта K лишається в kCh376BaudTable лише для ручного DBG,usb,baud,<бод>,<K>. 921600 не вмикаємо (немає точного дільника).
 inline constexpr uint8_t kCh376BaudDivPrefix = 0x03;
 struct Ch376BaudDiv {
   uint32_t baud;
@@ -127,16 +128,69 @@ inline constexpr Ch376BaudDiv kCh376BaudTable[] = {
 };
 inline constexpr size_t kCh376BaudTableN = sizeof(kCh376BaudTable) / sizeof(kCh376BaudTable[0]);
 inline constexpr Ch376BaudDiv kCh376NegotiateTable[] = {
-    {1000000, kCh376BaudDivPrefix, 0xFA},
-    {750000, kCh376BaudDivPrefix, 0xF8},
-    {500000, kCh376BaudDivPrefix, 0xF4},
+    {1000000, kCh376BaudDivPrefix, 0xFA},  // M4b1: лише швидкості, перевірені на залізі (M4a2)
     {460800, kCh376BaudDivPrefix, 0xF3},
-    {230400, kCh376BaudDivPrefix, 0xE6},
     {115200, kCh376BaudDivPrefix, 0xCC},
 };
 inline constexpr size_t kCh376NegotiateN = sizeof(kCh376NegotiateTable) / sizeof(kCh376NegotiateTable[0]);
 static_assert(kCh376NegotiateN >= 1, "таблиця спроб CH376S порожня");
 inline constexpr uint32_t kCh376RawWinMs = 30;  // вікно прослуховування сирих байтів (DBG,usb,baudraw)
+
+// ---- CH376S (M4b1): файловий шар ----
+// УВАГА: даташита в проєкті немає, значення — з памʼяті. Позначка (В/С/Н) — впевненість: висока / середня / низька.
+// Підсумок і результат перевірки на платі — у report_M4b1.md (таблиця «Припущення з даташита») і hwcheck_M4b1.md.
+inline constexpr uint8_t  kCh376CmdGetFileSize = 0x0C;   // GET_FILE_SIZE, відповідь 4 байти LE без переривання (С)
+inline constexpr uint8_t  kCh376GetFileSizeArg = 0x68;   // аргумент GET_FILE_SIZE (С)
+inline constexpr uint8_t  kCh376CmdRdUsbData0 = 0x27;    // RD_USB_DATA0: байт довжини, далі дані (В)
+inline constexpr uint8_t  kCh376CmdSetFileName = 0x2F;   // SET_FILE_NAME: рядок, завершений 0x00 (В)
+inline constexpr uint8_t  kCh376CmdFileOpen = 0x32;      // FILE_OPEN (В)
+inline constexpr uint8_t  kCh376CmdFileEnumGo = 0x33;    // FILE_ENUM_GO: наступний запис переліку (В)
+inline constexpr uint8_t  kCh376CmdFileClose = 0x36;     // FILE_CLOSE, аргумент 0x00 = без оновлення довжини (В)
+inline constexpr uint8_t  kCh376FileCloseArg = 0x00;
+inline constexpr uint8_t  kCh376CmdByteLocate = 0x39;    // BYTE_LOCATE: зсув 4 байти LE (В)
+inline constexpr uint8_t  kCh376CmdByteRead = 0x3A;      // BYTE_READ: кількість 2 байти LE (В)
+inline constexpr uint8_t  kCh376CmdByteRdGo = 0x3B;      // BYTE_RD_GO: продовжити після блоку (В)
+inline constexpr uint8_t  kCh376CmdDiskRead = 0x54;     // DISK_READ: LBA 4 байти LE + кількість секторів 1 байт (С, лише діагностика DBG,usb,sec)
+inline constexpr uint8_t  kCh376CmdDiskRdGo = 0x55;      // DISK_RD_GO: наступний блок сектора (С)
+inline constexpr uint8_t  kCh376IntDiskRead = 0x1D;      // USB_INT_DISK_READ: дані блоку готові / запис переліку (В)
+inline constexpr uint8_t  kCh376IntBufOver = 0x17;       // USB_INT_BUF_OVER (С)
+inline constexpr uint8_t  kCh376IntDiskErr = 0x1F;       // USB_INT_DISK_ERR (С)
+inline constexpr uint8_t  kCh376ErrOpenDir = 0x41;       // ERR_OPEN_DIR: відкрито каталог (В)
+inline constexpr uint8_t  kCh376ErrMissFile = 0x42;      // ERR_MISS_FILE: не знайдено / кінець переліку (В)
+inline constexpr uint8_t  kCh376ErrFoundName = 0x43;     // ERR_FOUND_NAME: знайдено файл, а потрібен каталог (С)
+inline constexpr size_t   kCh376BlockMax = 255;          // блок BYTE_READ: до 255 Б за даташитом 5.11 і за виміром (довжина 0xFF) (В)
+inline constexpr size_t   kCh376StageMax = 64;           // обмін по USB-рівню (DISK_READ, DISK_MOUNT): блок ≤ 64 Б; розмір буфера blk_ (В)
+inline constexpr size_t   kCh376DirInfoLen = 32;         // запис каталогу FAT (В)
+inline constexpr size_t   kCh376DirOffAttr = 11;         // зсув атрибута в записі (В)
+inline constexpr size_t   kCh376DirOffSize = 28;         // зсув розміру (4 байти LE) у записі (В)
+inline constexpr uint8_t  kCh376AttrHidden = 0x02;
+inline constexpr uint8_t  kCh376AttrVolume = 0x08;
+inline constexpr uint8_t  kCh376AttrDir = 0x10;
+inline constexpr size_t   kCh376FsNameMax = 12;          // «ИМЯ8.EXT» без NUL; довгі імена чіп не підтримує (В)
+inline constexpr size_t   kCh376FsPathMax = 48;          // шлях у читачі (з NUL); потрібен для повтору після збою
+inline constexpr uint8_t  kCh376FsDepthMax = 8;          // елементів шляху
+inline constexpr bool     kCh376FsUseInt = true;         // файлові операції чекають INT#, якщо пін підключено (DBG,usb,wait,int|poll)
+inline constexpr uint32_t kCh376FsOpMs = 1000;           // тайм-аут очікування статусу одної операції (консоль ≤ 3 с)
+inline constexpr uint32_t kCh376FsIntSliceMs = 20;       // скільки чекати INT, перш ніж один раз спитати GET_STATUS (запасний шлях)
+inline constexpr uint32_t kCh376FsDataMs = 150;          // тайм-аут бездіяльності при прийомі блоку даних (на 9600 блок ≈ 68 мс)
+inline constexpr uint32_t kCh376FsSettleBytes = 2;       // після прийому статусу чекаємо стільки байтових інтервалів: запізнілий дубль статусу встигає прийти й скидається наступною командою
+inline constexpr uint32_t kCh376FsAbortMs = 100;         // очікування відповіді на FILE_CLOSE при аварійному закритті
+inline constexpr uint8_t  kCh376FsReadRetries = 2;       // повторів читання/seek після збою (reopen + seek)
+inline constexpr uint32_t kCh376SpinSleepUs = 100000;    // UART-читання: спін без сну не довше цього, далі 1 тік (інакше idle-задача ядра 0 голодує → WDT)
+static_assert(kCh376FsPathMax >= 16 && kCh376FsPathMax <= 128, "kCh376FsPathMax: 16..128");
+static_assert(kCh376FsOpMs <= 3000 && kCh376FsOpMs > kCh376FsIntSliceMs, "кожен тайм-аут консолі ≤ 3 с");
+
+// Діагностика файлового шару (лише DBG,usb,ls|read|seek|seq)
+inline constexpr uint16_t kCh376DiagLsMax = 64;          // записів у DBG,usb,ls
+inline constexpr uint32_t kCh376DiagReadKbDef = 512;     // DBG,usb,read: типово, КБ
+inline constexpr uint32_t kCh376DiagKbMax = 65535;
+inline constexpr uint32_t kCh376DiagSeekN = 4096;        // DBG,usb,seek: типово, байтів
+inline constexpr uint32_t kCh376DiagMeasMs = 10000;      // стеля часу вимірювання, мс (далі — переривання)
+inline constexpr size_t   kCh376DiagChunk = 8192;        // порція read() у DBG,usb,read
+inline constexpr size_t   kCh376SeqChunk = 1045;         // DBG,usb,seq: 144·320000/44100 Б на кадр MP3 320 кбіт/с
+inline constexpr uint32_t kCh376SeqPeriodUs = 26122;     // тривалість кадру 1152/44100 с
+inline constexpr uint32_t kCh376SeqKbDef = 256;          // типово ≈ 6,4 с відтворення
+inline constexpr uint32_t kCh376SeqLagOkUs = 78000;      // допустиме відставання ≈ 3 кадри (запас вхідного буфера плеєра 3072 Б)
 static_assert(kCh376RxBuf >= 64 && kCh376RxBuf <= 2048, "kCh376RxBuf: 64..2048 Б");
 
 // ---- Аудіо ----
@@ -324,3 +378,4 @@ inline constexpr int kPrioDecoder = 5;   // нижче за audio (6), вище 
 
 // ---- Діагностика ----
 inline constexpr uint32_t kDiagPeriodMs = 60000;
+

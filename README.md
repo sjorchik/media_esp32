@@ -8,7 +8,7 @@
 
 - **BT**: A2DP-приймач з AVRCP. Працює.
 - **SD**: MP3 з картки (SdFat, hot-plug, плейлист, shuffle, резюме).
-- **USB**: через CH376S. Драйвер і діагностика `DBG,usb*` готові (M4a) за `ENABLE_USB_CH376 = 1`. До `SourceManager` ще не підключено, тож `MEDIA` показує `usb=0`.
+- **USB**: через CH376S. Драйвер, файловий шар і діагностика `DBG,usb*` готові (M4a, M4b1) за `ENABLE_USB_CH376 = 1`. До `SourceManager` ще не підключено, тож `MEDIA` показує `usb=0`.
 
 Звук виводиться по I2S на ЦАП. Гучністю, тембром і входом керує лише S3 (TDA7318); цифровий EQ і послаблення виходу S3 задає командами `EQ` і `LVL` (M6b). WROOM мʼютить свій ЦАП сам.
 
@@ -44,7 +44,7 @@
 - `esp32dev` — **реліз** (за замовчуванням). `BOOT_TEST_CMDS=0`, `SKIP_TEST_CMDS=0`.
 - `esp32dev_test` — стенд. Успадковує `esp32dev` і додає `-DBOOT_TEST_CMDS=1 -DSKIP_TEST_CMDS=1`. Не для релізу.
 - `esp32dev_usb` — стенд CH376S: успадковує `esp32dev_test` і додає `-DENABLE_USB_CH376=1`. Не для релізу.
-- `native` — юніт-тести (`pio test -e native`). Збирає `proto/frame`, `proto/cmd_args`, `media/id3`, `media/shuffle`, `storage/resume_record`, `storage/settings_record`, `storage/boot_guard`, `usb/ch376`.
+- `native` — юніт-тести (`pio test -e native`). Збирає `proto/frame`, `proto/cmd_args`, `media/id3`, `media/shuffle`, `storage/resume_record`, `storage/settings_record`, `storage/boot_guard`, `usb/ch376`, `usb/ch376_fs`, `usb/ch376_file_reader`.
 
 Команди (COM-порт підставити свій):
 
@@ -64,7 +64,7 @@ pio test -e native
 | `HAVE_DAC` | 1 | Лише для логу: 0 → «DAC відсутній» |
 | `LOG_LEVEL` | 3 | 1=E 2=W 3=I 4=D |
 | `AUTO_RESUME_SOURCE` | 0 | 1: після старту вмикати останнє джерело |
-| `ENABLE_USB_CH376` | 0 | 1: драйвер CH376S і `DBG,usb*` (M4a) |
+| `ENABLE_USB_CH376` | 0 | 1: драйвер CH376S, файловий шар і `DBG,usb*` (M4a, M4b1) |
 | `SD_CD_ACTIVE_LOW` | 1 | Полярність card-detect |
 | `BOOT_TEST_CMDS` | 0 | 1: `DBG,boot,crash`, `DBG,boot,set,<n>` |
 | `SKIP_TEST_CMDS` | 0 | 1: `DBG,failnext`, `DBG,media,ins\|rem` |
@@ -175,11 +175,22 @@ SdFat не потокобезпечний: усі виклики серіалі�
 | `DBG,eq[,g1,g2,g3,g4,g5]` | Пресет EQ і активні смуги / задати пресет (дБ −12…12) |
 | `DBG,lvl[,<bt\|sd\|usb>,<дБ>]` | Рівні виходу bt/sd/usb і останній активний слот / задати рівень (дБ −40…0) |
 | `DBG,usb` | Стан CH376S: запуск, швидкість, флешка, остання помилка і подія (без звернення до чіпа) |
-| `DBG,usb,init` | Повна послідовність: скид → CHECK_EXIST → host → підключення (≤ 3 с) → DISK_CONNECT → DISK_MOUNT, мкс на кожен крок |
+| `DBG,usb,init[,<бод>\|auto]` | Повна послідовність: скид → CHECK_EXIST → [швидкість] → host → підключення (≤ 3 с) → DISK_CONNECT → DISK_MOUNT, мкс на кожен крок. Без аргументу лишається 9600; `auto` пробує 1000000 → 460800 → 115200 |
 | `DBG,usb,reset` | Скид чіпа і повернення порту на 9600 |
 | `DBG,usb,ping,<N>` | N× CHECK_EXIST: успіхи, середній і максимальний час, мкс (N ≤ 50) |
 | `DBG,usb,baud` | Перебір дільників з таблиці, відкат на 9600 при невдачі |
 | `DBG,usb,baud,<бод>,<K hex>` | Одна спроба з явною парою (9600…1000000, K 00…FF) для підбору на залізі |
+| `DBG,usb,ls[,<каталог>]` | Перелік записів (імʼя 8.3, тип, розмір), до 64; довші списки позначаються «ОБРІЗАНО» (M4b1) |
+| `DBG,usb,read,<шлях>[,<КБ>]` | Читання з початку файлу без обробки (типово 512 КБ, стеля 10 с): КБ/с, час блоку мін/сер/макс, розбивка часу, помилки/повтори, heap і стек |
+| `DBG,usb,seek,<шлях>,<зсув>[,<N>]` | Seek і читання N байтів (типово 4096): час, КБ/с, перші 16 байтів |
+| `DBG,usb,seq,<шлях>[,<КБ>]` | Читання шматками ≈1,1 КБ кожні ≈26 мс (потік 320 кбіт/с): чи тримається, найгірший шматок, відставання |
+| `DBG,usb,wait[,int\|poll]` | Показати/задати очікування файлових операцій: INT# чи опитування GET_STATUS (для порівняння) |
+| `DBG,usb,trace,on\|off\|dump` | Кадри UART до/від чіпа (T/R, hex) у буфері heap ≈0,8 КБ; для розбору збоїв файлового шару |
+| `DBG,usb,gap[,<мкс>]` | Пауза між SET_FILE_NAME і FILE_OPEN (типово 0) |
+| `DBG,usb,fopen,<імʼя>` | Сирий FILE_OPEN: статус чіпа і запис каталогу (для `*`) |
+| `DBG,usb,cmd,<hex>[,<hex арг>]` | Довільна команда чіпа (до 4 аргументів): статус, рівень INT, дані RD_USB_DATA0 (напр. `3F` DISK_QUERY) |
+| `DBG,usb,sec,<LBA>[,<блок>]` | Сирий сектор через DISK_READ (блоки по 64 Б), для розбору розкладки тому |
+| `DBG,usb,mode,<4..7>` | SET_USB_MODE з консолі (7 = скид шини USB, 6 = host з SOF); після цього потрібен mount (`cmd,31`). У `trace` рядки F — байти, відкинуті очищенням RX |
 | `DBG,failnext,<n>[,read\|decode]` | **[test]** Наступні n стартів треку штучно завершуються збоєм |
 
 Приклад (реліз, `esp32dev`): `DBG,failnext,1` → `DBG,failnext вимкнено (SKIP_TEST_CMDS=0)`.
@@ -239,3 +250,9 @@ SdFat не потокобезпечний: усі виклики серіалі�
 - Дільники SET_BAUDRATE — гіпотеза: команда `02 03 K`, швидкість = 6 000 000 / (256 − K). K: 1000000 → FA, 460800 → F3, 230400 → E6, 115200 → CC. Звірити на залізі (`DBG,usb,baud`, або `DBG,usb,baud,<бод>,<K hex>` без перекомпіляції). Відкат на 9600 обовʼязковий.
 - Драйвер не підключено до `SourceManager`/`UsbSource`; читання файлів не реалізовано (M4b).
 - Детальні кроки перевірки на залізі — `hwcheck_M4a.md`.
+
+## 13. USB: файловий шар CH376S (M4b1)
+
+- `src/usb/ch376_fs.*` (команди файлового шару, шлях поетапно, читання блоками по 64 Б, перелік) і `src/usb/ch376_file_reader.*` (`Ch376FileReader : IFileReader`) — без Arduino, тестуються в `native` (mock у `test/test_ch376/mock_fs_link.h`). Лише імена 8.3; шлях від кореня `/A/B/FILE.MP3`; флешка FAT32. Драйвер файловий шар не запускає: спершу `DBG,usb,init,auto` (або `init,1000000`).
+- Очікування статусу: GPIO-переривання INT# (falling) → семафор, запасне опитування `GET_STATUS` за `micros()`; `delay(1)` у гарячому шляху немає. Порівняння: `DBG,usb,wait,poll` / `wait,int`.
+- Не підключено до `SourceManager`/`MEDIA` (це M4b2); `STUB_USB_PRESENT` не змінено. Інструкція перевірки на залізі — `hwcheck_M4b1.md`.

@@ -35,4 +35,26 @@ class Ch376Link {
 
   // Монотонний час, мкс (для тайм-аутів і вимірів у DBG,usb).
   virtual uint32_t nowUs() const = 0;
+
+  // ---- M4b1: гарячий шлях файлового шару. Не чисті, щоб існуючі реалізації й mock-и збиралися без змін. ----
+
+  // Блокуюче очікування, поки INT# стане LOW (подія чіпа), не довше timeoutUs. true — INT низький.
+  // Типово: одна перевірка intLow() без очікування. Справжня реалізація: GPIO-переривання → семафор.
+  virtual bool waitIntLow(uint32_t /*timeoutUs*/) { return intLow(); }
+
+  // Тривалість одного байта на лінії, мкс (10 біт / бод). Типово 0 (mock без часу на лінії).
+  virtual uint32_t byteTimeUs() const { return 0; }
+
+  // Віддати процесор в циклі опитування (без затримки на 1 тік). Типово нічого.
+  virtual void yieldNow() {}
+
+  // Прийом до n байтів. timeoutUs — тайм-аут БЕЗДІЯЛЬНОСТІ (скільки чекати наступного байта). Повертає прийняте.
+  // Типово: readByte по одному (тайм-аут округлюється вгору до мс).
+  virtual size_t readBytes(uint8_t* dst, size_t n, uint32_t timeoutUs) {
+    size_t k = 0;
+    const uint32_t ms = (timeoutUs + 999u) / 1000u;
+    while (k < n && readByte(dst[k], ms)) k++;
+    return k;
+  }
 };
+
