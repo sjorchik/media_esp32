@@ -250,6 +250,7 @@ int intLevel() {
 Ch376& driver() { return s_drv; }
 Ch376Fs& fs() { return s_fs; }
 Ch376FileReader& reader() { return s_rd; }
+Ch376Link& link() { return s_link; }
 
 }  // namespace ch376_uart
 

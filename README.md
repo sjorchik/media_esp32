@@ -256,3 +256,11 @@ SdFat не потокобезпечний: усі виклики серіалі�
 - `src/usb/ch376_fs.*` (команди файлового шару, шлях поетапно, читання блоками по 64 Б, перелік) і `src/usb/ch376_file_reader.*` (`Ch376FileReader : IFileReader`) — без Arduino, тестуються в `native` (mock у `test/test_ch376/mock_fs_link.h`). Лише імена 8.3; шлях від кореня `/A/B/FILE.MP3`; флешка FAT32. Драйвер файловий шар не запускає: спершу `DBG,usb,init,auto` (або `init,1000000`).
 - Очікування статусу: GPIO-переривання INT# (falling) → семафор, запасне опитування `GET_STATUS` за `micros()`; `delay(1)` у гарячому шляху немає. Порівняння: `DBG,usb,wait,poll` / `wait,int`.
 - Не підключено до `SourceManager`/`MEDIA` (це M4b2); `STUB_USB_PRESENT` не змінено. Інструкція перевірки на залізі — `hwcheck_M4b1.md`.
+
+## 14. USB: сирий доступ до секторів (M4b2)
+
+- `src/usb/ch376_disk.*` — шар секторів (`Ch376Disk`): `DISK_CAPACITY` і `DISK_READ` блоками по 64 Б, розбиття за `secPerCmd`, коди помилок, статистика. Залежить лише від `Ch376Link`. Файловий шар (`Ch376Fs`) не змінено.
+- `src/usb/disk_probe.*` — діагностичний розбір розкладки: MBR, захисний GPT (перший розділ), BPB FAT12/16/32 з повним полем `reserved`, exFAT. Це не читач FAT.
+- Консоль (`src/usb/ch376_diag_disk.cpp`): `DBG,usb,part`, `DBG,usb,rawread,<LBA>[,<секторів ≤ 8>]`, `DBG,usb,rawspeed,<LBA>,<КБ>[,<N>]`, `DBG,usb,rawseq,<LBA>[+зсув],<КБ>[,<байт>[,<мс>]]`, `DBG,usb,rawpre,<LBA>,<КБ>,<пакет Б>,<кадрів>`, `DBG,usb,rawcfg[,settle|skip|wait|spc,<значення>]`.
+- `DBG,usb,init,2000000` дозволено (K=FD, не підтверджено на залізі). `DBG,usb,sec` без змін.
+- Значення протоколу з памʼяті про даташит — в `config.h` (блок CH376S M4b2). Перевірка на залізі: `hwcheck_M4b2.md`, результати: `report_M4b2.md`.

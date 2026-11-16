@@ -14,6 +14,7 @@
 #include "usb/ch376.h"
 #include "usb/ch376_fs.h"
 #include "usb/ch376_uart.h"
+#include "usb/ch376_diag_disk.h"
 #include "util/diag.h"
 #include "util/log.h"
 
@@ -93,6 +94,7 @@ void usbRecovery(const Ch376& d);
 
 // Швидкість, дозволена для init (лише перевірені на залізі: kCh376NegotiateTable).
 bool negotiable(long b) {
+  if (b == 2000000) return true;  // M4b2: K=FD (дільник з kCh376BaudTable), НЕ підтверджено на залізі
   for (size_t i = 0; i < kCh376NegotiateN; i++)
     if ((long)kCh376NegotiateTable[i].baud == b) return true;
   return false;
@@ -105,8 +107,8 @@ Ch376Err usbInitBaud(Ch376& d, long baudArg) {
   const Ch376BaudDiv* tab = kCh376NegotiateTable;
   size_t n = kCh376NegotiateN;
   if (baudArg > 0) {
-    for (size_t i = 0; i < kCh376NegotiateN; i++)
-      if ((long)kCh376NegotiateTable[i].baud == baudArg) one = kCh376NegotiateTable[i];
+    for (size_t i = 0; i < kCh376BaudTableN; i++)  // M4b2: і 2000000 (K=FD), і решта з таблиці дільників
+      if ((long)kCh376BaudTable[i].baud == baudArg) one = kCh376BaudTable[i];
     tab = &one;
     n = 1;
   }
@@ -659,7 +661,7 @@ void Ch376Diag::handle(const proto::Msg& m) {
     if (m.argc == 3) {
       if (!strcasecmp(m.args[2], "auto")) b = -1;
       else if (!toInt(m.args[2], b, 10) || !negotiable(b)) {
-        LOGW(TAG, "DBG,usb,init[,1000000|460800|115200|auto]");
+        LOGW(TAG, "DBG,usb,init[,1000000|460800|115200|2000000|auto]");
         return;
       }
     }
@@ -744,10 +746,11 @@ void Ch376Diag::handle(const proto::Msg& m) {
     usbBaudRaw((uint8_t)c, (uint8_t)k, (uint32_t)nb);
   } else if (!strcasecmp(s, "stop") && m.argc == 2) {
     usbStop();
-  } else {
+  } else if (!Ch376DiagDisk::handle(m)) {  // M4b2: rawread|part|rawspeed|rawseq|rawpre|rawcfg
     usbHelp();
   }
 }
 
 #endif  // ENABLE_USB_CH376
+
 

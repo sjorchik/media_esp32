@@ -71,6 +71,12 @@ void help() {
   LOGI(TAG, "DBG,usb,trace,on|off|dump — кадри UART до/від чіпа | DBG,usb,gap[,<мкс>] — пауза імʼя→open");
   LOGI(TAG, "DBG,usb,fopen,<імʼя> — сирий FILE_OPEN | DBG,usb,cmd,<hex>[,<hex арг>] — довільна команда");
   LOGI(TAG, "DBG,usb,sec,<LBA>[,<блок 0..7>] — сирий сектор (DISK_READ), для розбору розкладки тому");
+  LOGI(TAG, "DBG,usb,part — розбір MBR, GPT, BPB, exFAT (M4b2)");
+  LOGI(TAG, "DBG,usb,rawread,<LBA>[,<секторів>] — сирі сектори, FNV-1a");
+  LOGI(TAG, "DBG,usb,rawspeed,<LBA>,<КБ>[,<N>] — КБ/с сирого читання");
+  LOGI(TAG, "DBG,usb,rawseq,<LBA>[+зсув],<КБ>[,<байт>[,<мс>]] — як у плеєра");
+  LOGI(TAG, "DBG,usb,rawpre,<LBA>,<КБ>,<пакет Б>,<кадрів> — випереджальне читання");
+  LOGI(TAG, "DBG,usb,rawcfg[,settle|skip|wait|spc,<значення>] — налаштування");
 #endif
 #if SKIP_TEST_CMDS
   LOGI(TAG, "DBG,failnext,<n>[,read|decode] — наступні n стартів треку штучно завершуються read_fail (типово) або decode_fail");
@@ -372,6 +378,7 @@ void DebugCmds::handle(const proto::Msg& m) {
     LOGW(TAG, "невідома DBG-команда '%s' (DBG,help)", c);
   }
 }
+
 
 
 

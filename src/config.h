@@ -193,6 +193,32 @@ inline constexpr uint32_t kCh376SeqKbDef = 256;          // типово ≈ 6,4
 inline constexpr uint32_t kCh376SeqLagOkUs = 78000;      // допустиме відставання ≈ 3 кадри (запас вхідного буфера плеєра 3072 Б)
 static_assert(kCh376RxBuf >= 64 && kCh376RxBuf <= 2048, "kCh376RxBuf: 64..2048 Б");
 
+// ---- CH376S (M4b2): сирий доступ до секторів (usb/ch376_disk.*). УВАГА: значення з памʼяті про даташит, НЕ перевірені;
+// кожне має запис у таблиці «Припущення з даташита» звіту report_M4b2.md (константа → значення → впевненість → результат на платі).
+inline constexpr uint8_t  kCh376CmdDiskCapacity = 0x3E; // DISK_CAPACITY: статус 0x14, далі RD_USB_DATA0 з 4 Б (сума секторів LE). СЕРЕДНЯ-НИЗЬКА
+inline constexpr uint8_t  kCh376DiskCapLen = 4;         // байтів у відповіді DISK_CAPACITY. СЕРЕДНЯ-НИЗЬКА
+inline constexpr uint32_t kCh376DiskSecBytes = 512;     // розмір сектора (FAT/exFAT стандарт). ВИСОКА
+inline constexpr uint32_t kCh376DiskBlkBytes = 64;      // блок DISK_READ (умова завдання M4b2, за виміром M4b1 — 64 Б). ВИСОКА
+inline constexpr uint32_t kCh376DiskBlksPerSec = 8;     // блоків на сектор: 512 / 64
+inline constexpr uint32_t kCh376DiskMaxSectors = 255;   // секторів в одній DISK_READ (лічильник 1 байт). СЕРЕДНЯ-НИЗЬКА, звірити на залізі
+inline constexpr uint32_t kCh376DiskSecPerCmdDef = 8;   // типово секторів на команду (вимір: варіант а)
+inline constexpr uint32_t kCh376DiskOpMs = 1000;        // тайм-аут статусу однієї операції (консоль ≤ 3 с)
+inline constexpr uint32_t kCh376DiskDataMs = 150;       // тайм-аут бездіяльності при прийомі блоку даних
+inline constexpr uint32_t kCh376DiskIntSliceMs = 20;    // зріз очікування INT перед запасним GET_STATUS
+inline constexpr uint32_t kCh376DiskSettleDef = 2;      // пауза після GET_STATUS, байтових інтервалів (вимір: варіант в)
+static_assert(kCh376DiskBlkBytes * kCh376DiskBlksPerSec == kCh376DiskSecBytes, "блок × блоків = сектор");
+static_assert(kCh376DiskMaxSectors >= 1 && kCh376DiskMaxSectors <= 255, "лічильник секторів — 1 байт");
+static_assert(kCh376DiskSecPerCmdDef >= 1 && kCh376DiskSecPerCmdDef <= kCh376DiskMaxSectors, "типова кількість секторів у межах");
+
+// ---- CH376S (M4b2): вимірювання сирого читання (usb/ch376_diag_disk.*) ----
+inline constexpr uint32_t kCh376RawChunkDef = 1045;      // rawseq: байтів на кадр за замовчуванням (MP3 320 кбіт/с)
+inline constexpr uint32_t kCh376RawPeriodDefUs = 26100;  // rawseq: період кадру за замовчуванням, мкс (26,1 мс)
+inline constexpr uint32_t kCh376RawKbDef = 128;          // rawspeed: КБ за замовчуванням (якщо не задано)
+inline constexpr uint32_t kCh376RawKbMax = 400;          // rawspeed/rawseq: стеля обсягу (≈10 с при 40 КБ/с)
+inline constexpr uint32_t kCh376RawReadSecMax = 8;       // rawread: секторів у одному виклику (буфер heap 4 КБ)
+inline constexpr uint32_t kCh376RawPreUnitMax = 8192;    // rawpre: байтів у пакеті випереджального читання (стеля)
+static_assert(kCh376RawChunkDef >= 1 && kCh376RawPeriodDefUs >= 1000, "параметри rawseq");
+
 // ---- Аудіо ----
 inline constexpr uint32_t kDefaultRate = 44100;
 inline constexpr uint32_t kFadeMs = 8;          // fade-in / хвіст fade-out
@@ -378,4 +404,5 @@ inline constexpr int kPrioDecoder = 5;   // нижче за audio (6), вище 
 
 // ---- Діагностика ----
 inline constexpr uint32_t kDiagPeriodMs = 60000;
+
 

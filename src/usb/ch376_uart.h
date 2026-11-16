@@ -34,7 +34,11 @@ void traceDump();   // надрукувати накопичене і очист
 Ch376Fs& fs();
 Ch376FileReader& reader();
 
+// Сам звʼязок (Ch376Link) для сирого доступу до секторів (M4b2). Статичний обʼєкт; стан не змінює.
+Ch376Link& link();
+
 }  // namespace ch376_uart
 
 #endif  // ENABLE_USB_CH376
+
 

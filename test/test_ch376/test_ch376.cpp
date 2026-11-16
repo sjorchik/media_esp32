@@ -639,6 +639,7 @@ void test_rollback_on_clean_chip() {
 }
 
 void run_fs_tests();  // test_ch376_fs.cpp (M4b1)
+void run_disk_tests();  // test_ch376_disk.cpp (M4b2)
 
 int main(int, char**) {
   UNITY_BEGIN();
@@ -686,6 +687,8 @@ int main(int, char**) {
   RUN_TEST(test_rollback_on_clean_chip);
   RUN_TEST(test_err_names);
   run_fs_tests();
+  run_disk_tests();
   return UNITY_END();
 }
+
 
