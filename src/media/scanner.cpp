@@ -1,6 +1,6 @@
 #include "media/scanner.h"
 
-#include <Arduino.h>
+#include "util/clock.h"
 #include <string.h>
 #include <strings.h>
 
@@ -10,7 +10,7 @@ void Scanner::start(IMedia& m, Playlist& pl) {
   pl_ = &pl;
   pl.clear();
   stats_ = ScanStats{};
-  t0_ = millis();
+  t0_ = nowMs();
   depth_ = 0;
   pathLen_ = 0;
   path_[0] = 0;
@@ -34,7 +34,7 @@ void Scanner::abort() {
 
 void Scanner::finish() {
   closeAll();
-  stats_.wallMs = millis() - t0_;
+  stats_.wallMs = nowMs() - t0_;
   stats_.tracks = pl_->tracks();
   stats_.foldersTotal = pl_->folders();
   uint16_t n = 0;
@@ -44,11 +44,11 @@ void Scanner::finish() {
 
 Scanner::St Scanner::step(uint32_t budgetMs) {
   if (st_ != St::Running) return st_;
-  uint32_t t = millis();
+  uint32_t t = nowMs();
   do {
     advance();
-  } while (st_ == St::Running && (uint32_t)(millis() - t) < budgetMs);
-  stats_.busyMs += millis() - t;
+  } while (st_ == St::Running && (uint32_t)(nowMs() - t) < budgetMs);
+  stats_.busyMs += nowMs() - t;
   if (st_ != St::Running) finish();
   return st_;
 }
@@ -139,3 +139,4 @@ void Scanner::advance() {
   depth_++;
   lv_[depth_] = Level{h, 0, Playlist::kNone, pathLen_, (uint16_t)(parentLen + 1)};
 }
+

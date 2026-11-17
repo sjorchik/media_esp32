@@ -39,6 +39,7 @@ struct BpbInfo {
   uint32_t dataStart = 0;    // сектор початку даних відносно початку тому
   uint32_t clusters = 0;
   char label[12] = {0};      // ASCII, без хвостових пробілів; непечатні → '?'
+  uint32_t serial = 0;       // M4b4: серійний номер тому з завантажувального сектора (FAT32: 0x43, FAT12/16: 0x27)
 };
 
 struct ExFatInfo {
@@ -47,6 +48,7 @@ struct ExFatInfo {
   uint64_t volLength = 0;
   uint32_t fatOffset = 0, fatLength = 0, heapOffset = 0, clusterCount = 0, rootCluster = 0;
   uint8_t bytesPerSecShift = 0, secPerClusShift = 0, numFats = 0;
+  uint32_t serial = 0;       // M4b4: VolumeSerialNumber (зсув 0x64)
 };
 
 struct ProbeReport {
@@ -72,3 +74,4 @@ bool parseBpb(const uint8_t* s, BpbInfo& b);                                    
 bool parseExFat(const uint8_t* s, ExFatInfo& e);                                // false — немає "EXFAT   " або збій полів
 bool parseGptHeader(const uint8_t* s, uint32_t& entriesLba, uint32_t& count, uint32_t& entrySize);  // false — немає "EFI PART"
 bool parseGptFirst(const uint8_t* entries, uint32_t entrySize, uint32_t& startLba, uint32_t& sectors);  // false — порожньо
+

@@ -38,6 +38,9 @@ inline constexpr int kProtoVer = 2;   // proto_ver: єдине місце (M6b: 
 #ifndef ENABLE_USB_CH376
 #define ENABLE_USB_CH376 0     // етап 4
 #endif
+#ifndef USB_FORCE_BAUD_REF
+#define USB_FORCE_BAUD_REF 0   // M4b4: 1 — стенд (env esp32dev_usb1m): після еталона 1 Мбод 2 Мбод не пробуємо (вимір резерву). Типово 0
+#endif
 #define MIRROR_HB 0            // 1: дзеркалити HB в UART0
 #define RELEASE_BLE_MEM 1      // esp_bt_controller_mem_release(ESP_BT_MODE_BLE) на старті
 #define STUB_SD_PRESENT 0      // SD тепер справжній: старт без картки, далі hot-plug (SdMedia)
@@ -363,6 +366,13 @@ inline constexpr int      kScanMaxDepth = 3;           // корінь = рів�
 inline constexpr size_t   kMediaNameMax = 256;         // буфер імені запису (UTF-8 + NUL)
 inline constexpr size_t   kScanPathMax = 256;          // буфер шляху під час скану
 inline constexpr uint32_t kScanSliceMs = 15;           // порція скану за ітерацію loopTask
+// ---- M4b4: USB як джерело (лише при ENABLE_USB_CH376=1) ----
+inline constexpr uint32_t kUsbLockWaitMs = 1500;       // очікування мʼютекса USB-тому (читання шматка ≤ ~40 мс на 1 Мбод, відкриття — до секунд, але без читачів)
+inline constexpr uint32_t kUsbScanWarnMs = 8000;       // скан довший → LOGW (варіанти прискорення — у звіті)
+// Зворотний бік: decodeLoop докачує вхід до повних kDecInBytes (≈3–5 КБ за раз). На USB (≈83 КБ/с) це 40–65 мс при DMA-запасі ≈23 мс → underrun.
+// Для USB докачування добирає буфер лише до kDecInRefill+128 і не більше цього числа за виклик (страховка). 0 = без обмеження (SD).
+inline constexpr size_t   kUsbFillMaxBytes = 1536;
+inline constexpr int      kUsbDirHandles = kScanMaxDepth + 1;  // одночасно відкритих каталогів скану (як у SdMedia)
 inline constexpr uint32_t kReadSliceMs = 15;           // порція DBG,sdread
 inline constexpr size_t   kEvFolderNameMax = 48;       // макс. байтів назви папки в події FOLDER
 inline constexpr size_t   kEvMetaFieldMax = 96;        // макс. байтів назви в META (SD: імʼя файлу без .mp3)
@@ -424,3 +434,4 @@ inline constexpr int kPrioDecoder = 5;   // нижче за audio (6), вище 
 
 // ---- Діагностика ----
 inline constexpr uint32_t kDiagPeriodMs = 60000;
+

@@ -324,9 +324,20 @@ bool Mp3Player::fill() {
     sx.inPos = 0;
     sx.inLen = avail;
   }
-  while (sx.inLen < kDecInBytes && !sx.eof) {
+  // M4b4: cap = 0 — до повного буфера (SD). USB: ціль лише трохи вище порога докачування (тоді кожен цикл читає ≈ стільки, скільки
+  // спожито, ≈1 кадр, ≈13 мс), а не фіксовані 1536 Б (≈20 мс при запасі DMA ≈23 мс); cap лишається страховкою на один виклик.
+  const uint32_t cap = fillMax_;
+  const uint32_t lim = cap ? (uint32_t)(kDecInRefill + 128 < kDecInBytes ? kDecInRefill + 128 : kDecInBytes) : (uint32_t)kDecInBytes;
+  uint32_t got = 0;
+  while (sx.inLen < lim && !sx.eof && (!cap || got < cap)) {
     int64_t t = esp_timer_get_time();
-    size_t n = rd_->read(S->in + sx.inLen, kDecInBytes - sx.inLen);
+    size_t want = lim - sx.inLen;
+    if (cap && want > cap - got) want = cap - got;
+    if (cap) {  // USB: читання до межі 512-байтного сектора → наступне починається з її початку і йде цілими секторами (менше команд чіпа)
+      const uint32_t e = (sx.fEnd + (uint32_t)want) & ~511u;
+      if (e > sx.fEnd) want = e - sx.fEnd;
+    }
+    size_t n = rd_->read(S->in + sx.inLen, want);
     uint32_t dt = (uint32_t)(esp_timer_get_time() - t);
     stats_.rdBusyUs += dt;
     if (dt > stats_.rdMaxUs) stats_.rdMaxUs = dt;
@@ -336,8 +347,10 @@ bool Mp3Player::fill() {
       break;
     }
     stats_.rdBytes += (uint32_t)n;
+    got += (uint32_t)n;
     sx.inLen += (uint32_t)n;
     sx.fEnd += (uint32_t)n;
+    if (cap) break;  // USB: одне вирівняне читання за виклик; решту докачає наступна ітерація
   }
   return true;
 }
@@ -567,7 +580,7 @@ Mp3Player::Ev Mp3Player::decodeLoop() {
     // 6b) M6a: EQ → рівень (слот sd) → одне насичення, на місці в PCM-кадрі (int16, ch = 1|2); AudioOut далі дублює моно
     eq::setSampleRate(hz);
     const int64_t tf = esp_timer_get_time();
-    eq::process(S->pcm, smp, (uint8_t)ch, level::advance(level::Slot::Sd, smp));
+    eq::process(S->pcm, smp, (uint8_t)ch, level::advance((level::Slot)lvSlot_, smp));
     const uint32_t fxUs = (uint32_t)(esp_timer_get_time() - tf);
 
     // 7) вивід + оцінка underrun (запас даних у DMA, модель «дірявого відра», без довгого дрейфу годинника)
@@ -621,4 +634,5 @@ Mp3Player::Ev Mp3Player::decodeLoop() {
     stats_.pcmBytes = (uint32_t)bytes;
   }
 }
+
 

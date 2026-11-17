@@ -90,6 +90,7 @@ bool parseBpb(const uint8_t* s, BpbInfo& b) {
   const VolKind k = fatKindFromClusters(clus);
   const uint8_t* lab = s + (k == VolKind::Fat32 ? 0x47 : 0x2B);
   if (k == VolKind::Fat32) b.rootClus = rd32(s + 44);
+  b.serial = rd32(s + (k == VolKind::Fat32 ? 0x43 : 0x27));  // M4b4: BS_VolID
   int n = 11;
   while (n > 0 && (lab[n - 1] == ' ' || lab[n - 1] == 0)) n--;
   for (int i = 0; i < n; i++) {
@@ -113,6 +114,7 @@ bool parseExFat(const uint8_t* s, ExFatInfo& e) {
   e.heapOffset = rd32(s + 0x58);
   e.clusterCount = rd32(s + 0x5C);
   e.rootCluster = rd32(s + 0x60);
+  e.serial = rd32(s + 0x64);  // M4b4: VolumeSerialNumber
   e.bytesPerSecShift = s[0x6C];
   e.secPerClusShift = s[0x6D];
   e.numFats = s[0x6E];
@@ -237,3 +239,4 @@ bool probeDisk(SectorReader& rd, uint8_t* s, ProbeReport& o) {
 }
 
 #endif  // ENABLE_USB_CH376
+

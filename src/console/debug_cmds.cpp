@@ -24,6 +24,14 @@ namespace {
 
 constexpr const char* TAG = "dbg";
 
+// M4b4: DBG-команди файлового джерела (nav, shuf, resume, list, play, tag, decode…) адресуються активному SD або USB.
+SdSource& fileSrc() {
+#if ENABLE_USB_CH376
+  if (g_sources.current() == SrcId::USB) return g_usb;
+#endif
+  return g_sd;
+}
+
 bool toInt(const char* s, long& v) {
   if (!s || !*s) return false;
   char* e = nullptr;
@@ -79,6 +87,7 @@ void help() {
   LOGI(TAG, "DBG,usb,rawcfg[,settle|skip|wait|spc,<значення>] — налаштування");
   LOGI(TAG, "DBG,usb,mount | DBG,usb,umount — SdFat-том над сирими секторами: швидкість, розділ, ФС, мітка, heap (M4b3)");
   LOGI(TAG, "DBG,usb,vls[,<каталог>[,N]] — перелік з довгими іменами (UTF-8) | DBG,usb,vtag,<шлях> — ID3 (початок і кінець файлу)");
+  LOGI(TAG, "DBG,usb,vscan — підсумок скану USB | DBG,usb,vlist[,N] — плейлист USB | DBG,usb,vtagn,<n> — ID3 треку №n плейлиста (src=usb, stop) (M4b4)");
   LOGI(TAG, "DBG,usb,vread,<шлях>[,<КБ>] — швидкість читання через SdFat | DBG,usb,vseq,<шлях>[,<КБ>, 0 = весь файл] — «як у плеєра»");
 #endif
 #if SKIP_TEST_CMDS
@@ -136,9 +145,10 @@ void aout() {
   g_sd.dec().snap(d);
   LOGI(TAG, "aout: ready=%d muted=%d abort=%d | %u Гц %u кан gain=%u%%", a.ready, a.muted, a.aborting, (unsigned)a.rate,
        (unsigned)a.channels, (unsigned)a.gainPct);
-  LOGI(TAG, "aout: src=%s state=%s | sd=%s errRun=%u/%u failnext=%u(%s)", srcName(g_sources.current()),
-       stateName(g_sources.state()), stateName(g_sd.playState()), (unsigned)g_sd.errRun(), (unsigned)kPlayErrStop,
-       (unsigned)g_sd.failLeft(), g_sd.failIsDecode() ? "decode" : "read");
+  const SdSource& fs = fileSrc();
+  LOGI(TAG, "aout: src=%s state=%s | %s=%s errRun=%u/%u failnext=%u(%s)", srcName(g_sources.current()),
+       stateName(g_sources.state()), srcName(fs.id()), stateName(fs.playState()), (unsigned)fs.errRun(), (unsigned)kPlayErrStop,
+       (unsigned)fs.failLeft(), fs.failIsDecode() ? "decode" : "read");
   LOGI(TAG, "aout: мʼют %u/%u анмʼют %u/%u fmt=%u stop=%u (виклики/реальні переходи)", (unsigned)a.muteCalls,
        (unsigned)a.muteDone, (unsigned)a.unmuteCalls, (unsigned)a.unmuteDone, (unsigned)a.fmtCalls, (unsigned)a.stopCalls);
   if (a.lastTrans) LOGI(TAG, "aout: остання зміна '%c' %u мс тому", a.lastTrans, (unsigned)a.lastTransAgoMs);
@@ -254,7 +264,7 @@ void DebugCmds::handle(const proto::Msg& m) {
       LOGW(TAG, "DBG,%s,<n> (n ≥ 1, номер із DBG,list)", k == SdSource::Dbg::Play ? "play" : k == SdSource::Dbg::Tag ? "tag" : "sdread");
       return;
     }
-    if (!g_sd.dbg(k, (int)n)) LOGW(TAG, "SD: попередня DBG-команда ще виконується");
+    if (!(k == SdSource::Dbg::Info ? g_sd : fileSrc()).dbg(k, (int)n)) LOGW(TAG, "%s: попередня DBG-команда ще виконується", srcName(fileSrc().id()));
   } else if (!strcasecmp(c, "eq")) {
     if (m.argc == 1) {
       eqShow();
@@ -318,7 +328,7 @@ void DebugCmds::handle(const proto::Msg& m) {
       LOGW(TAG, "DBG,failnext,<0..50>[,read|decode]");
       return;
     }
-    if (!g_sd.dbg(SdSource::Dbg::FailNext, (int)n | (dec ? 0x100 : 0))) LOGW(TAG, "SD: попередня DBG-команда ще виконується");
+    if (!fileSrc().dbg(SdSource::Dbg::FailNext, (int)n | (dec ? 0x100 : 0))) LOGW(TAG, "%s: попередня DBG-команда ще виконується", srcName(fileSrc().id()));
 #else
     LOGW(TAG, "DBG,failnext вимкнено (SKIP_TEST_CMDS=0)");
 #endif
@@ -328,7 +338,7 @@ void DebugCmds::handle(const proto::Msg& m) {
       LOGW(TAG, "DBG,resume[,clear]");
       return;
     }
-    if (!g_sd.dbg(clear ? SdSource::Dbg::ResumeClear : SdSource::Dbg::Resume, 0)) LOGW(TAG, "SD: попередня DBG-команда ще виконується");
+    if (!fileSrc().dbg(clear ? SdSource::Dbg::ResumeClear : SdSource::Dbg::Resume, 0)) LOGW(TAG, "%s: попередня DBG-команда ще виконується", srcName(fileSrc().id()));
   } else if (!strcasecmp(c, "boot") || !strcasecmp(c, "settings")) {
     // NVS пише лише loopTask: консоль ставить запит у скриньку (storage_dbg)
     const bool isBoot = !strcasecmp(c, "boot");
@@ -373,6 +383,19 @@ void DebugCmds::handle(const proto::Msg& m) {
          (unsigned)s.txMaxUs, (unsigned)s.mirrorMaxUs);
   } else if (!strcasecmp(c, "usb")) {
 #if ENABLE_USB_CH376
+    // M4b4: vscan / vlist[,N] / vtagn,<n> — підсумок скану, плейлист і ID3 треку №n активного USB-джерела (виконує app)
+    const bool vs = m.argc >= 2 && !strcasecmp(m.args[1], "vscan"), vl = m.argc >= 2 && !strcasecmp(m.args[1], "vlist"),
+               vt = m.argc >= 2 && !strcasecmp(m.args[1], "vtagn");
+    if (vs || vl || vt) {
+      long n = vl ? kDbgListDefault : 0;
+      if ((vl && m.argc >= 3 && (!toInt(m.args[2], n) || n < 0 || n > 65535)) || (vt && (m.argc != 3 || !toInt(m.args[2], n) || n < 1 || n > 65535)) ||
+          (vs && m.argc != 2) || (vl && m.argc > 3)) {
+        LOGW(TAG, "DBG,usb,vscan | DBG,usb,vlist[,0..65535] | DBG,usb,vtagn,<n ≥ 1>");
+        return;
+      }
+      if (!g_usb.dbg(vs ? SdSource::Dbg::Scan : vl ? SdSource::Dbg::List : SdSource::Dbg::Tag, (int)n)) LOGW(TAG, "usb: попередня DBG-команда ще виконується");
+      return;
+    }
     Ch376Diag::handle(m);
 #else
     LOGW(TAG, "DBG,usb вимкнено (ENABLE_USB_CH376=0)");
@@ -381,3 +404,4 @@ void DebugCmds::handle(const proto::Msg& m) {
     LOGW(TAG, "невідома DBG-команда '%s' (DBG,help)", c);
   }
 }
+

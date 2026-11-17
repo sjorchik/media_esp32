@@ -42,4 +42,13 @@ class IMedia {
   virtual void closeDir(int h) = 0;
   virtual IFileReader& reader() = 0;
   virtual void info(MediaInfo& out) = 0;
+  // M4b4. Ідентифікатор тому (серійний номер ФС) для резюме USB; 0 = немає/не використовується (SD).
+  virtual uint32_t volumeId() const { return 0; }
+  // M4b4. Короткий ексклюзивний доступ до чіпа (запис NVS зупиняє кеш флешу — у цей час передача по UART недопустима).
+  // Типово no-op (SD). Викликається з app; може блокувати не довше kUsbLockWaitMs.
+  // M4b4. Профіль скану (DBG,usb,vscan): what 0 = почати облік, 1 = зупинити, 2 = вивести в лог (wallMs/busyMs — час скану зі статистики Scanner). SD: no-op.
+  virtual void scanProfile(int what, uint32_t wallMs = 0, uint32_t busyMs = 0) { (void)what; (void)wallMs; (void)busyMs; }
+  virtual void ioLock() {}
+  virtual void ioUnlock() {}
 };
+

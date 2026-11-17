@@ -3,9 +3,14 @@
 #if ENABLE_USB_CH376
 
 #include <Arduino.h>
+#include <stdio.h>
 #include <string.h>
 
 #include <new>
+
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #include "SdFat.h"
 #include "usb/ch376.h"
@@ -16,6 +21,53 @@
 namespace {
 
 constexpr const char* TAG = "usb";
+
+// M4b4: один рекурсивний мʼютекс на весь USB-том (SdFat і UART чіпа не потокобезпечні). Створюється разом із синглтоном.
+SemaphoreHandle_t s_mtx = nullptr;
+bool s_profOn = false;                 // облік скану (profBegin/profEnd)
+uint32_t s_lkN = 0, s_lkUs = 0, s_lkMax = 0;
+struct Lk {
+  bool ok;
+  explicit Lk(uint32_t ms = kUsbLockWaitMs) : ok(false) {
+    if (!s_mtx) return;
+    if (!s_profOn) {
+      ok = xSemaphoreTakeRecursive(s_mtx, pdMS_TO_TICKS(ms)) == pdTRUE;
+      return;
+    }
+    const int64_t t = esp_timer_get_time();
+    ok = xSemaphoreTakeRecursive(s_mtx, pdMS_TO_TICKS(ms)) == pdTRUE;
+    const uint32_t d = (uint32_t)(esp_timer_get_time() - t);
+    s_lkN++;
+    s_lkUs += d;
+    if (d > s_lkMax) s_lkMax = d;
+  }
+  ~Lk() { if (ok) xSemaphoreGiveRecursive(s_mtx); }
+  Lk(const Lk&) = delete;
+  Lk& operator=(const Lk&) = delete;
+};
+
+// Час виконання операції під мʼютексом (після його захоплення); працює лише коли облік увімкнено.
+struct PT {
+  bool on;
+  int64_t t0;
+  uint32_t &n, &us;
+  uint32_t* mx;
+  PT(bool o, uint32_t& n_, uint32_t& us_, uint32_t* mx_ = nullptr) : on(o), t0(o ? esp_timer_get_time() : 0), n(n_), us(us_), mx(mx_) {}
+  ~PT() {
+    if (!on) return;
+    const uint32_t d = (uint32_t)(esp_timer_get_time() - t0);
+    n++;
+    us += d;
+    if (mx && d > *mx) *mx = d;
+  }
+};
+
+// Швидкість у «Мбод» для логу: 2000000 → "2", 1500000 → "1,5" (значення беруться з констант, а не з тексту).
+void fmtMbod(char* out, size_t cap, uint32_t baud) {
+  const unsigned w = (unsigned)(baud / 1000000u), f = (unsigned)((baud % 1000000u) / 100000u);
+  if (f) snprintf(out, cap, "%u,%u", w, f);
+  else snprintf(out, cap, "%u", w);
+}
 
 // Чіп і порт на залізі: Serial2 через ch376_uart, протокол через Ch376, сектори через Ch376Disk сеансу.
 class UartOpenHw final : public IUsbOpenHw {
@@ -95,15 +147,40 @@ class UartOpenHw final : public IUsbOpenHw {
 
 // ============================================================ UsbVolume
 
+UsbVolume::UsbVolume() : rd_(*this) {
+  if (!s_mtx) s_mtx = xSemaphoreCreateRecursiveMutex();
+}
+
 UsbVolume& UsbVolume::get() {
   static UsbVolume v;
   return v;
 }
 
-bool UsbVolume::present() const { return vol_ && ses_.isOpen() && ses_.dev()->present(); }
+bool UsbVolume::present() const {
+  Lk g;
+  return g.ok && vol_ && ses_.isOpen() && ses_.dev()->present();
+}
+
+bool UsbVolume::presentNoWait() const {
+  Lk g(0);
+  if (!g.ok) return true;  // чіп зайнятий обміном — пристрій явно відповідає
+  return vol_ && ses_.isOpen() && ses_.dev()->present();
+}
+
+bool UsbVolume::lockFor(uint32_t ms) { return s_mtx && xSemaphoreTakeRecursive(s_mtx, pdMS_TO_TICKS(ms)) == pdTRUE; }
+
+void UsbVolume::unlock() {
+  if (s_mtx) xSemaphoreGiveRecursive(s_mtx);
+}
 
 bool UsbVolume::open(UsbVolInfo& out) {
   out = UsbVolInfo{};
+  Lk lk;
+  if (!lk.ok) {
+    out.fail = UsbOpenFail::NoPort;
+    LOGW(TAG, "open: мʼютекс USB зайнятий довше %u мс", (unsigned)kUsbLockWaitMs);
+    return false;
+  }
   const uint32_t t0 = millis();
   if (vol_) {
     out.fail = UsbOpenFail::AlreadyOpen;
@@ -116,8 +193,11 @@ bool UsbVolume::open(UsbVolInfo& out) {
   for (uint8_t i = 0; i < in.nSteps; i++)
     LOGI(TAG, "open: крок %u: %u Бод → %s", (unsigned)(i + 1), (unsigned)in.steps[i].baud, ch376ErrName(in.steps[i].err));
   if (f == UsbOpenFail::None) {
-    LOGI(TAG, "open: самоперевірка 2 Мбод: %s (хеш сектора 0: 1 Мбод %08X, 2 Мбод %08X)", selfTestName(in.selfTest),
-         (unsigned)in.refHash, (unsigned)in.fastHash);
+    char mFast[10], mRef[10];
+    fmtMbod(mFast, sizeof mFast, kUsbBaudFast);
+    fmtMbod(mRef, sizeof mRef, kUsbBaudRef);
+    LOGI(TAG, "open: самоперевірка %s Мбод: %s (хеш сектора 0: %s Мбод %08X, %s Мбод %08X)", mFast, selfTestName(in.selfTest), mRef,
+         (unsigned)in.refHash, mFast, (unsigned)in.fastHash);
     dev_ = new (std::nothrow) Ch376SdDevice(*ses_.dev());
     vol_ = new (std::nothrow) FsVolume;
     if (!dev_ || !vol_) {
@@ -142,6 +222,8 @@ bool UsbVolume::open(UsbVolInfo& out) {
     return false;
   }
   out.baud = in.baud;
+  serial_ = in.serial;
+  out.serial = in.serial;
   out.selfTest = in.selfTest;
   out.partStart = in.partStart;
   out.partSectors = in.partSectors;
@@ -155,8 +237,19 @@ bool UsbVolume::open(UsbVolInfo& out) {
   return true;
 }
 
+void UsbVolume::closeDirs() {
+  for (int i = 0; i < kUsbDirHandles; i++) {
+    if (!dirs_[i]) continue;
+    if (dirs_[i]->isOpen()) dirs_[i]->close();
+    delete dirs_[i];
+    dirs_[i] = nullptr;
+  }
+}
+
 void UsbVolume::release() {
   fileClose();
+  closeDirs();
+  serial_ = 0;
   if (vol_) {
     vol_->end();
     delete vol_;
@@ -168,6 +261,7 @@ void UsbVolume::release() {
 }
 
 void UsbVolume::close() {
+  Lk lk;  // не вдалось (мʼютекс чужий довше kUsbLockWaitMs) — все одно закриваємо: виклик лише коли читачів немає
   if (!vol_ && !ses_.isOpen() && !ch376_uart::started()) return;
   release();
   UartOpenHw::stopChip();
@@ -176,6 +270,8 @@ void UsbVolume::close() {
 UsbLsRes UsbVolume::listDir(const char* path, uint32_t maxN, UsbLsFn fn, void* ctx, uint32_t& count, bool& more) {
   count = 0;
   more = false;
+  Lk lk;
+  if (!lk.ok) return UsbLsRes::Gone;
   if (!vol_) return UsbLsRes::NoVolume;
   if (!ses_.dev()->present()) return UsbLsRes::Gone;
   FsFile* dir = new (std::nothrow) FsFile;
@@ -224,10 +320,96 @@ UsbLsRes UsbVolume::listDir(const char* path, uint32_t maxN, UsbLsFn fn, void* c
   return res;
 }
 
+// ---- перелік каталогу по одному запису (M4b4)
+void UsbVolume::profBegin() {
+  Lk lk;
+  prof_ = UsbScanProf{};
+  s_lkN = s_lkUs = s_lkMax = 0;
+  base0_[0] = base0_[1] = base0_[2] = 0;
+  if (vol_ && ses_.isOpen()) {
+    const BlockDevStats& b = ses_.dev()->stats();
+    base0_[0] = b.calls;
+    base0_[1] = b.sectors;
+    base0_[2] = b.cmds;
+  }
+  prof_.on = true;
+  s_profOn = true;
+}
+
+void UsbVolume::profEnd() {
+  if (!prof_.on) return;
+  s_profOn = false;
+  prof_.on = false;
+  prof_.lockN = s_lkN;
+  prof_.lockWaitUs = s_lkUs;
+  prof_.lockWaitMaxUs = s_lkMax;
+  Lk lk;
+  if (vol_ && ses_.isOpen()) {
+    const BlockDevStats& b = ses_.dev()->stats();
+    prof_.calls = b.calls - base0_[0];
+    prof_.sectors = b.sectors - base0_[1];
+    prof_.cmds = b.cmds - base0_[2];
+  }
+}
+
+int UsbVolume::dirOpen(const char* path) {
+  Lk lk;
+  PT pt(prof_.on, prof_.openDirN, prof_.openDirUs, &prof_.openDirMaxUs);
+  if (!lk.ok || !vol_ || !ses_.dev()->present()) return -1;
+  for (int i = 0; i < kUsbDirHandles; i++) {
+    if (dirs_[i]) continue;
+    FsFile* d = new (std::nothrow) FsFile;
+    if (!d) return -1;
+    *d = vol_->open(path, O_RDONLY);
+    if (!d->isOpen() || !d->isDir()) {
+      if (d->isOpen()) d->close();
+      delete d;
+      return -1;
+    }
+    dirs_[i] = d;
+    return i;
+  }
+  return -1;
+}
+
+int UsbVolume::dirNext(int h, char* name, size_t cap, bool& nameOk, bool& isDir, bool& hidden) {
+  Lk lk;
+  PT pt(prof_.on, prof_.nextN, prof_.nextUs, &prof_.nextMaxUs);
+  if (!lk.ok || !vol_ || h < 0 || h >= kUsbDirHandles || !dirs_[h]) return -1;
+  if (!ses_.dev()->present()) {
+    if (prof_.on) prof_.errN++;
+    return -1;
+  }
+  FsFile ent;
+  if (!ent.openNext(dirs_[h], O_RDONLY)) {  // кінець каталогу або зникнення носія
+    const bool alive = ses_.dev()->present();
+    if (prof_.on) (alive ? prof_.endN : prof_.errN)++;
+    return alive ? 0 : -1;
+  }
+  if (prof_.on) prof_.entries++;
+  const size_t n = ent.getName(name, cap);
+  nameOk = n > 0 && n < cap;
+  if (!nameOk) name[0] = 0;
+  isDir = ent.isDir();
+  hidden = ent.isHidden();
+  ent.close();
+  return 1;
+}
+
+void UsbVolume::dirClose(int h) {
+  Lk lk;
+  PT pt(prof_.on, prof_.closeN, prof_.closeUs);
+  if (!lk.ok || h < 0 || h >= kUsbDirHandles || !dirs_[h]) return;
+  if (dirs_[h]->isOpen()) dirs_[h]->close();
+  delete dirs_[h];
+  dirs_[h] = nullptr;
+}
+
 bool UsbVolume::fileOpen(const char* path, uint32_t& size) {
+  Lk lk;
   fileClose();
   size = 0;
-  if (!vol_ || !ses_.dev()->present()) return false;
+  if (!lk.ok || !vol_ || !ses_.dev()->present()) return false;
   FsFile* f = new (std::nothrow) FsFile;
   if (!f) return false;
   *f = vol_->open(path, O_RDONLY);
@@ -243,18 +425,26 @@ bool UsbVolume::fileOpen(const char* path, uint32_t& size) {
 }
 
 int UsbVolume::fileRead(void* dst, size_t n) {
+  Lk lk;
+  if (!lk.ok) return -1;
   if (!file_ || !dst || !ses_.dev()->present()) return -1;
   return file_->read(dst, n);
 }
 
 bool UsbVolume::fileSeek(uint32_t pos) {
+  Lk lk;
+  if (!lk.ok) return false;
   if (!file_ || !ses_.dev()->present()) return false;
   return file_->seekSet(pos);
 }
 
-bool UsbVolume::fileIsOpen() const { return file_ && file_->isOpen(); }
+bool UsbVolume::fileIsOpen() const {
+  Lk lk;
+  return lk.ok && file_ && file_->isOpen();
+}
 
 void UsbVolume::fileClose() {
+  Lk lk;
   if (!file_) return;
   if (file_->isOpen()) file_->close();
   delete file_;
@@ -305,3 +495,4 @@ bool UsbFileReader::seek(uint32_t p) {
 }
 
 #endif  // ENABLE_USB_CH376
+

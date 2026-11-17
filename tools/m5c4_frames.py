@@ -421,12 +421,34 @@ def sc_src_usb(ctx):
     """SRC,usb без носія → STATE,usb,idle + ERR,no_media (Q1); повтор → лише ERR,no_media (Q7)."""
     if ctx.base.get("usb") == "1":
         return SKIP, "USB-носій змонтовано (збірка з CH376S?) — сценарій для usb=0"
+    if ctx.args.usb_flash:  # M4b4: збірка esp32dev_usb з флешкою — SRC,usb відкриває том і скануює
+        try:
+            fr = cmd(ctx, "SRC,usb", first_wait=8.0, quiet=1.5, max_wait=30.0)
+            names = [f.name for f in fr]
+            if "ERR" in names:
+                return FAIL, "SRC,usb з флешкою дав ERR: " + fmt(fr)
+            st = [f for f in fr if f.name == "STATE" and f.args and f.args[0] == "usb"]
+            if not st:
+                return FAIL, "немає STATE,usb,*: " + fmt(fr)
+            time.sleep(6.0)  # скан + старт
+            media = [f for f in ctx.rx.since(0) if f.name == "MEDIA"][-1].args
+            if media[1] != "1":
+                return FAIL, "після скану очікувалось MEDIA usb=1, отримано " + ",".join(media)
+            send(ctx, "SRC,off")
+            time.sleep(2.0)
+            media = [f for f in ctx.rx.since(0) if f.name == "MEDIA"][-1].args
+            if media[1] != "0":
+                return FAIL, "після SRC,off очікувалось MEDIA usb=0, отримано " + ",".join(media)
+            return PASS, "SRC,usb з флешкою: STATE,usb,..., MEDIA usb=1 після скану, 0 після SRC,off"
+        finally:
+            send(ctx, "SRC,off")
+            settle(ctx, 1.0)
     try:
-        fr = cmd(ctx, "SRC,usb")
+        fr = cmd(ctx, "SRC,usb", first_wait=8.0, quiet=1.0, max_wait=15.0)  # відкриття без флешки ≈3 с
         ok, d = expect(fr, [("STATE", ["usb", "idle", ctx.base["shuf"], ctx.base["rep"]]), ("ERR", ["no_media"])])
         if not ok:
             return FAIL, "SRC,usb: " + d
-        ok, d = expect(cmd(ctx, "SRC,usb"), [("ERR", ["no_media"])])
+        ok, d = expect(cmd(ctx, "SRC,usb", first_wait=8.0, quiet=1.0, max_wait=15.0), [("ERR", ["no_media"])])  # повтор пробує відкрити том знову (≈3 с)
         if not ok:
             return FAIL, "повторне SRC,usb: " + d
         return PASS, "SRC,usb без носія → STATE,usb,idle + ERR,no_media; повтор → лише ERR,no_media"
@@ -648,6 +670,7 @@ def main(argv=None):
     ap.add_argument("--only", help="імена сценаріїв через кому (precond додається автоматично)")
     ap.add_argument("--list", action="store_true", help="показати сценарії й вийти")
     ap.add_argument("--usb-expected", type=int, default=0, choices=(0, 1), help="очікуване MEDIA usb (0 без CH376S)")
+    ap.add_argument("--usb-flash", action="store_true", help="M4b4: у гнізді CH376S є флешка з mp3 (сценарій src_usb перевіряє відкриття, скан і MEDIA usb)")
     ap.add_argument("--expect-title", help="очікувана назва треку (імʼя файлу без .mp3) для сценарію meta_escape")
     ap.add_argument("--max-next", type=int, default=5, help="скільки разів NEXT шукати трек для meta_escape")
     args = ap.parse_args(argv)
@@ -707,4 +730,5 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+
 

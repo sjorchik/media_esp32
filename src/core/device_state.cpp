@@ -36,6 +36,12 @@ void DeviceState::setSd(bool sd) {
   portEXIT_CRITICAL(&s_mux);
 }
 
+void DeviceState::setUsb(bool usb) {
+  portENTER_CRITICAL(&s_mux);
+  s_usb = usb;
+  portEXIT_CRITICAL(&s_mux);
+}
+
 bool DeviceState::btConnected() { return s_bt; }
 
 void DeviceState::btName(char* out, size_t cap) {
@@ -53,3 +59,4 @@ void DeviceState::setBt(bool connected, const char* name) {
   s_btName[sizeof s_btName - 1] = 0;
   portEXIT_CRITICAL(&s_mux);
 }
+

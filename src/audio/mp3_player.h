@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "audio/level.h"
 #include "config.h"
 #include "media/id3.h"
 #include "media/ifile_reader.h"
@@ -31,7 +32,11 @@ class Mp3Player {
   enum class Ev : uint8_t { None, Eof, ReadFail, DecodeFail };
   enum class St : uint8_t { Idle, Run, Paused };
 
+  // M4b4: ОДИН екземпляр на всі файлові джерела (SD, USB): задача mp3 одна, її стек і буфери — у PcmArena. init() повторюють при
+  // кожній активації джерела (читач і слот рівня міняються лише коли сесії немає).
   void init(AudioOut& out, IFileReader& rd) { out_ = &out; rd_ = &rd; }
+  void setFillMax(uint32_t n) { fillMax_ = n; }  // M4b4: ліміт байтів за одне докачування входу (0 = до повного буфера)
+  void setLevelSlot(level::Slot s) { lvSlot_ = (uint8_t)s; }  // слот цифрового рівня шляху PCM (за замовчуванням Sd)
   bool start();                       // створює задачу (один раз); вимагає PcmArena=Sd
   void startSession() { startSessionAt(0, 0); }   // файл уже відкрито (pos 0); асинхронно
   // M5b1: старт із відновленням. off = байтовий зсув початку кадру (0 = з початку), ms = пройдений час.
@@ -104,6 +109,8 @@ class Mp3Player {
 
   AudioOut* out_ = nullptr;
   IFileReader* rd_ = nullptr;
+  volatile uint32_t fillMax_ = 0;                        // M4b4
+  volatile uint8_t lvSlot_ = (uint8_t)level::Slot::Sd;   // M4b4
   volatile St st_ = St::Idle;
   volatile uint8_t req_ = 0;
   volatile Ev ev_ = Ev::None;
@@ -124,4 +131,5 @@ class Mp3Player {
   volatile uint8_t inj_ = 0;           // Ev штучної помилки (0 = нема)
 #endif
 };
+
 
