@@ -219,6 +219,26 @@ inline constexpr uint32_t kCh376RawReadSecMax = 8;       // rawread: секто�
 inline constexpr uint32_t kCh376RawPreUnitMax = 8192;    // rawpre: байтів у пакеті випереджального читання (стеля)
 static_assert(kCh376RawChunkDef >= 1 && kCh376RawPeriodDefUs >= 1000, "параметри rawseq");
 
+// ---- CH376S (M4b3): SdFat-том над сирими секторами (usb/ch376_blockdev.*, usb_volume*.*, usb_volume_diag.*) ----
+inline constexpr uint32_t kCh376SectorsPerCmd = 8;        // секторів на одну DISK_READ у блочному пристрої (за виміром M4b2; N=255 не використовувати)
+inline constexpr uint32_t kCh376MinPlayBaud = 1000000;    // мінімальна швидкість для відтворення; нижче — open() відмовляє з логом
+inline constexpr uint32_t kUsbBaudRef = 1000000;          // еталонна швидкість для самоперевірки (резерв)
+inline constexpr uint32_t kUsbBaudFast = 2000000;         // робоча швидкість (K=0xFD)
+inline constexpr uint32_t kUsbLsDef = 40;                 // vls: записів типово
+inline constexpr uint32_t kUsbLsMax = 1000;               // vls: стеля записів
+inline constexpr size_t   kUsbIoChunk = 1024;             // vread: шматок читання (≈1 КБ, як у плеєра; без додаткового кешу)
+inline constexpr uint32_t kUsbReadKbDef = 512;            // vread: КБ типово
+inline constexpr uint32_t kUsbSeqKbDef = 256;             // vseq: КБ типово (0 у команді = до кінця файлу)
+inline constexpr uint32_t kUsbKbMax = 65535;              // vread/vseq: стеля КБ
+inline constexpr uint32_t kUsbReadMeasMs = 120000;        // vread: стеля часу, мс (5 МБ при 61 КБ/с ≈ 85 с)
+inline constexpr uint32_t kUsbSeqMeasMs = 900000;         // vseq: стеля часу, мс (трек 5 хв і довше; консоль зайнята весь цей час)
+inline constexpr size_t   kUsbLogChunk = 120;             // довге імʼя в логу ріжеться шматками по стільки байтів (рядок логу ≤ 192 Б)
+static_assert(kCh376SectorsPerCmd >= 1 && kCh376SectorsPerCmd <= 8, "kCh376SectorsPerCmd: 1..8 (M4b2: більше не використовувати)");
+static_assert(kCh376SectorsPerCmd <= kCh376DiskMaxSectors, "секторів на команду ≤ ліміту чіпа");
+static_assert(kCh376MinPlayBaud <= kUsbBaudRef && kUsbBaudRef <= kUsbBaudFast, "швидкості: мін ≤ еталон ≤ робоча");
+static_assert(kUsbIoChunk >= 64 && kUsbIoChunk <= 4096, "kUsbIoChunk: 64..4096");
+static_assert(kUsbLogChunk >= 32 && kUsbLogChunk <= 150, "kUsbLogChunk: 32..150 (рядок ≤ 192 Б з префіксом)");
+
 // ---- Аудіо ----
 inline constexpr uint32_t kDefaultRate = 44100;
 inline constexpr uint32_t kFadeMs = 8;          // fade-in / хвіст fade-out
@@ -404,5 +424,3 @@ inline constexpr int kPrioDecoder = 5;   // нижче за audio (6), вище 
 
 // ---- Діагностика ----
 inline constexpr uint32_t kDiagPeriodMs = 60000;
-
-

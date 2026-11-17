@@ -43,8 +43,8 @@
 
 - `esp32dev` — **реліз** (за замовчуванням). `BOOT_TEST_CMDS=0`, `SKIP_TEST_CMDS=0`.
 - `esp32dev_test` — стенд. Успадковує `esp32dev` і додає `-DBOOT_TEST_CMDS=1 -DSKIP_TEST_CMDS=1`. Не для релізу.
-- `esp32dev_usb` — стенд CH376S: успадковує `esp32dev_test` і додає `-DENABLE_USB_CH376=1`. Не для релізу.
-- `native` — юніт-тести (`pio test -e native`). Збирає `proto/frame`, `proto/cmd_args`, `media/id3`, `media/shuffle`, `storage/resume_record`, `storage/settings_record`, `storage/boot_guard`, `usb/ch376`, `usb/ch376_fs`, `usb/ch376_file_reader`.
+- `esp32dev_usb` — стенд CH376S: успадковує `esp32dev_test` і додає `-DENABLE_USB_CH376=1` та `-DUSE_BLOCK_DEVICE_INTERFACE=1` (M4b3: власний блочний пристрій для SdFat). Не для релізу.
+- `native` — юніт-тести (`pio test -e native`). Збирає `proto/frame`, `proto/cmd_args`, `media/id3`, `media/shuffle`, `storage/resume_record`, `storage/settings_record`, `storage/boot_guard`, `usb/ch376`, `usb/ch376_fs`, `usb/ch376_file_reader`, `usb/ch376_disk`, `usb/disk_probe`, `usb/ch376_blockdev`, `usb/usb_volume_core`.
 
 Команди (COM-порт підставити свій):
 
@@ -191,6 +191,10 @@ SdFat не потокобезпечний: усі виклики серіалі�
 | `DBG,usb,cmd,<hex>[,<hex арг>]` | Довільна команда чіпа (до 4 аргументів): статус, рівень INT, дані RD_USB_DATA0 (напр. `3F` DISK_QUERY) |
 | `DBG,usb,sec,<LBA>[,<блок>]` | Сирий сектор через DISK_READ (блоки по 64 Б), для розбору розкладки тому |
 | `DBG,usb,mode,<4..7>` | SET_USB_MODE з консолі (7 = скид шини USB, 6 = host з SOF); після цього потрібен mount (`cmd,31`). У `trace` рядки F — байти, відкинуті очищенням RX |
+| `DBG,usb,mount` / `DBG,usb,umount` | M4b3: SdFat-том над сирими секторами: 1 Мбод → 2 Мбод із самоперевіркою хешу сектора 0, розділ (MBR/GPT), ФС, мітка, кластер, heap до/після. `umount` звільняє все й закриває порт. Не змішувати з `init`/`stop` |
+| `DBG,usb,vls[,<каталог>[,N]]` | M4b3: перелік через SdFat з довгими (UTF-8) іменами, тип, розмір; N типово 40 |
+| `DBG,usb,vread,<шлях>[,<КБ>]` / `DBG,usb,vseq,<шлях>[,<КБ>]` | M4b3: КБ/с і час шматка (1 КБ) / читання «як у плеєра» (1045 Б кожні 26,1 мс); для `vseq` КБ = 0 — весь файл |
+| `DBG,usb,vtag,<шлях>` | M4b3: ID3 (початок і кінець файлу) через SdFat |
 | `DBG,failnext,<n>[,read\|decode]` | **[test]** Наступні n стартів треку штучно завершуються збоєм |
 
 Приклад (реліз, `esp32dev`): `DBG,failnext,1` → `DBG,failnext вимкнено (SKIP_TEST_CMDS=0)`.

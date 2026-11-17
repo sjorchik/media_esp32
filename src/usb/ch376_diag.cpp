@@ -15,6 +15,7 @@
 #include "usb/ch376_fs.h"
 #include "usb/ch376_uart.h"
 #include "usb/ch376_diag_disk.h"
+#include "usb/usb_volume_diag.h"
 #include "util/diag.h"
 #include "util/log.h"
 
@@ -60,6 +61,7 @@ void usbHelp() {
   LOGI(TAG, "baud | baud,<бод>,<K hex> | baudraw,<C hex>,<K hex>[,<бод>]");
   LOGI(TAG, "trace,on|off|dump | gap[,<мкс>] | fopen,<імʼя> | cmd,<hex>[,<hex арг>] | mode,<4..7>");
   LOGI(TAG, "ls[,<каталог>] | read,<шлях>[,<КБ>] | seek,<шлях>,<зсув>[,<N>] | seq,<шлях>[,<КБ>] | wait[,int|poll]");
+  LOGI(TAG, "mount | umount | vls[,<каталог>[,N]] | vread,<шлях>[,<КБ>] | vseq,<шлях>[,<КБ>] | vtag,<шлях> (M4b3, SdFat)");
   LOGI(TAG, "K hex 00..FF, швидкість 6000000/(256-K), C — перший байт (звичайно 03)");
 }
 
@@ -746,11 +748,9 @@ void Ch376Diag::handle(const proto::Msg& m) {
     usbBaudRaw((uint8_t)c, (uint8_t)k, (uint32_t)nb);
   } else if (!strcasecmp(s, "stop") && m.argc == 2) {
     usbStop();
-  } else if (!Ch376DiagDisk::handle(m)) {  // M4b2: rawread|part|rawspeed|rawseq|rawpre|rawcfg
+  } else if (!Ch376DiagDisk::handle(m) && !UsbVolDiag::handle(m)) {  // M4b2: rawread|part|rawspeed|rawseq|rawpre|rawcfg; M4b3: mount|umount|vls|vread|vseq|vtag
     usbHelp();
   }
 }
 
 #endif  // ENABLE_USB_CH376
-
-

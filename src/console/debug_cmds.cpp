@@ -77,6 +77,9 @@ void help() {
   LOGI(TAG, "DBG,usb,rawseq,<LBA>[+зсув],<КБ>[,<байт>[,<мс>]] — як у плеєра");
   LOGI(TAG, "DBG,usb,rawpre,<LBA>,<КБ>,<пакет Б>,<кадрів> — випереджальне читання");
   LOGI(TAG, "DBG,usb,rawcfg[,settle|skip|wait|spc,<значення>] — налаштування");
+  LOGI(TAG, "DBG,usb,mount | DBG,usb,umount — SdFat-том над сирими секторами: швидкість, розділ, ФС, мітка, heap (M4b3)");
+  LOGI(TAG, "DBG,usb,vls[,<каталог>[,N]] — перелік з довгими іменами (UTF-8) | DBG,usb,vtag,<шлях> — ID3 (початок і кінець файлу)");
+  LOGI(TAG, "DBG,usb,vread,<шлях>[,<КБ>] — швидкість читання через SdFat | DBG,usb,vseq,<шлях>[,<КБ>, 0 = весь файл] — «як у плеєра»");
 #endif
 #if SKIP_TEST_CMDS
   LOGI(TAG, "DBG,failnext,<n>[,read|decode] — наступні n стартів треку штучно завершуються read_fail (типово) або decode_fail");
@@ -378,9 +381,3 @@ void DebugCmds::handle(const proto::Msg& m) {
     LOGW(TAG, "невідома DBG-команда '%s' (DBG,help)", c);
   }
 }
-
-
-
-
-
-
