@@ -6,18 +6,33 @@
 #include "media/scanner.h"
 #include "media/shuffle.h"
 #include "sources/isource.h"
+#include "sources/src_profile.h"
+#include "sources/usb_media_policy.h"
+
+// Профіль джерела (M4b4): у збірці без USB — константа SD (код як до M4b4), інакше — поле екземпляра.
+#if ENABLE_USB_CH376
+#define SRCPROF_(f) (prof_.f)
+#else
+#define SRCPROF_(f) (kSdProfile.f)
+#endif
 
 // SD-джерело: hot-plug, скан, плейлист (M3a); відтворення MP3 (M3b); навігація, repeat, події треку,
 // обробка помилок відтворення (M3c); ID3-теги в META (M3d); shuffle без повторів та історія для PREV (M5a, media/shuffle);
 // резюме треку й позиції в NVS (M5b1, storage/resume_store); hot-plug SD: виймання/вставлення/дубль, відкладений вердикт
 // збою читання, сторожа «play без сесії» (M5c3).
 // Працює через IMedia&, тому про SD не знає. Усе (скан, DBG-завдання) виконується в задачі app порціями.
+// M4b4: той самий клас обслуговує USB (UsbSource = SdSource + kUsbProfile + UsbMedia): профіль задає id, ключ резюме, слот
+// рівня й чи саме джерело відкриває носій. Декодер Mp3Player — один спільний екземпляр (задача mp3 одна).
 class SdSource : public ISource {
  public:
   enum class Dbg : uint8_t { None, Info, Scan, List, Read, Play, Decode, Nav, Tag, Shuf, ShufTest, Resume, ResumeClear, FailNext };
 
-  explicit SdSource(IMedia& media) : media_(media) {}
-  SrcId id() const override { return SrcId::SD; }
+#if ENABLE_USB_CH376
+  SdSource(IMedia& media, Mp3Player& dec, const SrcProfile& prof = kSdProfile) : media_(media), dec_(dec), prof_(prof) {}
+#else
+  SdSource(IMedia& media, Mp3Player& dec) : media_(media), dec_(dec) {}
+#endif
+  SrcId id() const override { return SRCPROF_(id); }
   bool begin() override;
   Res activate() override;
   void deactivate() override;
@@ -35,6 +50,9 @@ class SdSource : public ISource {
   void idleLoop(uint32_t nowMs) override { service(nowMs); }
   void emitInfo() override;
   Res refreshMedia() override;
+#if ENABLE_USB_CH376
+  Res retryMedia() override;  // M4b4: повторне SRC,usb без тому — спроба відкрити його знову (виявлення вставлення — M4c)
+#endif
 
   // DBG (з будь-якої задачі): лише ставить запит; виконує app. false = попереднє ще виконується.
   // FailNext: arg = n (0..255) | 0x100 для decode_fail (інакше read_fail); потрібен SKIP_TEST_CMDS=1.
@@ -65,6 +83,9 @@ class SdSource : public ISource {
   void scanStep();
   void finishScan(Scanner::St r);
   void scanFailed();                       // M5c3: повтор скану або idle (після відкладеного вердикту)
+#if ENABLE_USB_CH376
+  void applyStep(const MediaStep& s, bool emit);  // M4b4: виконати крок політики USB-носія (прапорець MEDIA, закриття тому)
+#endif
   void susStep(uint32_t now);              // M5c3: кінець очікування Removed → звичайна обробка збою
   void stopJobs();
   void runDbg();
@@ -108,6 +129,11 @@ class SdSource : public ISource {
   void pushMeta();                         // META лише якщо відрізняється від уже показаного
 
   IMedia& media_;
+  Mp3Player& dec_;                         // M4b4: спільний декодер (не член: задача mp3 одна на SD і USB)
+#if ENABLE_USB_CH376
+  const SrcProfile& prof_;
+  UsbMediaPolicy pol_;                     // лише для prof_.ownsMount
+#endif
   Playlist pl_;
   Scanner scanner_;
   PlayState st_ = PlayState::Idle;
@@ -127,7 +153,6 @@ class SdSource : public ISource {
   uint8_t errRun_ = 0;                     // помилок відтворення підряд
   uint8_t failN_ = 0;                      // M5c1: скільки наступних стартів треку штучно завершити помилкою (SKIP_TEST_CMDS)
   uint8_t failMode_ = 0;                   // 0 = read_fail, 1 = decode_fail
-  Mp3Player dec_;
   uint32_t nextTimeAt_ = 0, infoSeq_ = 0;
   uint16_t tagTrack_ = 0xFFFF;             // для якого треку чинні dec_.tags() (0xFFFF = ні)
   uint32_t tagSeqSeen_ = 0;                // останній забраний dec_.tagSeq()
@@ -148,3 +173,4 @@ class SdSource : public ISource {
   bool rdOpen_ = false;
   uint32_t rdBytes_ = 0, rdBusyUs_ = 0, rdT0_ = 0;
 };
+

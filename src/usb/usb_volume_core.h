@@ -74,6 +74,7 @@ struct UsbOpenInfo {
   uint8_t partIndex = 0;               // 1..4 — запис MBR; 0 — без таблиці або перший запис GPT
   char label[12] = {0};                // мітка тому з BPB (FAT); для exFAT порожня
   VolKind kind = VolKind::None;
+  uint32_t serial = 0;                 // M4b4: серійний номер тому (BPB/exFAT) — привʼязка резюме до флешки; 0 = невідомий
   DiskErr diskErr = DiskErr::Ok;       // остання помилка диска
   Ch376Err chipErr = Ch376Err::Ok;     // остання помилка чіпа
   UsbStep steps[kUsbStepsMax];
@@ -117,3 +118,4 @@ class UsbSession {
   Ch376BlockDev* bd_ = nullptr;
   UsbOpenInfo info_;
 };
+

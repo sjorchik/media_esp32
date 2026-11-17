@@ -10,8 +10,9 @@
 #include "usb/usb_volume_core.h"
 
 // USB-том на SdFat над сирими секторами CH376S (M4b3). Увесь стан SdFat (FsVolume, FsFile) — на heap від open() до close();
-// статично лише вказівники й UsbOpenInfo (≈0,15 КБ). Один відкритий файл одночасно. Мʼютекса немає: усі виклики з однієї
-// задачі (консоль); для плеєра в наступних завданнях потрібне серіалізування, як у SdMedia.
+// статично лише вказівники й UsbOpenInfo (≈0,15 КБ). Один відкритий файл одночасно.
+// M4b4: усі публічні виклики серіалізуються одним рекурсивним мʼютексом (як у SdMedia): app (відкриття, скан, ID3 у DBG),
+// задача mp3 (читання файлу під час відтворення), консоль (DBG,usb,*). Очікування — до kUsbLockWaitMs.
 class FsVolume;
 class FsFile;
 class Ch376SdDevice;
@@ -27,6 +28,7 @@ struct UsbVolInfo {
   uint32_t clusterBytes = 0;
   char label[12] = {0};
   uint32_t openMs = 0;
+  uint32_t serial = 0;         // M4b4: серійний номер тому (BPB/exFAT); 0 = невідомий
 };
 
 struct UsbDirEntry {
@@ -55,6 +57,17 @@ class UsbFileReader final : public IFileReader {
   bool failed_ = false;
 };
 
+// M4b4: профіль перелічення каталогів під час скану (DBG,usb,vscan). Облік увімкнено лише між profBegin() і profEnd().
+struct UsbScanProf {
+  bool on = false;
+  uint32_t openDirN = 0, openDirUs = 0, openDirMaxUs = 0;
+  uint32_t nextN = 0, nextUs = 0, nextMaxUs = 0;   // виклики dirNext = FsFile::openNext
+  uint32_t entries = 0, endN = 0, errN = 0;        // dirNext: 1 = запис, 0 = кінець каталогу, -1 = помилка
+  uint32_t closeN = 0, closeUs = 0;
+  uint32_t lockN = 0, lockWaitUs = 0, lockWaitMaxUs = 0;  // очікування мʼютекса (лише всередині openDir/openNext/closeDir і читань під час скану)
+  uint32_t calls = 0, sectors = 0, cmds = 0;       // блочний пристрій: різниця за час скану
+};
+
 class UsbVolume {
  public:
   static UsbVolume& get();
@@ -66,7 +79,10 @@ class UsbVolume {
   void close();
 
   bool isOpen() const { return vol_ != nullptr; }
-  bool present() const;  // том відкрито і пристрій не «відсутній»
+  bool present() const;  // том відкрито і пристрій не «відсутній» (бере мʼютекс; не вдалось — false)
+  // M4b4: те саме без очікування — для poll() у app: якщо чіп зайнятий читанням (мʼютекс чужий), вважаємо «присутній».
+  bool presentNoWait() const;
+  uint32_t serial() const { return serial_; }  // серійний номер відкритого тому (0 — немає/невідомий)
   const UsbOpenInfo* openInfo() const { return vol_ ? &ses_.info() : nullptr; }
   Ch376BlockDev* blockDev() { return ses_.dev(); }
   Ch376SdDevice* sdDevice() { return dev_; }
@@ -81,16 +97,35 @@ class UsbVolume {
   bool fileIsOpen() const;
   void fileClose();
 
+  // M4b4: перелік каталогу по одному запису (для IMedia::openDir/nextEntry). Хендли — FsFile на heap від dirOpen до dirClose,
+  // до kUsbDirHandles одночасно. dirNext: 1 = запис, 0 = кінець, -1 = помилка/носій зник. name — буфер kMediaNameMax.
+  int dirOpen(const char* path);
+  int dirNext(int h, char* name, size_t cap, bool& nameOk, bool& isDir, bool& hidden);
+  void dirClose(int h);
+
+  void profBegin();
+  void profEnd();
+  const UsbScanProf& prof() const { return prof_; }
+
+  // M4b4: ексклюзивний доступ до чіпа ззовні (запис NVS зупиняє кеш флешу: UART-обмін у цей час недопустимий).
+  bool lockFor(uint32_t ms);
+  void unlock();
+
   UsbFileReader& reader() { return rd_; }
 
  private:
-  UsbVolume() : rd_(*this) {}
+  UsbVolume();
   void release();
+  void closeDirs();
 
   UsbSession ses_;
   Ch376SdDevice* dev_ = nullptr;
   FsVolume* vol_ = nullptr;
   FsFile* file_ = nullptr;
+  FsFile* dirs_[kUsbDirHandles] = {};
+  uint32_t serial_ = 0;
+  UsbScanProf prof_;
+  uint32_t base0_[3] = {0, 0, 0};  // BlockDevStats (calls, sectors, cmds) на початок скану
   UsbFileReader rd_;
 };
 
@@ -98,3 +133,4 @@ class UsbVolume {
 static_assert(sizeof(UsbOpenInfo) <= 160, "UsbOpenInfo завеликий для статичної памʼяті");
 
 #endif  // ENABLE_USB_CH376
+

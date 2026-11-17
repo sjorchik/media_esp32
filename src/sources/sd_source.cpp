@@ -11,13 +11,13 @@
 #include "core/device_state.h"
 #include "core/events.h"
 #include "storage/resume_store.h"
+#include "storage/resume_vol.h"
 #include "util/diag.h"
 #include "util/log.h"
 #include "util/utf8.h"
 
 namespace {
 
-constexpr const char* TAG = "sdsrc";
 // Код з контракту. Якщо в proto::errc є відповідна константа — замінити.
 constexpr const char* kErrTooMany = "too_many_files";
 constexpr int kListPerSlice = 12;
@@ -54,6 +54,13 @@ const char* scanStName(Scanner::St s) {
 
 }  // namespace
 
+#define TAG SRCPROF_(tag)  // M4b4: тег логу з профілю (SD: "sdsrc", USB: "usbsrc")
+#if ENABLE_USB_CH376
+#define SRC_IS_USB (prof_.ownsMount)
+#else
+#define SRC_IS_USB false
+#endif
+
 // ============================================================ життєвий цикл
 
 bool SdSource::begin() {
@@ -61,19 +68,27 @@ bool SdSource::begin() {
   dec_.init(g_audio, media_.reader());
   bool ok = media_.begin();
   media_.poll(millis());  // початковий mount; події не шлемо — MEDIA піде з HELLO/GET
-  DeviceState::setSd(media_.mounted());  // M5c4b: usb не зберігаємо
-  LOGI(TAG, "begin: картка %s", media_.mounted() ? "є" : "немає");
+  if (!SRC_IS_USB) DeviceState::setSd(media_.mounted());  // M5c4b: usb не зберігаємо; USB-том відкриває activate()
+  LOGI(TAG, "begin: %s %s", SRC_IS_USB ? "флешка" : "картка", media_.mounted() ? "є" : "немає");
   return ok;
 }
 
 Res SdSource::activate() {
   if (!PcmArena::acquire(PcmArena::Owner::Sd)) return Res::BadState;  // область ще у BT: порядок порушено
+#if ENABLE_USB_CH376
+  dec_.init(g_audio, media_.reader());  // M4b4: спільний декодер → читач і слот рівня цього джерела (сесії зараз нема)
+  dec_.setLevelSlot(prof_.slot);
+  dec_.setFillMax(prof_.ownsMount ? (uint32_t)kUsbFillMaxBytes : 0);  // USB: короткі докачування (≈18 мс замість ≈65 мс)
+#endif
   if (!dec_.start()) {                                                // задача mp3 (створюється один раз)
     PcmArena::release(PcmArena::Owner::Sd);
     return Res::DecodeFail;
   }
   active_ = true;
   scanRetry_ = 0;
+#if ENABLE_USB_CH376
+  if (prof_.ownsMount && !media_.mounted()) pol_.mountResult(media_.mount());  // USB: відкрити том (до ≈3 с без флешки)
+#endif
   if (!media_.mounted()) {
     st_ = PlayState::Idle;
     LOGI(TAG, "activate: носія немає");
@@ -89,6 +104,11 @@ void SdSource::deactivate() {
   stopJobs();      // скан, DBG-читання, сесія декодера; після цього файл закрито
   active_ = false;
   st_ = PlayState::Idle;
+#if ENABLE_USB_CH376
+  if (prof_.ownsMount) applyStep(pol_.deactivate(), true);  // M4b4: MEDIA usb → 0, том і драйвер закрито
+  pl_.clear();      // арена плейлиста спільна для SD і USB: наступне джерело скануватиме її заново
+  scanned_ = false;
+#endif
   PcmArena::release(PcmArena::Owner::Sd);  // область вільна для BT
 }
 
@@ -116,7 +136,7 @@ void SdSource::service(uint32_t now) {
 // NVS-резюме тут не пишеться. Помилки читання від зниклої картки не рахуються (див. sus_). BT активне: лише MEDIA.
 void SdSource::onMedia(MediaEvent ev) {
   const bool ins = ev == MediaEvent::Inserted;
-  if (ins == DeviceState::sd()) {  // Inserted при вже змонтованому / Removed при вже відсутньому
+  if (!SRC_IS_USB && ins == DeviceState::sd()) {  // Inserted при вже змонтованому / Removed при вже відсутньому (USB: UsbMedia дубля не дає)
     if (ins) insDup_++;
     else remDup_++;
     LOGI(TAG, "картка: дубль %s ігноровано (state=%s)", ins ? "Inserted" : "Removed", stateName(st_));
@@ -134,10 +154,19 @@ void SdSource::onMedia(MediaEvent ev) {
     g_audio.mute();
     st_ = PlayState::Idle;
   }
+#if ENABLE_USB_CH376
+  if (prof_.ownsMount) {
+    applyStep(pol_.removed(), false);  // MEDIA піде з onMediaChanged(); том і драйвер закриваємо тут — сесії вже нема
+    media_.unmount();
+  } else {
+    DeviceState::setSd(ins);
+  }
+#else
   DeviceState::setSd(ins);
-  LOGI(TAG, "картку %s", ins ? "вставлено" : "вийнято");
-  g_sources.onMediaChanged();  // MEDIA, refreshMedia() активного SD, STATE
-  Diag::logHeap("sd-media");
+#endif
+  LOGI(TAG, "%s %s", SRC_IS_USB ? "флешку" : "картку", ins ? "вставлено" : "вийнято");
+  g_sources.onMediaChanged();  // MEDIA, refreshMedia() активного джерела, STATE
+  Diag::logHeap(SRC_IS_USB ? "usb-media" : "sd-media");
 }
 
 Res SdSource::refreshMedia() {
@@ -151,6 +180,29 @@ Res SdSource::refreshMedia() {
   if (st_ == PlayState::Idle) startScan();  // картку вставили при активному SD
   return Res::Ok;
 }
+
+#if ENABLE_USB_CH376
+// M4b4: виконує крок політики USB-носія. emit=false, коли MEDIA надішле менеджер (onMediaChanged).
+void SdSource::applyStep(const MediaStep& s, bool emit) {
+  if (s.flagChanged) {
+    DeviceState::setUsb(s.flag);
+    if (emit) Events::media(DeviceState::sd(), DeviceState::usb());
+  }
+  if (s.release) media_.unmount();
+}
+
+// Повторне SRC,usb для активного джерела без тому (Q7: без носія команда дає лише ERR,no_media, але новий том ловимо тут,
+// бо виявлення вставлення, поки USB неактивний, — завдання M4c). Ok → скан розпочато, менеджер пошле STATE.
+Res SdSource::retryMedia() {
+  if (!prof_.ownsMount || !active_) return Res::NoMedia;
+  if (st_ != PlayState::Idle) return Res::Ok;  // скан або відтворення вже йдуть
+  pol_.mountResult(media_.mount());
+  if (!media_.mounted()) return Res::NoMedia;
+  scanRetry_ = 0;
+  startScan();
+  return Res::Ok;
+}
+#endif
 
 void SdSource::stopJobs() {
   scanner_.abort();
@@ -188,13 +240,17 @@ void SdSource::startScan() {
   tagTrack_ = kNoTag;
   nav_.detach();  // перестановка живе в арені, яку скан перезаписує
   errRun_ = 0;
+  if (SRC_IS_USB) media_.scanProfile(0);  // M4b4: профіль скану (лише USB)
   scanner_.start(media_, pl_);
   LOGI(TAG, "скан розпочато");
 }
 
 void SdSource::scanStep() {
   Scanner::St r = scanner_.step(kScanSliceMs);
-  if (r != Scanner::St::Running) finishScan(r);
+  if (r != Scanner::St::Running) {
+    if (SRC_IS_USB) media_.scanProfile(1);
+    finishScan(r);
+  }
 }
 
 void SdSource::finishScan(Scanner::St r) {
@@ -202,7 +258,11 @@ void SdSource::finishScan(Scanner::St r) {
   LOGI(TAG, "скан %s: %u мс (робота %u мс), треків=%u папок=%u (з треками %u), арена=%u/%u", scanStName(r),
        (unsigned)s.wallMs, (unsigned)s.busyMs, (unsigned)s.tracks, (unsigned)s.foldersTotal,
        (unsigned)s.foldersWithTracks, (unsigned)pl_.used(), (unsigned)Playlist::capacity());
-  Diag::logHeap("sd-scan");
+  Diag::logHeap(SRC_IS_USB ? "usb-scan" : "sd-scan");
+#if ENABLE_USB_CH376
+  if (prof_.ownsMount && s.wallMs > kUsbScanWarnMs)
+    LOGW(TAG, "скан %u мс > %u мс: надто довгий (варіанти — у звіті M4b4)", (unsigned)s.wallMs, (unsigned)kUsbScanWarnMs);
+#endif
   if (r == Scanner::St::Failed) {
     if (scanRetry_ == 0) {  // M5c3: перший збій міг бути від виймання картки — чекаємо Removed (st_ лишається scan)
       sus_ = Sus::Scan;
@@ -215,9 +275,15 @@ void SdSource::finishScan(Scanner::St r) {
   }
   if (pl_.tracks() == 0) {
     st_ = PlayState::Idle;
+#if ENABLE_USB_CH376
+    if (prof_.ownsMount) applyStep(pol_.scanDone(0, false), true);  // порожня флешка: том закрито, MEDIA usb лишається 0
+#endif
     Events::err(proto::errc::kNoMedia, "empty");  // носій є, але mp3 немає
     return;
   }
+#if ENABLE_USB_CH376
+  if (prof_.ownsMount) applyStep(pol_.scanDone(pl_.tracks(), false), true);  // MEDIA usb → 1 (том змонтовано й є треки) до TRACK/FOLDER/META
+#endif
   nav_.attach(pl_.permBuf(), pl_.tracks());  // перестановка — у зарезервованому хвості арени
   // M5b1: збережений трек із позиції; запису/файлу нема → перший трек за каталогом із нуля. У shuffle він перший у колі.
   uint32_t off = 0, ms = 0;
@@ -246,7 +312,11 @@ void SdSource::scanFailed() {
     return;
   }
   st_ = PlayState::Idle;  // якщо носій зник — Removed повідомить hot-plug
-  if (media_.mounted()) Events::err(proto::errc::kReadFail, "scan");
+  const bool mounted = media_.mounted();
+#if ENABLE_USB_CH376
+  if (prof_.ownsMount) applyStep(pol_.scanDone(0, true), true);  // остаточний збій скану: том закрито
+#endif
+  if (mounted) Events::err(proto::errc::kReadFail, "scan");
 }
 
 // Кінець очікування Removed (M5c3): картка на місці → збій справжній, обробка як раніше.
@@ -605,19 +675,32 @@ uint16_t SdSource::loadResume(uint32_t& off, uint32_t& ms) {
   off = ms = 0;
   Resume::Record rec;
   Resume::ParseErr why = Resume::ParseErr::Ok;
-  ResumeStore::Load lr = ResumeStore::load(ResumeStore::Src::Sd, rec, &why);
+  ResumeStore::Load lr = ResumeStore::load(SRCPROF_(rsm), rec, &why);
   if (lr != ResumeStore::Load::Ok) {
     LOGI(TAG, "резюме: %s -> перший трек", lr == ResumeStore::Load::None ? "запису немає" : "запис пошкоджено");
     return Playlist::kNone;
   }
-  uint16_t idx = pl_.indexOfPath(rec.path);
+  const char* path = rec.path;
+#if ENABLE_USB_CH376
+  if (prof_.volId) {  // M4b4: резюме USB діє лише для тієї самої флешки (серійний номер тому)
+    uint32_t st = 0;
+    const ResumeVol::Verdict v = ResumeVol::check(rec.path, media_.volumeId(), path, &st);
+    if (v != ResumeVol::Verdict::Match) {
+      LOGI(TAG, "резюме: %s (збережено %08X, зараз %08X) -> перший трек",
+           v == ResumeVol::Verdict::OtherVolume ? "інша флешка" : v == ResumeVol::Verdict::NoId ? "серійний номер невідомий" : "формат запису не той",
+           (unsigned)st, (unsigned)media_.volumeId());
+      return Playlist::kNone;
+    }
+  }
+#endif
+  uint16_t idx = pl_.indexOfPath(path);
   if (idx == Playlist::kNone) {
-    LOGI(TAG, "резюме: '%s' немає в плейлисті -> перший трек", rec.path);
+    LOGI(TAG, "резюме: '%s' немає в плейлисті -> перший трек", path);
     return Playlist::kNone;
   }
   off = rec.off;
   ms = rec.ms;
-  LOGI(TAG, "резюме: #%u %s, зсув %u Б, %u мс", (unsigned)idx + 1, rec.path, (unsigned)off, (unsigned)ms);
+  LOGI(TAG, "резюме: #%u %s, зсув %u Б, %u мс", (unsigned)idx + 1, path, (unsigned)off, (unsigned)ms);
   return idx;
 }
 
@@ -625,16 +708,36 @@ uint16_t SdSource::loadResume(uint32_t& off, uint32_t& ms) {
 bool SdSource::rsmWrite(uint32_t off, uint32_t ms) {
   if (!media_.mounted() || cur_ >= pl_.tracks()) return false;
   char path[Resume::kPathMax + 1];  // стек app, 256 Б
-  if (!pl_.trackPath(cur_, path, sizeof path)) {
+  char* tp = path;                  // куди класти шлях треку (USB: після префікса серійного номера)
+  size_t cap = sizeof path;
+#if ENABLE_USB_CH376
+  if (prof_.volId) {
+    const uint32_t id = media_.volumeId();
+    if (!id) {  // без серійного номера не можна ні відновити, ні відрізнити флешку
+      if (rsmWarn_ != 0xFFFE) {
+        rsmWarn_ = 0xFFFE;
+        LOGW(TAG, "резюме: серійний номер тому невідомий — не зберігається");
+      }
+      return false;
+    }
+    ResumeVol::putPrefix(path, id);
+    tp = path + ResumeVol::kPrefix;
+    cap = sizeof path - ResumeVol::kPrefix;
+  }
+#endif
+  if (!pl_.trackPath(cur_, tp, cap)) {
     if (rsmWarn_ != cur_) {
       rsmWarn_ = cur_;
-      LOGW(TAG, "резюме: шлях треку #%u довший за %u Б — не зберігається", (unsigned)cur_ + 1, (unsigned)Resume::kPathMax);
+      LOGW(TAG, "резюме: шлях треку #%u задовгий — не зберігається", (unsigned)cur_ + 1);
     }
-    ResumeStore::erase(ResumeStore::Src::Sd);
+    ResumeStore::erase(SRCPROF_(rsm));
     return false;
   }
   rsmLastOff_ = off;
-  return ResumeStore::save(ResumeStore::Src::Sd, path, off, ms);
+  if (SRC_IS_USB) media_.ioLock();  // M4b4: запис у флеш зупиняє кеш — на цей час UART чіпа не має передавати
+  const bool ok = ResumeStore::save(SRCPROF_(rsm), path, off, ms);
+  if (SRC_IS_USB) media_.ioUnlock();
+  return ok;
 }
 
 // Поточна позиція декодера → NVS. periodic: лише якщо зсув змінився щонайменше на один кадр відносно останнього запису.
@@ -708,7 +811,7 @@ void SdSource::dbgInfo() {
 }
 
 void SdSource::dbgScan() {
-  if (!scanned_) { LOGI(TAG, "скану ще не було (SRC,sd)"); return; }
+  if (!scanned_) { LOGI(TAG, "скану ще не було (SRC,%s)", srcName(SRCPROF_(id))); return; }
   const ScanStats& s = scanner_.stats();
   LOGI(TAG, "scan[%s]: %u мс (робота %u мс) треків=%u папок=%u (з треками %u) записів=%u", scanStName(scanner_.state()),
        (unsigned)s.wallMs, (unsigned)s.busyMs, (unsigned)s.tracks, (unsigned)s.foldersTotal, (unsigned)s.foldersWithTracks,
@@ -716,6 +819,7 @@ void SdSource::dbgScan() {
   LOGI(TAG, "scan: відкинуто: приховані=%u довгі=%u глибоко=%u каталоги_err=%u не_влізло=%u%s", (unsigned)s.hidden,
        (unsigned)s.longName, (unsigned)s.deepDirs, (unsigned)s.dirErr, (unsigned)s.dropped,
        s.overflow ? " (ПЕРЕПОВНЕННЯ, скан зупинено)" : "");
+  if (SRC_IS_USB) media_.scanProfile(2, s.wallMs, s.busyMs);  // M4b4
 }
 
 void SdSource::dbgList() {
@@ -746,12 +850,12 @@ void SdSource::dbgRead() {
     if (scanner_.state() == Scanner::St::Running) { LOGW(TAG, "sdread: триває скан"); job_ = Dbg::None; return; }
     if (!media_.mounted()) { LOGW(TAG, "sdread: носія немає"); job_ = Dbg::None; return; }
     if (!active_ || st_ != PlayState::Stop) {  // буфер читання — вхідний буфер PcmArena, власник Sd
-      LOGW(TAG, "sdread: потрібен src=sd у стані stop (область PCM належить SD, сесії немає)");
+      LOGW(TAG, "sdread: потрібен src=%s у стані stop (сесії немає)", srcName(SRCPROF_(id)));
       job_ = Dbg::None;
       return;
     }
     if (arg_ < 1 || arg_ > (int)pl_.tracks()) {
-      LOGW(TAG, "sdread: номер 1..%u (спершу SRC,sd для скану)", (unsigned)pl_.tracks());
+      LOGW(TAG, "sdread: номер 1..%u (спершу SRC,%s для скану)", (unsigned)pl_.tracks(), srcName(SRCPROF_(id)));
       job_ = Dbg::None;
       return;
     }
@@ -793,7 +897,7 @@ void SdSource::dbgRead() {
 // DBG,play,<n>: відтворити трек n із DBG,list (з будь-якого стану SD, окрім скану/idle).
 void SdSource::dbgPlay() {
   if (!active_ || st_ == PlayState::Scan || st_ == PlayState::Idle) {
-    LOGW(TAG, "play: потрібен src=sd зі скануванням, що завершилось (state=%s)", stateName(st_));
+    LOGW(TAG, "play: потрібен src=%s зі скануванням, що завершилось (state=%s)", srcName(SRCPROF_(id)), stateName(st_));
     return;
   }
   if (arg_ < 1 || arg_ > (int)pl_.tracks()) {
@@ -849,7 +953,7 @@ void SdSource::dbgNav() {
 // DBG,tag,<n>: розібрати теги треку n без відтворення (src=sd у stop; скретч — вхідний буфер області PCM).
 void SdSource::dbgTag() {
   if (!active_ || st_ != PlayState::Stop || rdOpen_ || dec_.sessionActive()) {
-    LOGW(TAG, "tag: потрібен src=sd у стані stop (state=%s)", stateName(st_));
+    LOGW(TAG, "tag: потрібен src=%s у стані stop (state=%s)", srcName(SRCPROF_(id)), stateName(st_));
     return;
   }
   if (arg_ < 1 || arg_ > (int)pl_.tracks()) {
@@ -1012,28 +1116,37 @@ void SdSource::dbgShufTest() {
 // перепише наступний періодичний запис).
 void SdSource::dbgResume(bool clear) {
   if (!active_) {
-    LOGW(TAG, "resume: потрібен src=sd");
+    LOGW(TAG, "resume: потрібен src=%s", srcName(SRCPROF_(id)));
     return;
   }
   if (clear) {
-    bool ok = ResumeStore::erase(ResumeStore::Src::Sd);
-    LOGI(TAG, "resume: запис %s стерто%s", ResumeStore::key(ResumeStore::Src::Sd), ok ? "" : " (ПОМИЛКА)");
+    bool ok = ResumeStore::erase(SRCPROF_(rsm));
+    LOGI(TAG, "resume: запис %s стерто%s", ResumeStore::key(SRCPROF_(rsm)), ok ? "" : " (ПОМИЛКА)");
     return;
   }
   Resume::Record rec;
   Resume::ParseErr why = Resume::ParseErr::Ok;
-  ResumeStore::Load lr = ResumeStore::load(ResumeStore::Src::Sd, rec, &why);
+  ResumeStore::Load lr = ResumeStore::load(SRCPROF_(rsm), rec, &why);
   if (lr == ResumeStore::Load::None) {
-    LOGI(TAG, "resume: %s — запису немає", ResumeStore::key(ResumeStore::Src::Sd));
+    LOGI(TAG, "resume: %s — запису немає", ResumeStore::key(SRCPROF_(rsm)));
   } else if (lr == ResumeStore::Load::Bad) {
-    LOGI(TAG, "resume: %s — запис є, CRC/формат: ПОМИЛКА (%s)", ResumeStore::key(ResumeStore::Src::Sd), Resume::errName(why));
+    LOGI(TAG, "resume: %s — запис є, CRC/формат: ПОМИЛКА (%s)", ResumeStore::key(SRCPROF_(rsm)), Resume::errName(why));
   } else {
-    LOGI(TAG, "resume: %s шлях='%s' зсув=%u Б час=%u мс CRC ok версія=%u", ResumeStore::key(ResumeStore::Src::Sd), rec.path,
+    const char* rpath = rec.path;
+#if ENABLE_USB_CH376
+    if (prof_.volId) {
+      uint32_t st = 0;
+      const ResumeVol::Verdict v = ResumeVol::check(rec.path, media_.volumeId(), rpath, &st);
+      LOGI(TAG, "resume: серійний №%08X, зараз %08X -> %s", (unsigned)st, (unsigned)media_.volumeId(),
+           v == ResumeVol::Verdict::Match ? "збіг" : v == ResumeVol::Verdict::OtherVolume ? "ІНША флешка" : v == ResumeVol::Verdict::NoId ? "номер невідомий" : "формат не той");
+    }
+#endif
+    LOGI(TAG, "resume: %s шлях='%s' зсув=%u Б час=%u мс CRC ok версія=%u", ResumeStore::key(SRCPROF_(rsm)), rpath,
          (unsigned)rec.off, (unsigned)rec.ms, (unsigned)rec.version);
     if (st_ == PlayState::Scan) {
       LOGI(TAG, "resume: триває скан, плейлист неповний");
     } else {
-      uint16_t idx = pl_.indexOfPath(rec.path);
+      uint16_t idx = pl_.indexOfPath(rpath);
       if (idx == Playlist::kNone) LOGI(TAG, "resume: у плейлисті: немає (старт — перший трек)");
       else LOGI(TAG, "resume: у плейлисті: трек #%u з %u", (unsigned)idx + 1, (unsigned)pl_.tracks());
     }
@@ -1043,3 +1156,4 @@ void SdSource::dbgResume(bool clear) {
     LOGI(TAG, "resume: зараз #%u зсув=%u Б час=%u мс, останній запис зсув=%u Б", (unsigned)cur_ + 1, (unsigned)off, (unsigned)ms,
          (unsigned)rsmLastOff_);
 }
+

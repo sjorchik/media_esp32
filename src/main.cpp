@@ -11,6 +11,9 @@
 #include "core/events.h"
 #include "core/router.h"
 #include "media/sd_media.h"
+#if ENABLE_USB_CH376
+#include "media/usb_media.h"
+#endif
 #include "proto/link.h"
 #include "sources/sd_source.h"
 #include "sources/stub_source.h"
@@ -28,9 +31,17 @@ AudioOut g_audio;
 SourceManager g_sources;
 BtSource g_bt;
 
+Mp3Player g_dec;  // M4b4: один декодер на всі файлові джерела (задача mp3 одна)
 static SdMedia s_sdMedia;
-SdSource g_sd(s_sdMedia);  // SD: hot-plug, скан, плейлист (M3a)
+SdSource g_sd(s_sdMedia, g_dec);  // SD: hot-plug, скан, плейлист (M3a)
+#if ENABLE_USB_CH376
+static UsbMedia s_usbMedia;
+UsbSource g_usb(s_usbMedia, g_dec);  // M4b4: USB-флешка як повноцінне джерело
+#define USB_SRC g_usb
+#else
 static StubSource s_usb(SrcId::USB);
+#define USB_SRC s_usb
+#endif
 static QueueHandle_t s_cmdQ = nullptr;
 
 void setup() {
@@ -51,7 +62,7 @@ void setup() {
 
   s_cmdQ = xQueueCreate(kCmdQueueDepth, sizeof(Cmd));
   Router::init(s_cmdQ);
-  g_sources.begin(&g_audio, &g_bt, &g_sd, &s_usb);
+  g_sources.begin(&g_audio, &g_bt, &g_sd, &USB_SRC);
 
   Link::begin();
   Console::begin();
@@ -80,4 +91,5 @@ void loop() {
   StorageDbg::service();     // DBG boot/settings виконує loopTask
   Diag::tick(now);
 }
+
 

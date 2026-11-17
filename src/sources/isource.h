@@ -31,4 +31,7 @@ class ISource {
   virtual void idleLoop(uint32_t) {}      // щоітерації, коли джерело НЕактивне (фонові події)
   virtual void emitInfo() = 0;            // TRACK, FOLDER, META, TIME для GET/HELLO
   virtual Res refreshMedia() { return Res::Ok; }  // після зміни носіїв
+  // M4b4: повторне SRC для вже активного джерела без носія. Ok — носій знайдено, скан розпочато (менеджер пошле STATE);
+  // NoMedia — як раніше (лише ERR,no_media). Типово NoMedia: SD/BT/заглушка не змінюються. USB пробує відкрити том знову (виявлення — M4c).
+  virtual Res retryMedia() { return Res::NoMedia; }
 };

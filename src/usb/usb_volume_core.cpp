@@ -107,10 +107,10 @@ const char* usbOpenFailText(UsbOpenFail f) {
 const char* selfTestName(SelfTest s) {
   switch (s) {
     case SelfTest::NotRun: return "не виконувалась";
-    case SelfTest::Passed: return "збіг, лишаємось на 2 Мбод";
-    case SelfTest::Mismatch: return "хеш не збігся (дроти?), повернення на 1 Мбод";
-    case SelfTest::FastFailed: return "2 Мбод не працюють, повернення на 1 Мбод";
-    case SelfTest::RefFailed: return "еталон 1 Мбод недоступний, 2 Мбод без перевірки";
+    case SelfTest::Passed: return "збіг, лишаємось на робочій швидкості";
+    case SelfTest::Mismatch: return "хеш не збігся (дроти?), повернення на еталонну швидкість";
+    case SelfTest::FastFailed: return "робоча швидкість не працює, повернення на еталонну";
+    case SelfTest::RefFailed: return "еталонна швидкість недоступна, робоча без перевірки";
   }
   return "?";
 }
@@ -138,6 +138,10 @@ UsbOpenFail usbNegotiate(IUsbOpenHw& hw, uint8_t* scratch, UsbOpenInfo& info) {
       return fromDisk(d);
     }
     info.refHash = usbFnv1a(scratch, kCh376DiskSecBytes);
+#if USB_FORCE_BAUD_REF
+    info.baud = hw.baud();  // стенд (M4b4, вимір резерву): лишаємось на еталонній швидкості, самоперевірка не виконується
+    return UsbOpenFail::None;
+#endif
 
     // 2. Швидка: 2 Мбод і порівняння хешу сектора 0.
     e = hw.bringUp(kUsbBaudFast);
@@ -244,6 +248,7 @@ UsbOpenFail usbPickPartition(IUsbOpenHw& hw, uint8_t* scratch, ProbeReport& pr, 
   info.partSectors = (uint32_t)sec;
   info.partIndex = idx;
   info.kind = pr.kind;
+  info.serial = pr.kind == VolKind::ExFat ? pr.ex.serial : pr.bpb.serial;
   memset(info.label, 0, sizeof info.label);
   if (pr.kind != VolKind::ExFat) memcpy(info.label, pr.bpb.label, sizeof info.label - 1);
   return UsbOpenFail::None;
@@ -302,3 +307,4 @@ void UsbSession::close() {
 }
 
 #endif  // ENABLE_USB_CH376
+

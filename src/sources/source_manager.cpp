@@ -57,6 +57,11 @@ Res SourceManager::select(SrcId id) {
   if (id == cur_) {  // ідемпотентно
     LOGI(TAG, "джерело %s вже активне", srcName(id));
     if (mediaMissing(id)) {  // Q7: кожна команда без носія → ERR,no_media (STATE не дублюється)
+      ISource* s = src_[(int)id];
+      if (s && s->retryMedia() == Res::Ok) {  // M4b4: USB — том з'явився (або скан уже йде): без ERR, STATE пошле publish
+        publish(false);
+        return Res::Ok;
+      }
       emitErr(Res::NoMedia, nullptr);
       return Res::NoMedia;
     }
@@ -183,3 +188,4 @@ void SourceManager::loop(uint32_t nowMs) {
   if (s) s->loop(nowMs);
   publish(false);  // STATE після TRACK/FOLDER/META/TIME, які породив loop()
 }
+

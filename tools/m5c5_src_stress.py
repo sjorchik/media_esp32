@@ -7,7 +7,7 @@
                Канал команд і подій контракту (кадри $BODY*XX).
   --dbg COMy : штатний USB-порт плати (UART0, 460800). Консоль DBG,* для heap / aout / tasks / decode.
 
-Стрес:   python tools/m5c5_src_stress.py --ctl COMx --dbg COMy --cycles 100 [--seed N] [--no-usb] [--no-bt]
+Стрес:   python tools/m5c5_src_stress.py --ctl COMx --dbg COMy --cycles 100 [--seed N] [--no-usb] [--usb-flash] [--no-bt]
 Пачка:   python tools/m5c5_src_stress.py --dbg COMy --burst 50      (і --burst 200; --ctl не потрібен)
 
 Кодування кадрів, розбір UART1 і XOR-сума беруться з tools/m5c4_frames.py (імпорт, без копії).
@@ -444,8 +444,10 @@ class Stress:
     def media(self):
         f = self.last_frame("MEDIA")
         if not f or len(f.args) < 2:
-            return {"sd": False, "usb": False}
-        return {"sd": f.args[0] == "1", "usb": f.args[1] == "1"}
+            return {"sd": False, "usb": bool(self.a.usb_flash)}
+        # M4b4: MEDIA usb=1 лише поки USB — активне джерело зі змонтованим томом; перед SRC,usb прапорець 0, тож з флешкою
+        # у гнізді вважаємо носій наявним за --usb-flash
+        return {"sd": f.args[0] == "1", "usb": f.args[1] == "1" or bool(self.a.usb_flash)}
 
     def bt_conn(self):
         f = self.last_frame("BT")
@@ -840,6 +842,7 @@ def main(argv=None):
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--settle", type=float, default=15.0, help="таймаут очікування STATE≠scan після SRC, с")
     ap.add_argument("--no-usb", action="store_true", help="не вибирати SRC,usb")
+    ap.add_argument("--usb-flash", action="store_true", help="M4b4: у гнізді CH376S є флешка з mp3 — SRC,usb очікується як робочий носій (STATE≠scan), а не no_media")
     ap.add_argument("--no-bt", action="store_true", help="не вибирати SRC,bt")
     ap.add_argument("--warmup", type=int, default=2, help="проходів прогріву по всіх джерелах до базових точок")
     ap.add_argument("--dwell", type=float, default=1.0, help="макс. випадкова пауза після SRC, с")
@@ -897,3 +900,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+

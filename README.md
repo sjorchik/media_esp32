@@ -8,7 +8,7 @@
 
 - **BT**: A2DP-приймач з AVRCP. Працює.
 - **SD**: MP3 з картки (SdFat, hot-plug, плейлист, shuffle, резюме).
-- **USB**: через CH376S. Драйвер, файловий шар і діагностика `DBG,usb*` готові (M4a, M4b1) за `ENABLE_USB_CH376 = 1`. До `SourceManager` ще не підключено, тож `MEDIA` показує `usb=0`.
+- **USB**: через CH376S. Повноцінне джерело (M4b4) за `ENABLE_USB_CH376 = 1`: `SRC,usb` відкриває том, скануює, відтворює MP3 (теги, навігація, shuffle, резюме `rsm_usb`). Без цього прапорця `usb` лишається заглушкою. `MEDIA usb=1` лише поки USB активне, том змонтовано й є треки; виявлення вставлення, поки USB неактивне, — окреме завдання (M4c), тож повторне `SRC,usb` пробує відкрити том знову.
 
 Звук виводиться по I2S на ЦАП. Гучністю, тембром і входом керує лише S3 (TDA7318); цифровий EQ і послаблення виходу S3 задає командами `EQ` і `LVL` (M6b). WROOM мʼютить свій ЦАП сам.
 
@@ -44,7 +44,8 @@
 - `esp32dev` — **реліз** (за замовчуванням). `BOOT_TEST_CMDS=0`, `SKIP_TEST_CMDS=0`.
 - `esp32dev_test` — стенд. Успадковує `esp32dev` і додає `-DBOOT_TEST_CMDS=1 -DSKIP_TEST_CMDS=1`. Не для релізу.
 - `esp32dev_usb` — стенд CH376S: успадковує `esp32dev_test` і додає `-DENABLE_USB_CH376=1` та `-DUSE_BLOCK_DEVICE_INTERFACE=1` (M4b3: власний блочний пристрій для SdFat). Не для релізу.
-- `native` — юніт-тести (`pio test -e native`). Збирає `proto/frame`, `proto/cmd_args`, `media/id3`, `media/shuffle`, `storage/resume_record`, `storage/settings_record`, `storage/boot_guard`, `usb/ch376`, `usb/ch376_fs`, `usb/ch376_file_reader`, `usb/ch376_disk`, `usb/disk_probe`, `usb/ch376_blockdev`, `usb/usb_volume_core`.
+- `esp32dev_usb1m` — M4b4: стенд вимірів на резервній швидкості 1 Мбод (`-DUSB_FORCE_BAUD_REF=1`: після еталона 2 Мбод не пробуються). Не для релізу.
+- `native` — юніт-тести (`pio test -e native`). Збирає `proto/frame`, `proto/cmd_args`, `media/id3`, `media/shuffle`, `storage/resume_record`, `storage/settings_record`, `storage/boot_guard`, `usb/ch376`, `usb/ch376_fs`, `usb/ch376_file_reader`, `usb/ch376_disk`, `usb/disk_probe`, `usb/ch376_blockdev`, `usb/usb_volume_core`, `media/playlist`, `media/scanner` (тести M4b4: `test_usb_src`).
 
 Команди (COM-порт підставити свій):
 
@@ -195,6 +196,10 @@ SdFat не потокобезпечний: усі виклики серіалі�
 | `DBG,usb,vls[,<каталог>[,N]]` | M4b3: перелік через SdFat з довгими (UTF-8) іменами, тип, розмір; N типово 40 |
 | `DBG,usb,vread,<шлях>[,<КБ>]` / `DBG,usb,vseq,<шлях>[,<КБ>]` | M4b3: КБ/с і час шматка (1 КБ) / читання «як у плеєра» (1045 Б кожні 26,1 мс); для `vseq` КБ = 0 — весь файл |
 | `DBG,usb,vtag,<шлях>` | M4b3: ID3 (початок і кінець файлу) через SdFat |
+| `DBG,usb,vscan` | M4b4: підсумок скану USB-джерела (час, треки, папки, відкинуте, арена); спершу `SRC,usb` |
+| `DBG,usb,vlist[,N]` | M4b4: перші N рядків плейлиста USB (типово 20, 0 = усі) |
+| `DBG,usb,vtagn,<n>` | M4b4: ID3 треку №n плейлиста без відтворення (`src=usb`, `stop`); відрізняється від `vtag,<шлях>` (M4b3) |
+| `DBG,nav` / `shuf` / `resume` / `decode` / `list` / `play,<n>` / `tag,<n>` | Адресуються активному файловому джерелу (SD або USB); `DBG,sd` завжди про SD |
 | `DBG,failnext,<n>[,read\|decode]` | **[test]** Наступні n стартів треку штучно завершуються збоєм |
 
 Приклад (реліз, `esp32dev`): `DBG,failnext,1` → `DBG,failnext вимкнено (SKIP_TEST_CMDS=0)`.
@@ -204,8 +209,8 @@ SdFat не потокобезпечний: усі виклики серіалі�
 Усі скрипти потребують `pyserial` (`pip install pyserial`). Адаптер USB-UART 3,3 В: TX → GPIO32, RX ← GPIO33, спільна земля. S3 має бути відʼєднаний від GPIO32/33.
 
 - `tools/m5c1_series.py COMx [серій=20] [read|decode]` — серія `DBG,failnext,1` + `NEXT` через UART0. **Потребує `esp32dev_test`.** Лог: `m5c1_series.log`.
-- `tools/m5c4_frames.py COMx [--only a,b] [--list] [--usb-expected 0|1] [--expect-title назва] [--max-next 5]` — перевірка протоколу UART1 (proto_ver = 2, зокрема сценарії `eq_lvl`, `eq_lvl_bad`): PASS/FAIL/SKIP/INFO. Код виходу: 0 — без FAIL, 1 — є FAIL, 2 — порт або передумова.
-- `tools/m5c5_src_stress.py --ctl COMx --dbg COMy [--cycles 100] [--seed 1] [--settle 15] [--no-usb] [--no-bt] [--warmup 2]` — стрес SRC (UART1 + UART0). Код виходу: 0 — без FAIL.
+- `tools/m5c4_frames.py COMx [--only a,b] [--list] [--usb-expected 0|1] [--usb-flash] [--expect-title назва] [--max-next 5]` — перевірка протоколу UART1 (proto_ver = 2, зокрема сценарії `eq_lvl`, `eq_lvl_bad`): PASS/FAIL/SKIP/INFO. Код виходу: 0 — без FAIL, 1 — є FAIL, 2 — порт або передумова.
+- `tools/m5c5_src_stress.py --ctl COMx --dbg COMy [--cycles 100] [--seed 1] [--settle 15] [--no-usb] [--usb-flash] [--no-bt] [--warmup 2]` — стрес SRC (UART1 + UART0). Код виходу: 0 — без FAIL.
 - `tools/m5c5_src_stress.py --dbg COMy --burst 50` (і `--burst 200`) — пачка рядків у UART0, без `--ctl`. Код виходу 1, якщо є втрати.
 
 Примітка: `m5c5` вимикає DTR/RTS до відкриття UART0, бо відкриття скидає плату.
@@ -234,7 +239,7 @@ SdFat не потокобезпечний: усі виклики серіалі�
 - **Q5:** STOP/PAUSE у стані scan дають `bad_state`.
 - **Q6:** переповнення черги команд — лише лог.
 - **Q10:** порожнє імʼя команди.
-- **USB:** драйвер M4a не підключено до джерела (M4b). Дільники швидкості — гіпотеза, звірити на залізі (розд. 12).
+- **USB (M4b4):** джерело працює, але вставлення/виймання, поки USB неактивне чи на паузі, не виявляється (M4c): зникнення відкритого тому помічається при першому читанні. Резюме `rsm_usb` зберігає шлях як `XXXXXXXX|<шлях>` (серійний номер тому, формат блоба без змін), тож діє лише для тієї самої флешки; найдовший шлях — 246 Б. Декодер один для SD і USB; арена PCM має власника `sd` і для USB. Відкриття без флешки блокує app ≈3 с (очікування підключення).
 - **Консоль UART0:** пачка без втрат до ≈ TBD (вимір, `--burst 200`). Буфер 1472 Б. Відповідь `DBG,*` блокує консоль на TX (≈ 1,4 мс на рядок).
 - Деталі Q3–Q10 не входять до дампів; тут наведено формулювання з переліку обмежень.
 
@@ -268,3 +273,4 @@ SdFat не потокобезпечний: усі виклики серіалі�
 - Консоль (`src/usb/ch376_diag_disk.cpp`): `DBG,usb,part`, `DBG,usb,rawread,<LBA>[,<секторів ≤ 8>]`, `DBG,usb,rawspeed,<LBA>,<КБ>[,<N>]`, `DBG,usb,rawseq,<LBA>[+зсув],<КБ>[,<байт>[,<мс>]]`, `DBG,usb,rawpre,<LBA>,<КБ>,<пакет Б>,<кадрів>`, `DBG,usb,rawcfg[,settle|skip|wait|spc,<значення>]`.
 - `DBG,usb,init,2000000` дозволено (K=FD, не підтверджено на залізі). `DBG,usb,sec` без змін.
 - Значення протоколу з памʼяті про даташит — в `config.h` (блок CH376S M4b2). Перевірка на залізі: `hwcheck_M4b2.md`, результати: `report_M4b2.md`.
+
