@@ -10,8 +10,7 @@
 //
 // Потоки: setDb()/getDb() — з будь-якої задачі (атомарні байти); advance()/apply()/process() — лише з задачі,
 // що пише PCM (mp3 для SD, audio для BT); без логів, блокувань і millis().
-// Одне насичення в кінці конвеєра: eq::process() множить на Gain у float і насичує один раз;
-// якщо смуг EQ немає, Gain застосовує apply().
+// Одне насичення в кінці конвеєра: apply() множить на Gain у float і насичує один раз (toS16).
 
 #include <stdint.h>
 
@@ -64,7 +63,7 @@ Gain advance(Slot s, int32_t frames);
 // Застосувати Gain до блоку int16 (ch = 1 або 2 каналів, frames кадрів) на місці. unity → не чіпає.
 void apply(int16_t* buf, int32_t frames, uint8_t ch, const Gain& lg);
 
-// advance + apply (шлях без EQ і для тестів).
+// advance + apply разом (для тестів; у плеєрах викликають advance() і apply() окремо).
 void process(int16_t* buf, int32_t frames, uint8_t ch, Slot s);
 
 }  // namespace level

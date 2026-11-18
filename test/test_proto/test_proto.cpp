@@ -2,7 +2,6 @@
 #include <string.h>
 #include <unity.h>
 
-#include "audio/eq.h"
 #include "audio/level.h"
 #include "config.h"
 #include "proto/cmd_args.h"
@@ -417,7 +416,7 @@ static void test_cmd_table_matches_contract() {
   const E want[] = {{"HELLO", 1, 1}, {"GET", 0, 0},   {"SRC", 1, 1},   {"PLAY", 0, 0}, {"PAUSE", 0, 0},
                     {"TOGGLE", 0, 0}, {"STOP", 0, 0}, {"NEXT", 0, 0},  {"PREV", 0, 0}, {"FNEXT", 0, 0},
                     {"FPREV", 0, 0},  {"SHUF", 1, 1}, {"REP", 1, 1},   {"HB", 1, 1},
-                    {"EQ", 5, 5},    {"LVL", 2, 2}};
+                    {"LVL", 2, 2}};
   for (const E& e : want) {
     const CmdDef* d = findCmd(e.n);
     TEST_ASSERT_NOT_NULL(d);
@@ -428,6 +427,7 @@ static void test_cmd_table_matches_contract() {
   TEST_ASSERT_NOT_NULL(findCmd("LIST"));
   TEST_ASSERT_NOT_NULL(findCmd("PLAYFILE"));
   TEST_ASSERT_EQUAL_size_t(sizeof(want) / sizeof(want[0]) + 2, kCmdCount);
+  TEST_ASSERT_NULL(findCmd("EQ"));    // M6c: EQ видалено з контракту → unknown_cmd
   TEST_ASSERT_NULL(findCmd("play"));  // регістр значущий → unknown_cmd
   TEST_ASSERT_NULL(findCmd("DBG"));   // DBG — лише UART0, не частина контракту
 }
@@ -483,9 +483,9 @@ static void test_split_edge_cases() {
 }
 
 
-// ---------------- M6b: EQ, LVL, proto_ver = 2 ----------------
+// ---------------- M6b/M6c: LVL, proto_ver = 3 ----------------
 
-// Модель роутера до виклику apply*: пошук у таблиці, перевірка арності, далі applyEq/applyLvl.
+// Модель роутера до виклику apply*: пошук у таблиці, перевірка арності, далі applyLvl.
 // true — команда прийнята й застосована; false — роутер відповів би ERR,bad_arg,<NAME> (або unknown_cmd).
 static bool route(const char* body) {
   char tmp[160];
@@ -496,25 +496,12 @@ static bool route(const char* body) {
   const CmdDef* d = findCmd(m.name);
   if (!d) return false;
   if (m.tooMany || m.argc < d->minArgs || m.argc > d->maxArgs) return false;
-  if (d->id == CmdId::Eq) return applyEq(m);
   if (d->id == CmdId::Lvl) return applyLvl(m);
   return false;
 }
 
 static void audioReset() {
-  const int8_t z[eq_cfg::kBandCount] = {0, 0, 0, 0, 0};
-  eq::setAllDb(z);
   for (uint8_t i = 0; i < level::kSlots; i++) level::setDb((level::Slot)i, 0);
-}
-
-static void expectEq(int a, int b, int c, int d, int e) {
-  int8_t g[eq_cfg::kBandCount];
-  eq::getAllDb(g);
-  TEST_ASSERT_EQUAL_INT(a, g[0]);
-  TEST_ASSERT_EQUAL_INT(b, g[1]);
-  TEST_ASSERT_EQUAL_INT(c, g[2]);
-  TEST_ASSERT_EQUAL_INT(d, g[3]);
-  TEST_ASSERT_EQUAL_INT(e, g[4]);
 }
 
 static void expectLvl(int bt, int sd, int usb) {
@@ -523,8 +510,8 @@ static void expectLvl(int bt, int sd, int usb) {
   TEST_ASSERT_EQUAL_INT(usb, level::getDb(level::Slot::Usb));
 }
 
-static void test_proto_ver_is_2() {
-  TEST_ASSERT_EQUAL_INT(2, kProtoVer);
+static void test_proto_ver_is_3() {
+  TEST_ASSERT_EQUAL_INT(3, kProtoVer);
   char buf[256];
   Arg a[] = {Arg::T(FW_VERSION), Arg::N(kProtoVer)};  // як Events::ready()
   size_t len = encodeFrame(buf, sizeof buf, "READY", a, 2);
@@ -537,7 +524,7 @@ static void test_proto_ver_is_2() {
   TEST_ASSERT_TRUE(splitBody(s.last, m));
   TEST_ASSERT_EQUAL_STRING("READY", m.name);
   TEST_ASSERT_EQUAL_UINT8(2, m.argc);
-  TEST_ASSERT_EQUAL_STRING("2", m.args[1]);
+  TEST_ASSERT_EQUAL_STRING("3", m.args[1]);
 }
 
 static void test_parse_ints() {
@@ -560,86 +547,21 @@ static void test_parse_ints() {
   TEST_ASSERT_FALSE(parseSInt(nullptr, v));
 }
 
-// HELLO: чужа версія (зокрема стара 1) → лише READY; наша 2 → READY + повний стан (його шле app).
+// HELLO: чужа версія (зокрема стара 1 і 2) → лише READY; наша 3 → READY + повний стан (його шле app).
 static void test_hello_version_policy() {
   long v = 0;
   TEST_ASSERT_TRUE(helloVerdict("1", kProtoVer, v) == HelloVerdict::ReadyOnly);
   TEST_ASSERT_EQUAL_INT(1, (int)v);
-  TEST_ASSERT_TRUE(helloVerdict("2", kProtoVer, v) == HelloVerdict::Full);
+  TEST_ASSERT_TRUE(helloVerdict("2", kProtoVer, v) == HelloVerdict::ReadyOnly);  // M6c: v2 застаріла
   TEST_ASSERT_EQUAL_INT(2, (int)v);
-  TEST_ASSERT_TRUE(helloVerdict("3", kProtoVer, v) == HelloVerdict::ReadyOnly);
+  TEST_ASSERT_TRUE(helloVerdict("3", kProtoVer, v) == HelloVerdict::Full);
+  TEST_ASSERT_EQUAL_INT(3, (int)v);
+  TEST_ASSERT_TRUE(helloVerdict("4", kProtoVer, v) == HelloVerdict::ReadyOnly);
   TEST_ASSERT_TRUE(helloVerdict("0", kProtoVer, v) == HelloVerdict::ReadyOnly);
   TEST_ASSERT_TRUE(helloVerdict("abc", kProtoVer, v) == HelloVerdict::BadArg);
   TEST_ASSERT_TRUE(helloVerdict("", kProtoVer, v) == HelloVerdict::BadArg);
   TEST_ASSERT_TRUE(helloVerdict("-2", kProtoVer, v) == HelloVerdict::BadArg);
   TEST_ASSERT_TRUE(helloVerdict(nullptr, kProtoVer, v) == HelloVerdict::BadArg);
-}
-
-static void test_eq_valid() {
-  audioReset();
-  TEST_ASSERT_TRUE(route("EQ,3,0,0,0,3"));
-  expectEq(3, 0, 0, 0, 3);
-  TEST_ASSERT_TRUE(route("EQ,-1,-2,-3,-4,-5"));  // від'ємні числа
-  expectEq(-1, -2, -3, -4, -5);
-  TEST_ASSERT_TRUE(route("EQ,0,0,0,0,0"));
-  expectEq(0, 0, 0, 0, 0);
-  TEST_ASSERT_TRUE(route("EQ,12,-12,6,-6,0"));
-  expectEq(12, -12, 6, -6, 0);
-  expectLvl(0, 0, 0);  // EQ рівнів не чіпає
-}
-
-static void test_eq_bounds() {
-  audioReset();
-  TEST_ASSERT_TRUE(route("EQ,-12,-12,-12,-12,-12"));
-  expectEq(-12, -12, -12, -12, -12);
-  TEST_ASSERT_TRUE(route("EQ,12,12,12,12,12"));
-  expectEq(12, 12, 12, 12, 12);
-  TEST_ASSERT_FALSE(route("EQ,13,0,0,0,0"));
-  TEST_ASSERT_FALSE(route("EQ,0,0,0,0,-13"));
-  TEST_ASSERT_FALSE(route("EQ,-100,0,0,0,0"));
-  TEST_ASSERT_FALSE(route("EQ,0,0,0,0,100000"));
-  expectEq(12, 12, 12, 12, 12);  // жодна спроба поза діапазоном нічого не змінила
-}
-
-static void test_eq_arity() {
-  audioReset();
-  TEST_ASSERT_TRUE(route("EQ,1,2,3,4,5"));
-  TEST_ASSERT_FALSE(route("EQ"));
-  TEST_ASSERT_FALSE(route("EQ,1"));
-  TEST_ASSERT_FALSE(route("EQ,9,9,9,9"));          // 4 аргументи
-  TEST_ASSERT_FALSE(route("EQ,9,9,9,9,9,9"));      // 6 аргументів
-  TEST_ASSERT_FALSE(route("EQ,9,9,9,9,9,9,9,9,9")); // 9 → tooMany
-  expectEq(1, 2, 3, 4, 5);
-}
-
-static void test_eq_not_number() {
-  audioReset();
-  TEST_ASSERT_TRUE(route("EQ,1,2,3,4,5"));
-  const char* bad[] = {"EQ,x,2,3,4,5",   "EQ,1,2,3,4,x",   "EQ,1,2,3,4,",     "EQ,,2,3,4,5",    "EQ,1,2,3,4, 5",
-                       "EQ,1,2,3,4,+5",  "EQ,1,2,3,4,5.5", "EQ,1,2,3,4,--5",  "EQ,1,2,3,4,-",   "EQ,1,2,3,4,0x5",
-                       "EQ,1,2,3,4,1e1", "EQ,1,2,3,4,5 ",  "EQ,1,2,3,4,abc"};
-  for (const char* b : bad) {
-    TEST_ASSERT_FALSE(route(b));
-    expectEq(1, 2, 3, 4, 5);
-  }
-}
-
-// Атомарність: помилка в будь-якому аргументі (зокрема в 5-му) не змінює ні першого, ні інших.
-static void test_eq_atomic() {
-  audioReset();
-  TEST_ASSERT_TRUE(route("EQ,1,2,3,4,5"));
-  TEST_ASSERT_FALSE(route("EQ,9,9,9,9,99"));  // 5-й поза діапазоном
-  expectEq(1, 2, 3, 4, 5);
-  TEST_ASSERT_FALSE(route("EQ,9,9,9,9,x"));    // 5-й не число
-  expectEq(1, 2, 3, 4, 5);
-  TEST_ASSERT_FALSE(route("EQ,9,9,9,99,9"));   // 4-й
-  expectEq(1, 2, 3, 4, 5);
-  TEST_ASSERT_FALSE(route("EQ,99,9,9,9,9"));   // 1-й
-  expectEq(1, 2, 3, 4, 5);
-  TEST_ASSERT_FALSE(route("EQ,9,9,9,9"));      // 4 аргументи
-  expectEq(1, 2, 3, 4, 5);
-  TEST_ASSERT_TRUE(route("EQ,5,4,3,2,1"));     // після помилок нормальна команда працює
-  expectEq(5, 4, 3, 2, 1);
 }
 
 static void test_lvl_valid() {
@@ -652,7 +574,6 @@ static void test_lvl_valid() {
   expectLvl(-40, -20, -1);
   TEST_ASSERT_TRUE(route("LVL,sd,0"));
   expectLvl(-40, 0, -1);
-  expectEq(0, 0, 0, 0, 0);  // LVL EQ не чіпає
 }
 
 static void test_lvl_bounds() {
@@ -698,29 +619,27 @@ static void test_lvl_not_number() {
   }
 }
 
-// Повний шлях: кадр із XOR-сумою → парсер → тіло → route. Контрольні суми з прикладів контракту.
+// Повний шлях: кадр із XOR-сумою → парсер → тіло → route. Контрольна сума з прикладу контракту.
 static void test_audio_cmd_frames() {
   audioReset();
-  const char* frames[] = {"$EQ,3,0,0,0,3*08\n", "$LVL,sd,-20*6E\n"};
-  const char* bodies[] = {"EQ,3,0,0,0,3", "LVL,sd,-20"};
-  for (int i = 0; i < 2; i++) {
-    Sink s;
-    FrameParser p(cb, &s);
-    feedStr(p, frames[i]);
-    TEST_ASSERT_EQUAL_INT(1, s.n);
-    TEST_ASSERT_EQUAL_STRING(bodies[i], s.last);
-    TEST_ASSERT_TRUE(route(s.last));
-  }
-  expectEq(3, 0, 0, 0, 3);
+  Sink s;
+  FrameParser p(cb, &s);
+  feedStr(p, "$LVL,sd,-20*6E\n");
+  TEST_ASSERT_EQUAL_INT(1, s.n);
+  TEST_ASSERT_EQUAL_STRING("LVL,sd,-20", s.last);
+  TEST_ASSERT_TRUE(route(s.last));
   expectLvl(0, -20, 0);
+  // M6c: EQ видалено. Кадр валідний (сума збігається), але команда невідома → роутер дав би ERR,unknown_cmd,EQ.
+  const char* eqBody = "EQ,3,0,0,0,3";
   char buf[96];
-  snprintf(buf, sizeof buf, "$%s*%02X\n", "EQ,1,2,3,4,x", xorSum("EQ,1,2,3,4,x", 12));  // кадр валідний, команда ні
+  snprintf(buf, sizeof buf, "$%s*%02X\n", eqBody, xorSum(eqBody, (int)strlen(eqBody)));
   Sink s2;
   FrameParser p2(cb, &s2);
   feedStr(p2, buf);
   TEST_ASSERT_EQUAL_INT(1, s2.n);
+  TEST_ASSERT_EQUAL_STRING(eqBody, s2.last);
   TEST_ASSERT_FALSE(route(s2.last));
-  expectEq(3, 0, 0, 0, 3);
+  expectLvl(0, -20, 0);  // невідома команда нічого не змінила
   audioReset();
 }
 
@@ -754,14 +673,9 @@ int main(int, char**) {
   RUN_TEST(test_arity_model);
   RUN_TEST(test_errc_codes_match_contract);
   RUN_TEST(test_split_edge_cases);
-  RUN_TEST(test_proto_ver_is_2);
+  RUN_TEST(test_proto_ver_is_3);
   RUN_TEST(test_parse_ints);
   RUN_TEST(test_hello_version_policy);
-  RUN_TEST(test_eq_valid);
-  RUN_TEST(test_eq_bounds);
-  RUN_TEST(test_eq_arity);
-  RUN_TEST(test_eq_not_number);
-  RUN_TEST(test_eq_atomic);
   RUN_TEST(test_lvl_valid);
   RUN_TEST(test_lvl_bounds);
   RUN_TEST(test_lvl_arity);
@@ -770,4 +684,3 @@ int main(int, char**) {
   RUN_TEST(test_audio_cmd_frames);
   return UNITY_END();
 }
-

@@ -98,12 +98,8 @@ void Router::dispatch(char* body, Origin o) {
       if (!parseInt(m.args[0], v) || v < 0 || v > 2) { Events::err(proto::errc::kBadArg, d->name); return; }
       c.arg = (int16_t)v;
       break;
-    case CmdId::Eq:  // M6b: будь-який state і src=off; значення лише в RAM, підтверджень і подій немає
-      // Без черги до app: eq::setAllDb() — атомарні слова, безпечно з link_rx/console (як DBG,eq).
-      // Усе або нічого: некоректний кадр не змінює жодної смуги.
-      if (!proto::applyEq(m)) Events::err(proto::errc::kBadArg, d->name);
-      return;
-    case CmdId::Lvl:  // M6b: те саме для level::setDb() (атомарний байт слота)
+    case CmdId::Lvl:  // M6b: будь-який state і src=off; значення лише в RAM, підтверджень і подій немає
+      // Без черги до app: level::setDb() — атомарний байт слота, безпечно з link_rx/console (як DBG,lvl).
       if (!proto::applyLvl(m)) Events::err(proto::errc::kBadArg, d->name);
       return;
     default:
@@ -111,4 +107,3 @@ void Router::dispatch(char* body, Origin o) {
   }
   post(c);
 }
-

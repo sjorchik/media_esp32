@@ -28,7 +28,6 @@
 #include "freertos/task.h"
 
 #include "audio/audio_out.h"
-#include "audio/eq.h"
 #include "audio/level.h"
 #include "audio/pcm_arena.h"
 #include "config.h"
@@ -62,7 +61,7 @@ struct Sess {
   uint32_t inPos, inLen, id3Skip, junk, badRun;
   bool eof, metaDone;
   uint32_t lastCh;
-  uint64_t posUs, sumDecUs, sumFrameUs, sumFxUs;   // sumFxUs: M6a, час EQ+рівня
+  uint64_t posUs, sumDecUs, sumFrameUs, sumLvlUs;   // sumLvlUs: M6c, час рівня
   int64_t lastT;       // мкс: кінець попереднього write()
   int32_t cushUs;      // оцінка запасу даних у DMA, мкс
   uint32_t fastRun;    // скільки кадрів підряд write() не блокував (мʼют/abort)
@@ -302,7 +301,6 @@ void Mp3Player::runSession() {
   memset(&sx, 0, sizeof sx);
   memset(&S->dec, 0, sizeof S->dec);
   mp3dec_init(&S->dec);
-  eq::reset();  // M6a: новий потік — стани фільтрів EQ з нуля
   const uint32_t rOff = rsmOff_, rMs = rsmMs_;
   parseTags();  // теги на скретчі (вхідний буфер), далі файл знову з початку
   Ev e = Ev::ReadFail;
@@ -577,11 +575,10 @@ Mp3Player::Ev Mp3Player::decodeLoop() {
       sx.lastT = 0;
     }
 
-    // 6b) M6a: EQ → рівень (слот sd) → одне насичення, на місці в PCM-кадрі (int16, ch = 1|2); AudioOut далі дублює моно
-    eq::setSampleRate(hz);
+    // 6b) M6c: рівень (слот sd/usb) → одне насичення, на місці в PCM-кадрі (int16, ch = 1|2); AudioOut далі дублює моно
     const int64_t tf = esp_timer_get_time();
-    eq::process(S->pcm, smp, (uint8_t)ch, level::advance((level::Slot)lvSlot_, smp));
-    const uint32_t fxUs = (uint32_t)(esp_timer_get_time() - tf);
+    level::apply(S->pcm, smp, (uint8_t)ch, level::advance((level::Slot)lvSlot_, smp));
+    const uint32_t lvlUs = (uint32_t)(esp_timer_get_time() - tf);
 
     // 7) вивід + оцінка underrun (запас даних у DMA, модель «дірявого відра», без довгого дрейфу годинника)
     size_t bytes = (size_t)smp * ch * 2;
@@ -619,9 +616,9 @@ Mp3Player::Ev Mp3Player::decodeLoop() {
     publishPos(sx.fEnd - (sx.inLen - sx.inPos), (uint32_t)(sx.posUs / 1000ULL));  // початок наступного кадру
     sx.sumDecUs += decUs;
     sx.sumFrameUs += frameUs;
-    sx.sumFxUs += fxUs;
-    stats_.fxAvgUs = (uint32_t)(sx.sumFxUs / stats_.frames);
-    if (fxUs > stats_.fxMaxUs) stats_.fxMaxUs = fxUs;
+    sx.sumLvlUs += lvlUs;
+    stats_.lvlAvgUs = (uint32_t)(sx.sumLvlUs / stats_.frames);
+    if (lvlUs > stats_.lvlMaxUs) stats_.lvlMaxUs = lvlUs;
     stats_.decAvgUs = (uint32_t)(sx.sumDecUs / stats_.frames);
     stats_.frameAvgUs = (uint32_t)(sx.sumFrameUs / stats_.frames);
     stats_.loadAvgPm = (uint32_t)(sx.sumDecUs * 1000ULL / sx.sumFrameUs);
@@ -634,5 +631,3 @@ Mp3Player::Ev Mp3Player::decodeLoop() {
     stats_.pcmBytes = (uint32_t)bytes;
   }
 }
-
-
