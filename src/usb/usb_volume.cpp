@@ -5,9 +5,11 @@
 #include <Arduino.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 #include <new>
 
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -16,6 +18,7 @@
 #include "usb/ch376.h"
 #include "usb/ch376_sdfat.h"
 #include "usb/ch376_uart.h"
+#include "util/heap_phases.h"
 #include "util/log.h"
 
 namespace {
@@ -189,6 +192,7 @@ bool UsbVolume::open(UsbVolInfo& out) {
   }
   UartOpenHw hw;
   UsbOpenFail f = ses_.open(ch376_uart::link(), hw);
+  HeapPhase::mark(HeapPhase::UsbDrv);  // M4c1: драйвер UART2 і сеанс підняті (або відмова)
   const UsbOpenInfo& in = ses_.info();
   for (uint8_t i = 0; i < in.nSteps; i++)
     LOGI(TAG, "open: крок %u: %u Бод → %s", (unsigned)(i + 1), (unsigned)in.steps[i].baud, ch376ErrName(in.steps[i].err));
@@ -214,6 +218,7 @@ bool UsbVolume::open(UsbVolInfo& out) {
       release();
       UartOpenHw::stopChip();
     }
+    HeapPhase::mark(HeapPhase::UsbVol);  // M4c1: том SdFat змонтовано (або відмова й звільнення)
   }
   out.fail = f;
   out.openMs = millis() - t0;
@@ -263,8 +268,68 @@ void UsbVolume::release() {
 void UsbVolume::close() {
   Lk lk;  // не вдалось (мʼютекс чужий довше kUsbLockWaitMs) — все одно закриваємо: виклик лише коли читачів немає
   if (!vol_ && !ses_.isOpen() && !ch376_uart::started()) return;
+  HeapPhase::mark(HeapPhase::UsbClose);  // M4c1: до звільнення (пік ресурсів USB)
   release();
   UartOpenHw::stopChip();
+  HeapPhase::mark(HeapPhase::UsbClose);  // після: heap має повернутись до бази
+}
+
+bool UsbVolume::held() const {
+  Lk g(0);
+  if (!g.ok) return true;  // чіп зайнятий — вважаємо, що тримає
+  if (vol_ || file_ || ses_.isOpen() || ch376_uart::started()) return true;
+  for (int i = 0; i < kUsbDirHandles; i++)
+    if (dirs_[i]) return true;
+  return false;
+}
+
+// Найбільше число слотів (kUsbScanCacheSlots, /2, …, 0), після виділення якого free ≥ kUsbScanHeapReserve.
+static uint8_t pickSlots(uint32_t freeNow) {
+  uint8_t s = kUsbScanCacheSlots;
+  while (s > 0 && freeNow < kUsbScanHeapReserve + (uint32_t)s * 512u + kUsbScanCacheMetaBytes) s = (uint8_t)(s / 2);
+  return s;
+}
+
+void UsbVolume::scanTune() {
+  Lk lk(0);  // без очікування: це лише керування розміром кешу
+  if (!lk.ok || !vol_ || !ses_.isOpen() || !kUsbScanCacheSlots) return;
+  Ch376BlockDev* bd = ses_.dev();
+  const uint8_t cur = bd->cacheSlots();
+  const uint32_t freeNow = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  if (freeNow < kUsbScanHeapReserve) {  // heap просів (напр. фоновий реконект BT ≈10 КБ): віддати кеш, не чекаючи кінця скану
+    if (!cur) return;
+    const uint8_t to = cur > 2 ? (uint8_t)(cur / 2) : 0;
+    if (!bd->cacheResize(to, to ? (kUsbScanReadAhead < to ? kUsbScanReadAhead : to) : 1)) bd->cacheClose();
+    LOGW(TAG, "scan: heap %u Б < %u — кеш секторів %u → %u слотів", (unsigned)freeNow, (unsigned)kUsbScanHeapReserve, (unsigned)cur, (unsigned)to);
+    return;
+  }
+  if (cur >= kUsbScanCacheSlots) return;
+  // розширення — з гістерезисом; новий кеш виділяється до звільнення старого, тож враховуємо повну вартість
+  const uint8_t want = pickSlots(freeNow > kUsbScanHeapHyst ? freeNow - kUsbScanHeapHyst : 0);
+  if (want <= cur) return;
+  const uint8_t ra = kUsbScanReadAhead < want ? kUsbScanReadAhead : want;
+  if (bd->cacheResize(want, ra)) LOGI(TAG, "scan: heap звільнився (%u Б) — кеш секторів %u → %u слотів", (unsigned)freeNow, (unsigned)cur, (unsigned)want);
+}
+
+void UsbVolume::scanBegin() {
+  Lk lk;
+  mp3Only_ = kUsbScanSkipName;
+  if (!lk.ok || !vol_ || !ses_.isOpen()) return;
+  // Розмір кешу — за вільним heap: після BT→USB пам'ять BT звільняється асинхронно ще ≈2 с (розрив A2DP), тож free на старті
+  // скану може бути ≈11 КБ. Беремо найбільший розмір, після якого free ≥ kUsbScanHeapReserve; scanTune() розширить згодом.
+  const uint32_t freeNow = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  const uint8_t slots = pickSlots(freeNow);
+  const uint8_t ra = kUsbScanReadAhead < slots ? kUsbScanReadAhead : (slots ? slots : 1);
+  if (kUsbScanCacheSlots && !slots) LOGW(TAG, "scan: мало heap (%u Б) — кеш секторів вимкнено, скан повільний", (unsigned)freeNow);
+  else if (slots < kUsbScanCacheSlots) LOGW(TAG, "scan: мало heap (%u Б) — кеш секторів %u замість %u слотів", (unsigned)freeNow, (unsigned)slots, (unsigned)kUsbScanCacheSlots);
+  if (!ses_.dev()->cacheOpen(slots, ra)) LOGW(TAG, "scan: не вистачило heap на кеш секторів — скан без кеша");
+}
+
+void UsbVolume::scanEnd() {
+  Lk lk;
+  profEnd();  // знімок лічильників (кеш ще живий)
+  mp3Only_ = false;
+  if (ses_.isOpen()) ses_.dev()->cacheClose();
 }
 
 UsbLsRes UsbVolume::listDir(const char* path, uint32_t maxN, UsbLsFn fn, void* ctx, uint32_t& count, bool& more) {
@@ -349,6 +414,20 @@ void UsbVolume::profEnd() {
     prof_.calls = b.calls - base0_[0];
     prof_.sectors = b.sectors - base0_[1];
     prof_.cmds = b.cmds - base0_[2];
+    if (const SectorCacheStats* c = ses_.dev()->cacheStats()) {  // M4c1
+      prof_.cacheOn = true;
+      prof_.cSlots = ses_.dev()->cacheSlots();
+      prof_.cReqs = c->reqs;
+      prof_.cUnique = c->unique;
+      prof_.cWould = c->wouldHit;
+      prof_.cSeq = c->seq;
+      prof_.cSame = c->same;
+      prof_.cJump = c->jump;
+      prof_.cHits = c->hits;
+      prof_.cMiss = c->misses;
+      prof_.cEvict = c->evictions;
+      prof_.cRa = c->raSectors;
+    }
   }
 }
 
@@ -387,11 +466,27 @@ int UsbVolume::dirNext(int h, char* name, size_t cap, bool& nameOk, bool& isDir,
     return alive ? 0 : -1;
   }
   if (prof_.on) prof_.entries++;
+  isDir = ent.isDir();
+  hidden = ent.isHidden();
+#if USB_SCAN_SFN
+  if (mp3Only_ && !isDir && cap > 0) {  // M4c1: довге імʼя (дорого: SdFat перечитує службові записи) потрібне лише кандидатам у MP3
+    char sfn[16];
+    const size_t m = ent.getSFN(sfn, sizeof sfn);  // 8.3: «NAME~1.MP3»; для exFAT і невдачі — 0 (тоді звичайний getName)
+    if (m > 0 && m < sizeof sfn) {
+      const char* dot = strrchr(sfn, '.');
+      if (!dot || strcasecmp(dot + 1, "mp3") != 0) {  // суфікс 8.3 береться з довгого імені, тож це точно не *.mp3
+        name[0] = 0;
+        nameOk = true;  // імʼя «порожнє, але коректне»: Scanner відкине його як не-MP3 (без longName)
+        if (prof_.on) prof_.nameSkips++;
+        ent.close();
+        return 1;
+      }
+    }
+  }
+#endif
   const size_t n = ent.getName(name, cap);
   nameOk = n > 0 && n < cap;
   if (!nameOk) name[0] = 0;
-  isDir = ent.isDir();
-  hidden = ent.isHidden();
   ent.close();
   return 1;
 }
@@ -495,4 +590,5 @@ bool UsbFileReader::seek(uint32_t p) {
 }
 
 #endif  // ENABLE_USB_CH376
+
 

@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 
+#include "config.h"
 #include "core/types.h"
 
 struct SourceStatus {
@@ -34,4 +35,9 @@ class ISource {
   // M4b4: повторне SRC для вже активного джерела без носія. Ok — носій знайдено, скан розпочато (менеджер пошле STATE);
   // NoMedia — як раніше (лише ERR,no_media). Типово NoMedia: SD/BT/заглушка не змінюються. USB пробує відкрити том знову (виявлення — M4c).
   virtual Res retryMedia() { return Res::NoMedia; }
+#if ENABLE_USB_CH376
+  // M4c1: джерело просить app не чекати чергу команд 10 мс між порціями (триває скан USB). Черга обслуговується щоітерації як і раніше.
+  virtual bool wantsFastLoop() const { return false; }
+#endif
 };
+

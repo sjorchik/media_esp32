@@ -17,6 +17,7 @@
 #include "storage/storage_dbg.h"
 #include "usb/ch376_diag.h"
 #include "util/diag.h"
+#include "util/heap_phases.h"
 #include "util/log.h"
 
 namespace {
@@ -42,7 +43,7 @@ void help() {
   LOGI(TAG, "Команди контракту: HELLO,%d GET SRC,<bt|sd|usb|off> PLAY PAUSE TOGGLE STOP NEXT PREV FNEXT FPREV SHUF,<0|1> REP,<0|1|2>", kProtoVer);
   LOGI(TAG, "Також: LVL,<bt|sd|usb>,<-40..0> (proto_ver=%d; показ: DBG,lvl)", kProtoVer);
   LOGI(TAG, "Формат: NAME,арг,… або $BODY*XX");
-  LOGI(TAG, "DBG,help | DBG,heap | DBG,tasks | DBG,state");
+  LOGI(TAG, "DBG,help | DBG,heap | DBG,heap,phases | DBG,heap,reset | DBG,tasks | DBG,state");
   LOGI(TAG, "DBG,tone[,Гц[,мс]] — тест-тон (лише при src=off), типово 440 Гц 1500 мс");
   LOGI(TAG, "DBG,media — присутність SD, сирий рівень card-detect, лічильники Inserted/Removed (прийнято/дубль/дребезг), state джерела");
 #if SKIP_TEST_CMDS
@@ -65,6 +66,7 @@ void help() {
   LOGI(TAG, "DBG,link[,reset] — втрати черг, злиті TIME, час відправки кадру (UART1+дзеркало)");
   LOGI(TAG, "DBG,console[,reset] — M5c5: заповнення RX UART0 (cap/peak/high), рядки ok/long, макс. довжина, байти");
   LOGI(TAG, "DBG,lvl — рівень виходу bt/sd/usb і час рівня на кадр | DBG,lvl,<bt|sd|usb>,<-40..0> — послаблення, дБ (лише RAM, після перезапуску 0)");
+  LOGI(TAG, "DBG,lvl,reset — скинути лічильники блоків | DBG,heap,phases | DBG,heap,reset — мінімум heap по фазах (M4c1)");
   LOGI(TAG, "DBG,aout — стан AudioOut (мʼют, лічильники, власник мʼютекса) і задачі mp3 (де стоїть); читає без app, працює й при завислому app");
 #if ENABLE_USB_CH376
   LOGI(TAG, "DBG,usb — стан CH376S | DBG,usb,init — повна послідовність з мкс");
@@ -116,6 +118,12 @@ void lvlShow() {
   g_sd.dec().stats(st);
   LOGI(TAG, "lvl: час рівня на кадр SD/USB: сер. %u макс. %u мкс (остання сесія; 0 = файлове джерело не грало)", (unsigned)st.lvlAvgUs,
        (unsigned)st.lvlMaxUs);
+  LOGI(TAG, "lvl: кадрів з обходом (0 дБ) %u, з них вікно >50 мкс %u (витіснення, не обробка)", (unsigned)st.lvlUnityFrames,
+       (unsigned)st.lvlUnitySlow);
+  // M4c1: чи справді йде множення. На 0 дБ без рампи mul не росте; якщо lvlAvgUs великий, а mul стоїть — це не вартість обробки.
+  const level::Counters cn = level::counters();
+  LOGI(TAG, "lvl: блоків без множення %u, з множенням %u (кадрів %u) | DBG,lvl,reset — скинути", (unsigned)cn.unity, (unsigned)cn.mul,
+       (unsigned)cn.mulFrames);
 }
 
 // DBG,aout (M5c1): лише читання volatile-станів, без черги до app — відповідає й тоді, коли app завис на мʼютексі AudioOut.
@@ -177,7 +185,14 @@ void DebugCmds::handle(const proto::Msg& m) {
   if (!strcasecmp(c, "help")) {
     help();
   } else if (!strcasecmp(c, "heap")) {
-    Diag::logHeap("dbg");
+    if (m.argc >= 2 && !strcasecmp(m.args[1], "phases")) {  // M4c1: мінімум free/largest по фазах
+      HeapPhase::print();
+    } else if (m.argc >= 2 && !strcasecmp(m.args[1], "reset")) {
+      HeapPhase::reset();
+      LOGI(TAG, "heap: лічильники фаз скинуто");
+    } else {
+      Diag::logHeap("dbg");
+    }
   } else if (!strcasecmp(c, "tasks")) {
     Diag::logTasks();
   } else if (!strcasecmp(c, "state")) {
@@ -248,6 +263,11 @@ void DebugCmds::handle(const proto::Msg& m) {
     if (!(k == SdSource::Dbg::Info ? g_sd : fileSrc()).dbg(k, (int)n)) LOGW(TAG, "%s: попередня DBG-команда ще виконується", srcName(fileSrc().id()));
   } else if (!strcasecmp(c, "lvl")) {
     if (m.argc == 1) {
+      lvlShow();
+      return;
+    }
+    if (m.argc == 2 && !strcasecmp(m.args[1], "reset")) {  // M4c1: скинути лічильники блоків
+      level::resetCounters();
       lvlShow();
       return;
     }
@@ -368,3 +388,4 @@ void DebugCmds::handle(const proto::Msg& m) {
     LOGW(TAG, "невідома DBG-команда '%s' (DBG,help)", c);
   }
 }
+

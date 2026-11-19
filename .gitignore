@@ -10,3 +10,5 @@ project_dump.txt
 git_cheat_sheet.txt
 help.txt
 _dumps/
+
+*.log

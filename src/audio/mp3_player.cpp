@@ -577,8 +577,13 @@ Mp3Player::Ev Mp3Player::decodeLoop() {
 
     // 6b) M6c: рівень (слот sd/usb) → одне насичення, на місці в PCM-кадрі (int16, ch = 1|2); AudioOut далі дублює моно
     const int64_t tf = esp_timer_get_time();
-    level::apply(S->pcm, smp, (uint8_t)ch, level::advance((level::Slot)lvSlot_, smp));
+    const level::Gain lg = level::advance((level::Slot)lvSlot_, smp);
+    level::apply(S->pcm, smp, (uint8_t)ch, lg);
     const uint32_t lvlUs = (uint32_t)(esp_timer_get_time() - tf);
+    if (lg.unity) {  // M4c1: обхід не множить; довге вікно тут = витіснення задачі
+      stats_.lvlUnityFrames++;
+      if (lvlUs > 50) stats_.lvlUnitySlow++;
+    }
 
     // 7) вивід + оцінка underrun (запас даних у DMA, модель «дірявого відра», без довгого дрейфу годинника)
     size_t bytes = (size_t)smp * ch * 2;

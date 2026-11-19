@@ -349,6 +349,32 @@ inline constexpr uint32_t kUsbScanWarnMs = 8000;       // скан довший 
 inline constexpr size_t   kUsbFillMaxBytes = 1536;
 inline constexpr int      kUsbDirHandles = kScanMaxDepth + 1;  // одночасно відкритих каталогів скану (як у SdMedia)
 inline constexpr uint32_t kReadSliceMs = 15;           // порція DBG,sdread
+// ---- M4c1: швидкість скану USB, діагностика heap (код лише при ENABLE_USB_CH376) ----
+// Кроки для вимірів «до/після»: -DUSB_SCAN_STAGE=N (env esp32dev_usb_sN). 1 = лише лічильники секторів (як M4b4); 2 = + швидкий loop під час скану;
+// 3 = + LRU-кеш секторів; 4 = + читання наперед; 5 = + один прохід по каталогу й пропуск getName() для не-MP3. Типово 3.
+#ifndef USB_SCAN_STAGE
+#define USB_SCAN_STAGE 3  // виміряно на залізі: крок 3 дає скан 1170 треків за 3,0 с (ціль ≤ 8 с); кроки 4–5 вимкнено
+#endif
+#ifndef USB_SCAN_SFN
+#define USB_SCAN_SFN 0  // 1: перед getName() дивитись 8.3-суфікс через FsFile::getSFN. У вашій SdFat FsFile його не має → типово 0 (вимкнено)
+#endif
+inline constexpr uint8_t  kUsbScanCacheSlots = USB_SCAN_STAGE >= 3 ? 8 : 0;   // слотів кешу секторів (8 × 512 Б = 4 КБ heap лише на час скану); 0 = лише лічильники
+inline constexpr uint8_t  kUsbScanReadAhead = USB_SCAN_STAGE >= 4 ? 4 : 1;    // секторів за одну DISK_READ при послідовному читанні каталогу
+inline constexpr bool     kUsbScanOnePass = USB_SCAN_STAGE >= 5;               // один прохід по каталогу (імена підкаталогів — у пулі)
+inline constexpr bool     kUsbScanSkipName = USB_SCAN_STAGE >= 5 && USB_SCAN_SFN != 0;  // не читати довге імʼя файлів, чий 8.3-суфікс не MP3
+inline constexpr bool     kUsbScanFastLoop = USB_SCAN_STAGE >= 2;              // app: під час скану не чекати чергу 10 мс (див. SourceManager::wantsFastLoop)
+inline constexpr uint32_t kUsbScanHeapReserve = 8192;                          // скан не залишає heap нижче цього: кеш секторів зменшується (8→4→2→0 слотів)
+inline constexpr uint32_t kUsbPreActivateFreeHeap = 18000;                       // BT→USB: чекати, поки free ≥ цього (пам'ять BT звільняється ≈1,5 с після розриву A2DP)
+inline constexpr uint32_t kUsbPreActivateWaitMs = 4000;                        // ...але не довше (потім активуємо як є; кеш скану адаптується до heap)
+inline constexpr uint32_t kUsbScanHeapHyst = 2048;                              // запас при розширенні кешу (гістерезис, щоб не гойдатись)
+inline constexpr uint32_t kUsbScanCacheMetaBytes = 400;                        // службова частина кешу (теги, «тінь», бітова карта, обʼєкти)
+inline constexpr uint32_t kUsbScanSubPoolBytes = 1024;                         // пул імен підкаталогів (heap, лише на час скану)
+inline constexpr uint32_t kScanFastWaitTicks = 1;                              // очікування черги команд app під час скану USB, тіків (замість ≈10 мс)
+inline constexpr uint32_t kHeapSamplePeriodMs = 200;                           // період семплювання heap під час скану (DBG,heap,phases)
+static_assert(kUsbScanCacheSlots <= 8, "кеш секторів: ≤ 8 слотів (4 КБ)");
+static_assert(kUsbScanReadAhead >= 1 && kUsbScanReadAhead <= kCh376SectorsPerCmd, "читання наперед: 1..kCh376SectorsPerCmd секторів");
+static_assert(kUsbScanSubPoolBytes >= 256 && kUsbScanSubPoolBytes <= 4096, "пул імен підкаталогів: 256..4096 Б");
+static_assert(USB_SCAN_STAGE >= 1 && USB_SCAN_STAGE <= 5, "USB_SCAN_STAGE: 1..5");
 inline constexpr size_t   kEvFolderNameMax = 48;       // макс. байтів назви папки в події FOLDER
 inline constexpr size_t   kEvMetaFieldMax = 96;        // макс. байтів назви в META (SD: імʼя файлу без .mp3)
 inline constexpr uint32_t kPrevRestartMs = 3000;       // PREV: позиція більша за це → перезапуск поточного треку
@@ -409,3 +435,4 @@ inline constexpr int kPrioDecoder = 5;   // нижче за audio (6), вище 
 
 // ---- Діагностика ----
 inline constexpr uint32_t kDiagPeriodMs = 60000;
+

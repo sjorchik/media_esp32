@@ -96,7 +96,20 @@ void UsbMedia::scanProfile(int what, uint32_t wallMs, uint32_t busyMs) {
        (unsigned)openMs, pct(openMs), (unsigned)lockMs, pct(lockMs));
   LOGI(TAG, "профіль: логіка скану %u (%u%%), простій loop %u (%u%%), closeDir %u (%u%%)", (unsigned)logic, pct(logic), (unsigned)idle, pct(idle),
        (unsigned)closeMs, pct(closeMs));
+  // M4c1: звернення до секторів (гіпотеза «повторне читання»). unique — бітова карта, недооцінка ≈10% при >300 секторів.
+  const uint32_t rep = p.cReqs > p.cUnique ? p.cReqs - p.cUnique : 0;
+  LOGI(TAG, "сектори: запитів %u, унікальних≈%u, повторних≈%u, у LRU-вікні 8: %u", (unsigned)p.cReqs, (unsigned)p.cUnique, (unsigned)rep,
+       (unsigned)p.cWould);
+  LOGI(TAG, "сектори: послідовних %u, тих самих %u, стрибків %u", (unsigned)p.cSeq, (unsigned)p.cSame, (unsigned)p.cJump);
+  LOGI(TAG, "кеш %s: слотів %u, попадань %u, промахів %u, витіснень %u, наперед %u", p.cacheOn ? "є" : "немає", (unsigned)p.cSlots,
+       (unsigned)p.cHits, (unsigned)p.cMiss, (unsigned)p.cEvict, (unsigned)p.cRa);
+  LOGI(TAG, "getName пропущено: %u файлів (суфікс 8.3 не MP3)", (unsigned)p.nameSkips);
 }
+
+// M4c1: кеш секторів і фільтр імен діють лише між scanBegin() і scanEnd(); у відтворенні їх немає.
+void UsbMedia::scanBegin() { UsbVolume::get().scanBegin(); }
+
+void UsbMedia::scanEnd() { UsbVolume::get().scanEnd(); }
 
 void UsbMedia::ioLock() {
   locked_ = UsbVolume::get().lockFor(kUsbLockWaitMs);

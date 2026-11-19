@@ -50,5 +50,12 @@ class IMedia {
   virtual void scanProfile(int what, uint32_t wallMs = 0, uint32_t busyMs = 0) { (void)what; (void)wallMs; (void)busyMs; }
   virtual void ioLock() {}
   virtual void ioUnlock() {}
+#if ENABLE_USB_CH376
+  // M4c1. Тимчасові ресурси скану (USB: кеш секторів на heap, пропуск getName() для не-MP3). scanBegin() — перед Scanner::start,
+  // scanEnd() — після завершення АБО переривання скану (ідемпотентно); у відтворенні ресурсів скану немає. SD: no-op.
+  virtual void scanBegin() {}
+  virtual void scanEnd() {}
+#endif
 };
+
 

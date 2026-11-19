@@ -56,6 +56,17 @@ int8_t getDb(Slot s);
 // Слот, який востаннє використовував advance() (-1 = ще ніхто). Для DBG,lvl.
 int lastSlot();
 
+// M4c1. Лічильники блоків (рахує advance(); лише діагностика): unity — блоки без множення (усталений 0 дБ: apply() нічого не робить),
+// mul — блоки, що пройшли множення (рівень ≠ 0 дБ або рампа), mulFrames — кадрів у них. На 0 дБ без рампи mul не росте (DBG,lvl).
+// Пише лише задача PCM, читає консоль (без блокувань; значення можуть бути на один блок застарілі).
+struct Counters {
+  uint32_t unity;
+  uint32_t mul;
+  uint32_t mulFrames;
+};
+Counters counters();
+void resetCounters();
+
 // Бере в рампи frames кадрів слота s і повертає параметри блоку. Зміна слота (інше джерело) —
 // стрибок одразу до цілі без рампи (потік новий). Лише з задачі, що пише PCM.
 Gain advance(Slot s, int32_t frames);
@@ -67,3 +78,4 @@ void apply(int16_t* buf, int32_t frames, uint8_t ch, const Gain& lg);
 void process(int16_t* buf, int32_t frames, uint8_t ch, Slot s);
 
 }  // namespace level
+

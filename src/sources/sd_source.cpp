@@ -13,6 +13,7 @@
 #include "storage/resume_store.h"
 #include "storage/resume_vol.h"
 #include "util/diag.h"
+#include "util/heap_phases.h"
 #include "util/log.h"
 #include "util/utf8.h"
 
@@ -100,12 +101,23 @@ Res SdSource::activate() {
 
 void SdSource::deactivate() {
   g_audio.mute();  // мʼют ДО зупинки (ідемпотентно: менеджер уже мʼютив) — без клацань і «хвостів»
+#if ENABLE_USB_CH376
+  const bool wasScan = active_ && st_ == PlayState::Scan;  // M4c1: вимір переривання скану
+  const uint32_t tDeact = millis();
+#endif
   if (active_ && (st_ == PlayState::Play || st_ == PlayState::Pause)) saveResume(false);  // позиція ДО зупинки сесії; носія нема — не пишеться
   stopJobs();      // скан, DBG-читання, сесія декодера; після цього файл закрито
   active_ = false;
   st_ = PlayState::Idle;
 #if ENABLE_USB_CH376
-  if (prof_.ownsMount) applyStep(pol_.deactivate(), true);  // M4b4: MEDIA usb → 0, том і драйвер закрито
+  if (prof_.ownsMount) {
+    applyStep(pol_.deactivate(), true);  // M4b4: MEDIA usb → 0, том і драйвер закрито
+    // M4c1: ексклюзивність — усі ресурси USB (том, файл, каталоги, кеш, порт чіпа) вільні ДО activate() наступного джерела.
+    media_.unmount();  // ідемпотентно (політика могла вважати том закритим)
+    LOGI(TAG, "deactivate: ресурси USB %s%s", UsbVolume::get().held() ? "ЛИШИЛИСЬ ЗАЙНЯТИМИ" : "звільнено",
+         wasScan ? " (скан перервано)" : "");
+    if (wasScan) LOGI(TAG, "скан USB перервано, ресурси звільнено за %u мс", (unsigned)(millis() - tDeact));
+  }
   pl_.clear();      // арена плейлиста спільна для SD і USB: наступне джерело скануватиме її заново
   scanned_ = false;
 #endif
@@ -122,6 +134,13 @@ void SdSource::loop(uint32_t now) {
   if (st_ == PlayState::Scan) scanStep();
   else if (st_ == PlayState::Play || st_ == PlayState::Pause) pollPlayer(now);
 }
+
+#if ENABLE_USB_CH376
+// M4c1: під час скану USB app не чекає чергу команд 10 мс між порціями; черга обслуговується щоітерації (одна порція ≈ kScanSliceMs).
+bool SdSource::wantsFastLoop() const {
+  return kUsbScanFastLoop && prof_.ownsMount && active_ && st_ == PlayState::Scan && sus_ == Sus::None;
+}
+#endif
 
 void SdSource::service(uint32_t now) {
   MediaEvent ev = media_.poll(now);
@@ -205,7 +224,12 @@ Res SdSource::retryMedia() {
 #endif
 
 void SdSource::stopJobs() {
-  scanner_.abort();
+  const bool wasScan = scanner_.state() == Scanner::St::Running;
+  scanner_.abort();  // закриває каталоги, звільняє пул імен підкаталогів
+#if ENABLE_USB_CH376
+  media_.scanEnd();  // M4c1: кеш секторів звільнено (і при перериванні скану); ідемпотентно
+#endif
+  if (wasScan) HeapPhase::mark(HeapPhase::ScanEnd);
   endSession();  // зупиняє декодер і закриває файл (це ж закриває й DBG,sdread)
   rdOpen_ = false;
   job_ = Dbg::None;
@@ -240,17 +264,38 @@ void SdSource::startScan() {
   tagTrack_ = kNoTag;
   nav_.detach();  // перестановка живе в арені, яку скан перезаписує
   errRun_ = 0;
+#if ENABLE_USB_CH376
+  if (SRC_IS_USB) {
+    media_.scanBegin();  // M4c1: кеш секторів (heap) і фільтр getName() — лише на час скану
+    scanner_.setOnePass(kUsbScanOnePass);
+  }
+#endif
   if (SRC_IS_USB) media_.scanProfile(0);  // M4b4: профіль скану (лише USB)
   scanner_.start(media_, pl_);
+  hpAt_ = millis() + kHeapSamplePeriodMs;
+  HeapPhase::mark(HeapPhase::ScanStart);
   LOGI(TAG, "скан розпочато");
 }
 
 void SdSource::scanStep() {
   Scanner::St r = scanner_.step(kScanSliceMs);
-  if (r != Scanner::St::Running) {
-    if (SRC_IS_USB) media_.scanProfile(1);
-    finishScan(r);
+  if (r == Scanner::St::Running) {
+#if ENABLE_USB_CH376
+    if (prof_.ownsMount) UsbVolume::get().scanTune();  // M4c1: кожну порцію: віддати кеш при просіданні heap, розширити — коли звільнився
+#endif
+    const uint32_t now = millis();
+    if (due(now, hpAt_)) {  // M4c1: пік використання heap під час скану
+      HeapPhase::mark(HeapPhase::ScanPeak);
+      hpAt_ = now + kHeapSamplePeriodMs;
+    }
+    return;
   }
+  if (SRC_IS_USB) media_.scanProfile(1);
+#if ENABLE_USB_CH376
+  media_.scanEnd();  // M4c1: кеш секторів звільнено до finishScan (знімок профілю вже взято)
+#endif
+  HeapPhase::mark(HeapPhase::ScanEnd);
+  finishScan(r);
 }
 
 void SdSource::finishScan(Scanner::St r) {
@@ -260,6 +305,8 @@ void SdSource::finishScan(Scanner::St r) {
        (unsigned)s.foldersWithTracks, (unsigned)pl_.used(), (unsigned)Playlist::capacity());
   Diag::logHeap(SRC_IS_USB ? "usb-scan" : "sd-scan");
 #if ENABLE_USB_CH376
+  if (prof_.ownsMount)  // M4c1: найдовший крок = верхня межа затримки реакції на SRC/STOP (разом із очікуванням черги)
+    LOGI(TAG, "скан: найдовший крок %u мс, каталогів перечитано %u", (unsigned)s.advMaxMs, (unsigned)s.reread);
   if (prof_.ownsMount && s.wallMs > kUsbScanWarnMs)
     LOGW(TAG, "скан %u мс > %u мс: надто довгий (варіанти — у звіті M4b4)", (unsigned)s.wallMs, (unsigned)kUsbScanWarnMs);
 #endif
@@ -518,6 +565,8 @@ Res SdSource::startTrack(uint16_t n, uint32_t off, uint32_t ms) {
 #endif
   dec_.startSessionAt(off, ms);
   st_ = PlayState::Play;
+  HeapPhase::mark(HeapPhase::Play);
+  hpAt_ = millis() + 5 * kHeapSamplePeriodMs;
   nextTimeAt_ = millis() + kTimeEventMs;
   rsmAt_ = millis() + kResumeSaveMs;
   infoSeq_ = dec_.infoSeq();
@@ -648,6 +697,10 @@ void SdSource::pollPlayer(uint32_t now) {
     return;
   }
   if (st_ != PlayState::Play) return;
+  if (due(now, hpAt_)) {  // M4c1: мінімум heap у відтворенні (≈ раз на секунду)
+    HeapPhase::mark(HeapPhase::Play);
+    hpAt_ = now + 5 * kHeapSamplePeriodMs;
+  }
   if (!act) {  // M5c3: сторожа — state=play без сесії («зомбі»: звуку нема, команди «ніби працюють»)
     guardN_++;
     LOGW(TAG, "сторожа: state=play без сесії (#%u) -> stop, мʼют", (unsigned)guardN_);
@@ -1156,4 +1209,5 @@ void SdSource::dbgResume(bool clear) {
     LOGI(TAG, "resume: зараз #%u зсув=%u Б час=%u мс, останній запис зсув=%u Б", (unsigned)cur_ + 1, (unsigned)off, (unsigned)ms,
          (unsigned)rsmLastOff_);
 }
+
 

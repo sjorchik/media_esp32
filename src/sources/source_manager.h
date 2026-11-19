@@ -20,6 +20,10 @@ class SourceManager {
   PlayState state() const;
   bool shuffle() const { return shuf_; }
   uint8_t repeat() const { return rep_; }
+#if ENABLE_USB_CH376
+  // M4c1: app під час скану USB чекає чергу команд kScanFastWaitTicks замість ≈10 мс (main.cpp: див. report_M4c1.md, «що лишилось»).
+  bool wantsFastLoop() const { return src_[(int)cur_] && src_[(int)cur_]->wantsFastLoop(); }
+#endif
 
  private:
   void publish(bool force);          // STATE при зміні + політика мʼюту DAC
@@ -38,3 +42,4 @@ class SourceManager {
   uint8_t pubRep_ = 0;
   uint8_t lastSaved_ = 0;
 };
+

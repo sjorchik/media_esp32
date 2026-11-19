@@ -1,10 +1,16 @@
 #include "sources/source_manager.h"
 
+#include <Arduino.h>
+#if ENABLE_USB_CH376
+#include "esp_heap_caps.h"
+#endif
+
 #include "core/device_state.h"
 #include "core/events.h"
 #include "storage/boot_guard_store.h"
 #include "storage/settings_store.h"
 #include "util/diag.h"
+#include "util/heap_phases.h"
 #include "util/log.h"
 
 namespace {
@@ -13,6 +19,8 @@ constexpr const char* TAG = "src";
 bool mediaMissing(SrcId id) {
   return (id == SrcId::SD && !DeviceState::sd()) || (id == SrcId::USB && !DeviceState::usb());
 }
+// M4c1: фаза heap для активації джерела
+HeapPhase::Phase actPhase(SrcId id) { return id == SrcId::BT ? HeapPhase::BtAct : id == SrcId::USB ? HeapPhase::UsbAct : HeapPhase::SdAct; }
 }  // namespace
 
 void SourceManager::begin(AudioOut* audio, ISource* bt, ISource* sd, ISource* usb) {
@@ -68,12 +76,31 @@ Res SourceManager::select(SrcId id) {
     return Res::Ok;
   }
   LOGI(TAG, "перемикання %s -> %s", srcName(cur_), srcName(id));
+  const uint32_t t0 = millis();  // M4c1: тривалість перемикання (скан USB має переривалось швидко)
   audio_->mute();  // тиша до зупинки попереднього джерела
+  const SrcId prevId = cur_;
   ISource* prev = src_[(int)cur_];
   if (prev) {
     LOGI(TAG, "deactivate %s", srcName(cur_));
+    HeapPhase::mark(HeapPhase::Deact);
     prev->deactivate();  // завершується до activate() нового (BT: AVRCP pause, прийом PCM вимкнено)
+    HeapPhase::mark(HeapPhase::Deact);
   }
+  const uint32_t tDeact = millis() - t0;
+#if ENABLE_USB_CH376
+  // M4c1: розрив BT асинхронний — його памʼять звільняється лише ≈1,5 с після deactivate. Відкриття USB (драйвер, том, кеш скану) у цей час
+  // лишає heap на 2–6 КБ. Чекаємо звільнення (без змін у BT), не довше kUsbPreActivateWaitMs; команди тим часом стоять у черзі.
+  if (id == SrcId::USB && prevId == SrcId::BT) {
+    const uint32_t w0 = millis();
+    uint32_t fr = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    const uint32_t fr0 = fr;
+    while (fr < kUsbPreActivateFreeHeap && millis() - w0 < kUsbPreActivateWaitMs) {
+      delay(50);
+      fr = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    }
+    LOGI(TAG, "BT→USB: чекав звільнення памʼяті BT %u мс (free %u → %u Б)", (unsigned)(millis() - w0), (unsigned)fr0, (unsigned)fr);
+  }
+#endif
   cur_ = id;
   Res r = Res::Ok;
   ISource* nx = src_[(int)id];
@@ -81,7 +108,9 @@ Res SourceManager::select(SrcId id) {
     nx->setShuffle(shuf_);
     nx->setRepeat(rep_);
     LOGI(TAG, "activate %s", srcName(id));
+    HeapPhase::mark(actPhase(id));
     r = nx->activate();
+    HeapPhase::mark(actPhase(id));
   } else {
     LOGI(TAG, "src=off: DAC замʼючено");
   }
@@ -90,6 +119,7 @@ Res SourceManager::select(SrcId id) {
   Diag::logTasks();
   publish(false);
   if (r != Res::Ok) emitErr(r, nullptr);
+  LOGI(TAG, "перемикання %s завершено за %u мс (deactivate %u мс)", srcName(id), (unsigned)(millis() - t0), (unsigned)tDeact);
   return r;
 }
 
@@ -188,4 +218,5 @@ void SourceManager::loop(uint32_t nowMs) {
   if (s) s->loop(nowMs);
   publish(false);  // STATE після TRACK/FOLDER/META/TIME, які породив loop()
 }
+
 

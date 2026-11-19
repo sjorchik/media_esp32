@@ -26,6 +26,8 @@ class UsbMedia final : public IMedia {
   void info(MediaInfo& out) override;
   uint32_t volumeId() const override { return serial_; }
   void scanProfile(int what, uint32_t wallMs = 0, uint32_t busyMs = 0) override;
+  void scanBegin() override;  // M4c1: кеш секторів (heap) + пропуск getName() для не-MP3
+  void scanEnd() override;    // M4c1: знімок профілю, звільнення кеша (ідемпотентно)
   void ioLock() override;
   void ioUnlock() override;
 
@@ -43,3 +45,4 @@ class UsbMedia final : public IMedia {
 };
 
 #endif  // ENABLE_USB_CH376
+

@@ -18,6 +18,9 @@ uint8_t s_slot = 0xFF;    // слот останнього advance (0xFF = ще 
 
 constexpr float kStep = 1.0f / (float)kLevelRampFrames;  // зміна коефіцієнта за кадр
 
+// M4c1: лічильники блоків (одна пишуча задача; читання з консолі без блокувань)
+volatile uint32_t s_nUnity = 0, s_nMul = 0, s_nMulFrames = 0;
+
 int clampDb(int db) {
   if (db < kLevelMinDb) db = kLevelMinDb;
   if (db > kLevelMaxDb) db = kLevelMaxDb;
@@ -42,6 +45,14 @@ int8_t level::getDb(Slot s) {
 
 int level::lastSlot() { return s_last.load(std::memory_order_relaxed); }
 
+level::Counters level::counters() { return Counters{s_nUnity, s_nMul, s_nMulFrames}; }
+
+void level::resetCounters() {
+  s_nUnity = 0;
+  s_nMul = 0;
+  s_nMulFrames = 0;
+}
+
 level::Gain level::advance(Slot s, int32_t frames) {
   const uint8_t si = static_cast<uint8_t>(s);
   if (si >= kSlots) return kUnityGain;
@@ -65,6 +76,12 @@ level::Gain level::advance(Slot s, int32_t frames) {
     g.nRamp = 0;
     g.gEnd = s_cur;
     g.unity = (s_cur >= 1.0f);
+    if (g.unity) {
+      s_nUnity = s_nUnity + 1;
+    } else {
+      s_nMul = s_nMul + 1;
+      s_nMulFrames = s_nMulFrames + (uint32_t)(frames > 0 ? frames : 0);
+    }
     return g;
   }
   const float ad = fabsf(diff);
@@ -77,6 +94,8 @@ level::Gain level::advance(Slot s, int32_t frames) {
   g.gEnd = (n == need) ? s_tgt : s_cur + g.dg * static_cast<float>(n);
   g.unity = false;
   s_cur = g.gEnd;
+  s_nMul = s_nMul + 1;
+  s_nMulFrames = s_nMulFrames + (uint32_t)frames;
   return g;
 }
 
@@ -103,3 +122,4 @@ void level::process(int16_t* buf, int32_t frames, uint8_t ch, Slot s) {
   if (buf == nullptr || frames <= 0) return;
   apply(buf, frames, ch, advance(s, frames));
 }
+

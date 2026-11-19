@@ -66,6 +66,12 @@ struct UsbScanProf {
   uint32_t closeN = 0, closeUs = 0;
   uint32_t lockN = 0, lockWaitUs = 0, lockWaitMaxUs = 0;  // очікування мʼютекса (лише всередині openDir/openNext/closeDir і читань під час скану)
   uint32_t calls = 0, sectors = 0, cmds = 0;       // блочний пристрій: різниця за час скану
+  // M4c1: звернення до секторів і кеш (знімок із SectorCache у profEnd/scanEnd)
+  bool cacheOn = false;
+  uint8_t cSlots = 0;
+  uint32_t cReqs = 0, cUnique = 0, cWould = 0, cSeq = 0, cSame = 0, cJump = 0;
+  uint32_t cHits = 0, cMiss = 0, cEvict = 0, cRa = 0;
+  uint32_t nameSkips = 0;                          // файли, для яких getName() пропущено (суфікс 8.3 не MP3)
 };
 
 class UsbVolume {
@@ -107,6 +113,14 @@ class UsbVolume {
   void profEnd();
   const UsbScanProf& prof() const { return prof_; }
 
+  // M4c1: тимчасові ресурси скану. scanBegin(): кеш секторів на heap (kUsbScanCacheSlots, 0 = лише лічильники) і фільтр getName();
+  // scanEnd(): знімок лічильників у профіль, звільнення кеша, зняття фільтра (ідемпотентно; і при перериванні скану).
+  void scanBegin();
+  void scanEnd();
+  void scanTune();  // M4c1: під час скану розширює кеш секторів до kUsbScanCacheSlots, коли heap дозволяє (після BT→USB)
+  // Чи тримає щось (том, файл, каталоги, кеш, порт чіпа). Для перевірки ексклюзивності після deactivate (бере мʼютекс).
+  bool held() const;
+
   // M4b4: ексклюзивний доступ до чіпа ззовні (запис NVS зупиняє кеш флешу: UART-обмін у цей час недопустимий).
   bool lockFor(uint32_t ms);
   void unlock();
@@ -126,6 +140,7 @@ class UsbVolume {
   uint32_t serial_ = 0;
   UsbScanProf prof_;
   uint32_t base0_[3] = {0, 0, 0};  // BlockDevStats (calls, sectors, cmds) на початок скану
+  bool mp3Only_ = false;           // M4c1: dirNext не читає довге імʼя файлів із суфіксом 8.3 ≠ MP3 (лише під час скану)
   UsbFileReader rd_;
 };
 
@@ -133,4 +148,5 @@ class UsbVolume {
 static_assert(sizeof(UsbOpenInfo) <= 160, "UsbOpenInfo завеликий для статичної памʼяті");
 
 #endif  // ENABLE_USB_CH376
+
 

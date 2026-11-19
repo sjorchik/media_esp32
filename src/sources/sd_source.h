@@ -52,6 +52,7 @@ class SdSource : public ISource {
   Res refreshMedia() override;
 #if ENABLE_USB_CH376
   Res retryMedia() override;  // M4b4: повторне SRC,usb без тому — спроба відкрити його знову (виявлення вставлення — M4c)
+  bool wantsFastLoop() const override;  // M4c1: триває скан USB → app не чекає чергу 10 мс
 #endif
 
   // DBG (з будь-якої задачі): лише ставить запит; виконує app. false = попереднє ще виконується.
@@ -154,6 +155,7 @@ class SdSource : public ISource {
   uint8_t failN_ = 0;                      // M5c1: скільки наступних стартів треку штучно завершити помилкою (SKIP_TEST_CMDS)
   uint8_t failMode_ = 0;                   // 0 = read_fail, 1 = decode_fail
   uint32_t nextTimeAt_ = 0, infoSeq_ = 0;
+  uint32_t hpAt_ = 0;                      // M4c1: коли наступний замір heap (скан/відтворення), DBG,heap,phases
   uint16_t tagTrack_ = 0xFFFF;             // для якого треку чинні dec_.tags() (0xFFFF = ні)
   uint32_t tagSeqSeen_ = 0;                // останній забраний dec_.tagSeq()
   uint32_t shownHash_ = 0;                 // хеш META, надісланого останнім (для порівняння «змінилось»)
@@ -173,4 +175,5 @@ class SdSource : public ISource {
   bool rdOpen_ = false;
   uint32_t rdBytes_ = 0, rdBusyUs_ = 0, rdT0_ = 0;
 };
+
 

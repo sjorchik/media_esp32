@@ -80,7 +80,13 @@ void setup() {
 
 void loop() {
   Cmd c;
-  if (xQueueReceive(s_cmdQ, &c, pdMS_TO_TICKS(10)) == pdTRUE) {
+#if ENABLE_USB_CH376
+  // M4c1: під час скану USB не чекаємо чергу 10 мс між порціями скану (черга все одно обслуговується щоітерації)
+  const TickType_t waitTicks = g_sources.wantsFastLoop() ? (TickType_t)kScanFastWaitTicks : pdMS_TO_TICKS(10);
+#else
+  const TickType_t waitTicks = pdMS_TO_TICKS(10);
+#endif
+  if (xQueueReceive(s_cmdQ, &c, waitTicks) == pdTRUE) {
     do {
       g_sources.handle(c);
     } while (xQueueReceive(s_cmdQ, &c, 0) == pdTRUE);

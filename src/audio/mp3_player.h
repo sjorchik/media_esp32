@@ -20,6 +20,7 @@ struct Mp3Stats {
   uint32_t inFill, inCap;                // заповнення вхідного буфера
   uint32_t rdBytes, rdBusyUs, rdMaxUs;   // читання файлу
   uint32_t lvlAvgUs, lvlMaxUs;           // M6c: час рівня на кадр (advance+apply), мкс; було fxAvgUs/fxMaxUs (EQ+рівень)
+  uint32_t lvlUnityFrames, lvlUnitySlow; // M4c1: кадрів з обходом (unity) і серед них із вікном рівня > 50 мкс (витіснення задачі, не обробка)
 };
 
 // MP3-декодер SD (minimp3) в окремій задачі (ядро 1, prio kPrioDecoder). Конвеєр:
@@ -131,3 +132,4 @@ class Mp3Player {
   volatile uint8_t inj_ = 0;           // Ev штучної помилки (0 = нема)
 #endif
 };
+
