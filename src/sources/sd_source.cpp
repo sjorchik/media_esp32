@@ -14,6 +14,7 @@
 #include "storage/resume_vol.h"
 #include "util/diag.h"
 #include "util/heap_phases.h"
+#include "util/stall_watch.h"
 #include "util/log.h"
 #include "util/utf8.h"
 
@@ -125,6 +126,7 @@ void SdSource::deactivate() {
 }
 
 void SdSource::loop(uint32_t now) {
+  StallWatch::disarm();  // M5c6: app повернулась у loop — сторож зависання після скану знято
   service(now);
   if (!active_) return;
   if (sus_ != Sus::None) {  // M5c3: чекаємо Removed; скан/відтворення не рухаємо
@@ -298,7 +300,11 @@ void SdSource::scanStep() {
   finishScan(r);
 }
 
+static void stallThunk(void* p) { static_cast<SdSource*>(p)->stallDump(); }
+
 void SdSource::finishScan(Scanner::St r) {
+  StallWatch::arm(&stallThunk, this, kStallWatchMs);  // M5c6: не повернулись у loop за kStallWatchMs → один дамп стану
+  endGuard_.reset();
   const ScanStats& s = scanner_.stats();
   LOGI(TAG, "скан %s: %u мс (робота %u мс), треків=%u папок=%u (з треками %u), арена=%u/%u", scanStName(r),
        (unsigned)s.wallMs, (unsigned)s.busyMs, (unsigned)s.tracks, (unsigned)s.foldersTotal,
@@ -524,6 +530,7 @@ Res SdSource::nav(Nav k) {
     }
   }
   errRun_ = 0;
+  endGuard_.reset();
   return playTrack(p.to, p.why, p.act);
 }
 
@@ -555,6 +562,15 @@ Res SdSource::startTrack(uint16_t n, uint32_t off, uint32_t ms) {
     return media_.mounted() ? Res::ReadFail : Res::NoMedia;
   }
   LOGI(TAG, "play #%u %s (%u Б)", (unsigned)n + 1, path, (unsigned)media_.reader().size());
+  if (off) {  // M5c6: резюме у хвості треку (< kResumeTailMs) або за кінцем файлу → з початку (інакше трек закінчується миттєво)
+    const PlayGuard::ResumeFix fx = PlayGuard::fixResume(off, ms, media_.reader().size(), kResumeTailMs, kResumeTailGuard);
+    if (fx.reset) {
+      LOGI(TAG, "резюме: зсув %u Б (%u мс) у хвості треку або за кінцем (розмір %u Б) -> з початку", (unsigned)off, (unsigned)ms,
+           (unsigned)media_.reader().size());
+      off = ms = 0;
+    }
+  }
+  rsmFrozen_ = false;
 #if SKIP_TEST_CMDS
   if (failN_) {  // M5c1: штучний збій — задача mp3 поверне помилку після розмʼюту, далі звичайний шлях (pollPlayer → onPlayError)
     failN_--;
@@ -564,6 +580,7 @@ Res SdSource::startTrack(uint16_t n, uint32_t off, uint32_t ms) {
   }
 #endif
   dec_.startSessionAt(off, ms);
+  endGuard_.start(millis());
   st_ = PlayState::Play;
   HeapPhase::mark(HeapPhase::Play);
   hpAt_ = millis() + 5 * kHeapSamplePeriodMs;
@@ -638,6 +655,7 @@ Res SdSource::play() {
     return Res::Ok;
   }
   errRun_ = 0;
+  endGuard_.reset();
   Pick p = nav_.play(cur_);       // після завершеного кола shuffle — нове коло (перший ≠ останньому)
   return playTrack(p.to, p.why, p.act);
 }
@@ -658,6 +676,7 @@ Res SdSource::pause() {
 Res SdSource::stop() {
   if (st_ == PlayState::Scan) return Res::BadState;
   errRun_ = 0;
+  endGuard_.reset();
   sus_ = Sus::None;  // M5c3: STOP скасовує відкладений вердикт (інакше після очікування стартував би наступний трек)
   if (st_ == PlayState::Play || st_ == PlayState::Pause) {
     endSession();
@@ -680,6 +699,14 @@ void SdSource::pollPlayer(uint32_t now) {
     switch (ev) {
       case Mp3Player::Ev::Eof:
         LOGI(TAG, "кінець треку #%u", (unsigned)cur_ + 1);
+        if (endGuard_.onEnd(now, kShortEndMs, kShortEndRun)) {  // M5c6: трек закінчується миттєво кілька разів підряд → не повторюємо
+          LOGW(TAG, "зациклення: %u поспіль завершень швидше за %u мс -> stop", (unsigned)kShortEndRun, (unsigned)kShortEndMs);
+          endGuard_.reset();
+          g_audio.mute();
+          rsmWrite(0, 0);
+          Events::err(resCode(Res::DecodeFail), "loop");  // STATE,<src>,stop надішле менеджер (st_ вже stop)
+          break;
+        }
         onTrackEnd();
         break;
       case Mp3Player::Ev::ReadFail:  // M5c3: може бути наслідком виймання картки — вердикт відкладено (susStep)
@@ -795,6 +822,7 @@ bool SdSource::rsmWrite(uint32_t off, uint32_t ms) {
 
 // Поточна позиція декодера → NVS. periodic: лише якщо зсув змінився щонайменше на один кадр відносно останнього запису.
 void SdSource::saveResume(bool periodic) {
+  if (rsmFrozen_) return;  // M5c6: DBG,resume,tail — не затирати налагоджувальне резюме
   uint32_t off = 0, ms = 0;
   if (!dec_.position(off, ms)) return;
   if (periodic) {
@@ -847,6 +875,7 @@ void SdSource::runDbg() {
     case Dbg::ShufTest: dbgShufTest(); job_ = Dbg::None; break;
     case Dbg::Resume: dbgResume(false); job_ = Dbg::None; break;
     case Dbg::ResumeClear: dbgResume(true); job_ = Dbg::None; break;
+    case Dbg::ResumeTail: dbgResumeTail(); job_ = Dbg::None; break;
     case Dbg::FailNext: dbgFailNext(); job_ = Dbg::None; break;
     default: job_ = Dbg::None; break;
   }
@@ -1163,6 +1192,43 @@ void SdSource::dbgShufTest() {
     all = false;
   }
   LOGI(TAG, "shuftest: %s", all ? "OK" : "FAIL");
+}
+
+// DBG,resume,tail,<мс>: записує резюме поточного треку як «кінець треку мінус N мс» (позиція за тривалістю, зсув пропорційно розміру файлу).
+// Потрібен трек у play/pause з відомою тривалістю. Далі періодичний запис і запис при deactivate не затирають його (rsmFrozen_ до нового старту).
+void SdSource::dbgResumeTail() {
+  const uint32_t n = (uint32_t)arg_;
+  const uint32_t dur = dec_.durMs();
+  const uint32_t size = media_.reader().isOpen() ? media_.reader().size() : 0;
+  if (!active_ || (st_ != PlayState::Play && st_ != PlayState::Pause) || !dur || !size) {
+    LOGW(TAG, "resume,tail: потрібен трек у play/pause з відомою тривалістю (стан=%d, тривалість %u мс, розмір %u Б)", (int)st_, (unsigned)dur,
+         (unsigned)size);
+    return;
+  }
+  const uint32_t ms = dur > n ? dur - n : 0;
+  const uint32_t off = (uint32_t)((uint64_t)size * ms / dur);
+  rsmFrozen_ = true;
+  const bool ok = rsmWrite(off, ms);
+  LOGI(TAG, "resume,tail: #%u зсув=%u Б час=%u мс (кінець − %u мс, тривалість %u мс) %s", (unsigned)cur_ + 1, (unsigned)off, (unsigned)ms, (unsigned)n,
+       (unsigned)dur, ok ? "записано" : "НЕ ЗАПИСАНО");
+}
+
+// M5c6: стан для сторожа (з esp_timer). Показує, де стоїть задача mp3, мʼют DAC, резюме й лічильники.
+void SdSource::stallDump() {
+  LOGW(TAG, "сторожа: STATE scan > %u мс після скану, app не повернулась у loop", (unsigned)kStallWatchMs);
+  LOGW(TAG, "стан: st=%d active=%d sus=%d cur=#%u rep=%u shuf=%d errRun=%u треків=%u", (int)st_, (int)active_, (int)sus_, (unsigned)cur_ + 1,
+       (unsigned)rep_, (int)nav_.on(), (unsigned)errRun_, (unsigned)pl_.tracks());
+  uint32_t off = 0, ms = 0;
+  const bool pos = dec_.position(off, ms);
+  LOGW(TAG, "резюме/позиція: %s зсув=%u Б час=%u мс, тривалість=%u мс, останній запис зсув=%u Б, заморожено=%d", pos ? "є" : "нема", (unsigned)off,
+       (unsigned)ms, (unsigned)dec_.durMs(), (unsigned)rsmLastOff_, (int)rsmFrozen_);
+  Mp3Player::Snap s;
+  dec_.snap(s);
+  LOGW(TAG, "mp3: st=%d ev=%d req=%u де=%s %u мс тому, старти=%u eof=%u read=%u dec=%u stop=%u, чекав розмʼюту довго %u разів", (int)s.st, (int)s.ev,
+       (unsigned)s.req, Mp3Player::whereName(s.where), (unsigned)s.whereAgoMs, (unsigned)s.starts, (unsigned)s.endEof, (unsigned)s.endRead,
+       (unsigned)s.endDec, (unsigned)s.endStop, (unsigned)s.waitLong);
+  LOGW(TAG, "аудіо: мʼют=%d, перериває=%d; читач відкрито=%d", (int)g_audio.isMuted(), (int)g_audio.aborting(), (int)media_.reader().isOpen());
+  Diag::logTasks();  // стеки й назви задач; черга команд у main.cpp не публікується
 }
 
 // DBG,resume: що збережено для активного SD, що знайдено в плейлисті. DBG,resume,clear: стерти запис (у play його

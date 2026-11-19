@@ -58,6 +58,7 @@ void help() {
   LOGI(TAG, "DBG,nav — індекс, папка/діапазон, repeat, shuffle, помилки підряд, історія переходів");
   LOGI(TAG, "DBG,shuf — shuffle: режим, коло k/N, початок перестановки, хвіст історії, якість esp_random() | DBG,shuftest — самоперевірка рушія (OK/FAIL)");
   LOGI(TAG, "DBG,resume — що збережено в NVS для активного SD (шлях, зсув, мс, CRC) і що знайдено в плейлисті | DBG,resume,clear — стерти запис");
+  LOGI(TAG, "DBG,resume,tail,<мс> — резюме поточного треку = кінець мінус N мс (потрібен play/pause)");
   LOGI(TAG, "DBG,boot — причина перезапуску, аварійний?, лічильник, режим захисту, AUTO_RESUME_SOURCE | DBG,boot,clear — скинути лічильник");
 #if BOOT_TEST_CMDS
   LOGI(TAG, "DBG,boot,crash — abort() (тест аварії) | DBG,boot,set,<0..255> — виставити лічильник (тест)");
@@ -317,9 +318,19 @@ void DebugCmds::handle(const proto::Msg& m) {
     LOGW(TAG, "DBG,failnext вимкнено (SKIP_TEST_CMDS=0)");
 #endif
   } else if (!strcasecmp(c, "resume")) {
+    if (m.argc == 3 && !strcasecmp(m.args[1], "tail")) {  // M5c6: резюме = кінець треку мінус N мс (крайні випадки без 5 хвилин очікування)
+      char* e = nullptr;
+      long n = strtol(m.args[2], &e, 10);
+      if (!e || *e || n < 0 || n > 3600000L) {
+        LOGW(TAG, "DBG,resume,tail,<0..3600000 мс>");
+        return;
+      }
+      if (!fileSrc().dbg(SdSource::Dbg::ResumeTail, (int)n)) LOGW(TAG, "%s: попередня DBG-команда ще виконується", srcName(fileSrc().id()));
+      return;
+    }
     bool clear = m.argc == 2 && !strcasecmp(m.args[1], "clear");
     if (m.argc > 2 || (m.argc == 2 && !clear)) {
-      LOGW(TAG, "DBG,resume[,clear]");
+      LOGW(TAG, "DBG,resume[,clear|,tail,<мс>]");
       return;
     }
     if (!fileSrc().dbg(clear ? SdSource::Dbg::ResumeClear : SdSource::Dbg::Resume, 0)) LOGW(TAG, "%s: попередня DBG-команда ще виконується", srcName(fileSrc().id()));

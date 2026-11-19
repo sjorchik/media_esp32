@@ -1,6 +1,7 @@
 #pragma once
 #include "audio/mp3_player.h"
 #include "config.h"
+#include "core/play_guard.h"
 #include "media/imedia.h"
 #include "media/playlist.h"
 #include "media/scanner.h"
@@ -25,7 +26,7 @@
 // рівня й чи саме джерело відкриває носій. Декодер Mp3Player — один спільний екземпляр (задача mp3 одна).
 class SdSource : public ISource {
  public:
-  enum class Dbg : uint8_t { None, Info, Scan, List, Read, Play, Decode, Nav, Tag, Shuf, ShufTest, Resume, ResumeClear, FailNext };
+  enum class Dbg : uint8_t { None, Info, Scan, List, Read, Play, Decode, Nav, Tag, Shuf, ShufTest, Resume, ResumeClear, FailNext, ResumeTail };
 
 #if ENABLE_USB_CH376
   SdSource(IMedia& media, Mp3Player& dec, const SrcProfile& prof = kSdProfile) : media_(media), dec_(dec), prof_(prof) {}
@@ -58,6 +59,7 @@ class SdSource : public ISource {
   // DBG (з будь-якої задачі): лише ставить запит; виконує app. false = попереднє ще виконується.
   // FailNext: arg = n (0..255) | 0x100 для decode_fail (інакше read_fail); потрібен SKIP_TEST_CMDS=1.
   bool dbg(Dbg k, int arg = 0);
+  void stallDump();  // M5c6: стан для сторожа (викликається з esp_timer; читання без блокувань, значення можуть бути «на льоту»)
 
   // Читання стану для DBG,aout (без блокувань; з консольної задачі, навіть якщо app завис)
   const Mp3Player& dec() const { return dec_; }
@@ -101,6 +103,7 @@ class SdSource : public ISource {
   void dbgShuf();
   void dbgShufTest();
   void dbgResume(bool clear);
+  void dbgResumeTail();  // DBG,resume,tail,<мс>: резюме = кінець треку мінус N мс
   void dbgFailNext();
   // відтворення
   Res startTrack(uint16_t n, uint32_t off = 0, uint32_t ms = 0);  // відкриває файл, запускає сесію (з зсуву off, мс); state=play; ReadFail, якщо не відкрито
@@ -160,6 +163,8 @@ class SdSource : public ISource {
   uint32_t tagSeqSeen_ = 0;                // останній забраний dec_.tagSeq()
   uint32_t shownHash_ = 0;                 // хеш META, надісланого останнім (для порівняння «змінилось»)
   uint32_t rsmAt_ = 0;                     // коли наступний періодичний запис резюме
+  PlayGuard::EndLoopGuard endGuard_;       // M5c6: миттєві завершення сесії підряд → зациклення
+  bool rsmFrozen_ = false;                 // M5c6: DBG,resume,tail — періодичний запис і запис при deactivate не затирають резюме
   uint32_t rsmLastOff_ = 0;                // зсув останнього запису (умова «≥ одного кадру»)
   uint16_t rsmWarn_ = 0xFFFF;              // для якого треку вже попередили «шлях задовгий»
 

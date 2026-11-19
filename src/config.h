@@ -403,6 +403,10 @@ inline constexpr size_t   kId3DbgRaw = 12;             // скільки сир�
 inline constexpr uint32_t kResumeSaveMs = 10000;       // період запису позиції під час play
 inline constexpr uint32_t kResumeMinStepBytes = 128;   // періодичний запис лише якщо зсув змінився ≥ цього (≈ один кадр MP3)
 inline constexpr uint32_t kResumeTailGuard = 4096;     // зсув ближче до кінця файлу ігнорується (трек з початку)
+inline constexpr uint32_t kResumeTailMs = 3000;        // M5c6: резюме ближче за стільки мс до кінця треку (або за кінцем файлу) → трек з початку
+inline constexpr uint32_t kShortEndMs = 200;           // M5c6: сесія, що завершилась (Eof) швидше за стільки мс, вважається «миттєвою»
+inline constexpr uint8_t  kShortEndRun = 3;            // ...і так стільки разів підряд → зациклення: stop + ERR замість нескінченного повтору
+inline constexpr uint32_t kStallWatchMs = 3000;        // M5c6: STATE scan триває довше за стільки мс після «скан done» → один раз вивести внутрішній стан
 
 // ---- Налаштування й захист від петлі аварій (M5b2) ----
 inline constexpr uint8_t  kCrashLoopMax = 3;           // аварійних перезапусків підряд → режим захисту на цей запуск
