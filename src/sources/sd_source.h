@@ -87,7 +87,12 @@ class SdSource : public ISource {
   void finishScan(Scanner::St r);
   void scanFailed();                       // M5c3: повтор скану або idle (після відкладеного вердикту)
 #if ENABLE_USB_CH376
-  void applyStep(const MediaStep& s, bool emit);  // M4b4: виконати крок політики USB-носія (прапорець MEDIA, закриття тому)
+  void applyStep(const MediaStep& s, bool emit);  // M4b4/M4c2: крок політики USB-носія: лише закриття тому (прапорець MEDIA веде UsbPresence)
+  // M4c2: неблокуюче відкриття USB. activate()/retryMedia() лише стартують (STATE scan одразу); loop() робить кроки.
+  enum class Open : uint8_t { None, WaitHeap, Mounting };
+  void startOpen();
+  void openStep(uint32_t now);
+  void abortOpen();
 #endif
   void susStep(uint32_t now);              // M5c3: кінець очікування Removed → звичайна обробка збою
   void stopJobs();
@@ -137,6 +142,8 @@ class SdSource : public ISource {
 #if ENABLE_USB_CH376
   const SrcProfile& prof_;
   UsbMediaPolicy pol_;                     // лише для prof_.ownsMount
+  Open open_ = Open::None;                 // M4c2: фаза відкриття USB
+  uint32_t openT0_ = 0, openFree0_ = 0, openSteps_ = 0, openMaxMs_ = 0;
 #endif
   Playlist pl_;
   Scanner scanner_;
@@ -180,5 +187,6 @@ class SdSource : public ISource {
   bool rdOpen_ = false;
   uint32_t rdBytes_ = 0, rdBusyUs_ = 0, rdT0_ = 0;
 };
+
 
 

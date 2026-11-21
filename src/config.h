@@ -375,6 +375,32 @@ static_assert(kUsbScanCacheSlots <= 8, "кеш секторів: ≤ 8 слот�
 static_assert(kUsbScanReadAhead >= 1 && kUsbScanReadAhead <= kCh376SectorsPerCmd, "читання наперед: 1..kCh376SectorsPerCmd секторів");
 static_assert(kUsbScanSubPoolBytes >= 256 && kUsbScanSubPoolBytes <= 4096, "пул імен підкаталогів: 256..4096 Б");
 static_assert(USB_SCAN_STAGE >= 1 && USB_SCAN_STAGE <= 5, "USB_SCAN_STAGE: 1..5");
+
+// ---- M4c2: присутність USB-флешки без активного USB; неблокуюче відкриття (код лише при ENABLE_USB_CH376) ----
+// USB_PRESENCE_MODE: 1 — «паркування»: чіп один раз ініціалізується (host, 2 Мбод), далі UART2 вимкнено (Serial2.end) без скидання
+// чіпа, а вставлення/виймання флешки видно за INT# (GPIO4, спадний фронт). 2 — запасний: чіп паркується так само, але подію шукає
+// опитування раз на kUsbPresPollMs (wake → GET_STATUS → park), лише коли активне не BT. 0 — без фонової присутності (прапорець usb
+// лише від open(), як у M4b4). Режим 2 вмикати лише якщо експеримент паркування (hwcheck_M4c2.md, крок «Експеримент») не пройшов.
+#ifndef USB_PRESENCE_MODE
+#define USB_PRESENCE_MODE 1
+#endif
+static_assert(USB_PRESENCE_MODE >= 0 && USB_PRESENCE_MODE <= 2, "USB_PRESENCE_MODE: 0..2");
+inline constexpr uint32_t kUsbPresInitDelayMs = 2000;    // фонова ініціалізація чіпа — не раніше ніж через стільки мс після старту (READY/HB не чекають)
+inline constexpr uint32_t kUsbPresInitSettleMs = 400;    // після SET_USB_MODE host чекаємо подію підключення (флешка могла стояти вже)
+inline constexpr uint32_t kUsbPresInitPollMs = 20;       // ...опитуючи GET_STATUS з таким кроком
+inline constexpr uint32_t kUsbPresSettleMs = 100;        // подія INT# → пауза (дребезг контакту) → обмін
+inline constexpr uint32_t kUsbPresPollMs = 3000;         // режим 2: період опитування (≥ 3 с за умовою завдання)
+inline constexpr uint32_t kUsbPresConnectMs = 3000;      // перевірка: очікування DISK_CONNECT і DISK_MOUNT, не довше кожного
+inline constexpr uint32_t kUsbPresRetryMs = 1000;        // збій обміну/читання → повтор перевірки через
+inline constexpr uint8_t  kUsbPresRetryMax = 2;          // повторів до визнання «чіп втрачено» (або флешка нечитана → Unsupported)
+inline constexpr uint32_t kUsbPresReinitMs = 5000;       // чіп втрачено / не в host → повторна ініціалізація через (далі ×2)
+inline constexpr uint32_t kUsbPresReinitMaxMs = 40000;
+inline constexpr uint8_t  kUsbPresInitTries = 3;         // спроб ініціалізації поспіль; далі пауза до DBG,usb,pres,init (чіпа може не бути в платі)
+inline constexpr uint32_t kUsbPresHeapOkBt = 20000;      // BT активне: обмін з чіпом лише якщо free ≥ цього; BT з телефоном ≈17 КБ → відкладається до виходу з BT
+inline constexpr uint32_t kUsbPresStepWarnMs = 40;       // крок перевірки довший → LOGW (ціль ≤ 15–20 мс; ініціалізація і probe можуть бути довшими)
+inline constexpr uint32_t kUsbOpenStepWarnMs = 100;      // крок відкриття довший → LOGW (ціль ≤ 100 мс)
+static_assert(kUsbPresPollMs >= 3000, "режим 2: період опитування ≥ 3 с");
+static_assert(kUsbPresHeapOkBt >= 20000, "free ≥ 20 КБ гарантує free ≥ 15 КБ після обміну (≈2,6 КБ драйвер + ≈1 КБ probe)");
 inline constexpr size_t   kEvFolderNameMax = 48;       // макс. байтів назви папки в події FOLDER
 inline constexpr size_t   kEvMetaFieldMax = 96;        // макс. байтів назви в META (SD: імʼя файлу без .mp3)
 inline constexpr uint32_t kPrevRestartMs = 3000;       // PREV: позиція більша за це → перезапуск поточного треку
@@ -439,4 +465,5 @@ inline constexpr int kPrioDecoder = 5;   // нижче за audio (6), вище 
 
 // ---- Діагностика ----
 inline constexpr uint32_t kDiagPeriodMs = 60000;
+
 

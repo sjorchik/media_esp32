@@ -16,6 +16,7 @@
 #include "proto/link.h"
 #include "storage/storage_dbg.h"
 #include "usb/ch376_diag.h"
+#include "usb/usb_presence_diag.h"
 #include "util/diag.h"
 #include "util/heap_phases.h"
 #include "util/log.h"
@@ -70,6 +71,8 @@ void help() {
   LOGI(TAG, "DBG,lvl,reset — скинути лічильники блоків | DBG,heap,phases | DBG,heap,reset — мінімум heap по фазах (M4c1)");
   LOGI(TAG, "DBG,aout — стан AudioOut (мʼют, лічильники, власник мʼютекса) і задачі mp3 (де стоїть); читає без app, працює й при завислому app");
 #if ENABLE_USB_CH376
+  LOGI(TAG, "DBG,usb,park — ініціалізація (host, 2 Мбод) і паркування: UART2 вимкнено, чіп лишається в host | DBG,usb,wake — UART2 на збереженій швидкості, CHECK_EXIST, GET_STATUS, heap/мкс (M4c2)");
+  LOGI(TAG, "DBG,usb,int[,reset] — рівень INT# і спадні фронти з ISR | DBG,usb,pres[,auto|init] — присутність флешки, лічильники; auto — відновити фонову присутність, init — ініціалізувати чіп знову");
   LOGI(TAG, "DBG,usb — стан CH376S | DBG,usb,init — повна послідовність з мкс");
   LOGI(TAG, "DBG,usb,reset — скид і повернення на 9600 | DBG,usb,ping,<N> — N× CHECK_EXIST");
   LOGI(TAG, "DBG,usb,baud — перебір дільників | DBG,usb,baud,<бод>,<K hex> — одна спроба");
@@ -391,6 +394,7 @@ void DebugCmds::handle(const proto::Msg& m) {
       if (!g_usb.dbg(vs ? SdSource::Dbg::Scan : vl ? SdSource::Dbg::List : SdSource::Dbg::Tag, (int)n)) LOGW(TAG, "usb: попередня DBG-команда ще виконується");
       return;
     }
+    if (UsbPresDiag::handle(m)) return;  // M4c2: park | wake | int | pres
     Ch376Diag::handle(m);
 #else
     LOGW(TAG, "DBG,usb вимкнено (ENABLE_USB_CH376=0)");
@@ -399,4 +403,5 @@ void DebugCmds::handle(const proto::Msg& m) {
     LOGW(TAG, "невідома DBG-команда '%s' (DBG,help)", c);
   }
 }
+
 

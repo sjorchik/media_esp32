@@ -34,6 +34,51 @@ bool UsbMedia::mount() {
   return true;
 }
 
+// Спільний підсумок успішного відкриття: стан UsbMedia і логи (як у mount()).
+static void logMounted(const UsbVolInfo& inf) {
+  if (inf.baud < kUsbBaudFast)  // M4b4/п.9: резервний режим — відтворення все одно стартує, але з явним попередженням
+    LOGW(TAG, "швидкість USB %u Бод < %u: РЕЗЕРВНИЙ режим (самоперевірка: %s). Потік 320 кбіт/с у запасі лише ≈2 кадри", (unsigned)inf.baud,
+         (unsigned)kUsbBaudFast, selfTestName(inf.selfTest));
+  LOGI(TAG, "том змонтовано: %s, серійний №%08X, %u Бод, відкриття %u мс", inf.fsType == 64 ? "exFAT" : inf.fsType == 32 ? "FAT32" : "FAT16",
+       (unsigned)inf.serial, (unsigned)inf.baud, (unsigned)inf.openMs);
+}
+
+bool UsbMedia::mountBegin() {
+  if (mounted_) return true;
+  UsbVolume& v = UsbVolume::get();
+  if (v.isOpen()) v.close();
+  UsbVolInfo inf;
+  if (!v.openBegin(inf)) {
+    fail_ = inf.fail;
+    return false;
+  }
+  fail_ = UsbOpenFail::None;
+  return true;
+}
+
+IMedia::MountPoll UsbMedia::mountStep(uint32_t nowMs) {
+  UsbVolume& v = UsbVolume::get();
+  if (!v.opening()) return mounted_ ? MountPoll::Done : MountPoll::Failed;
+  UsbVolInfo inf;
+  const OpenPoll r = v.openStep(nowMs, inf);
+  if (r == OpenPoll::Pending) return MountPoll::Pending;
+  if (r == OpenPoll::Failed) {
+    fail_ = inf.fail;
+    return MountPoll::Failed;
+  }
+  fail_ = UsbOpenFail::None;
+  mounted_ = true;
+  serial_ = inf.serial;
+  baud_ = inf.baud;
+  openMs_ = inf.openMs;
+  fsType_ = inf.fsType;
+  partSectors_ = inf.partSectors;
+  logMounted(inf);
+  return MountPoll::Done;
+}
+
+void UsbMedia::mountAbort() { UsbVolume::get().openAbort(); }
+
 void UsbMedia::unmount() {
   UsbVolume::get().close();
   mounted_ = false;
@@ -122,3 +167,4 @@ void UsbMedia::ioUnlock() {
 }
 
 #endif  // ENABLE_USB_CH376
+

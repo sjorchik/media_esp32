@@ -36,6 +36,13 @@ class Ch376 {
   // RESET_ALL, пауза, порт на 9600, очистка RX.
   Ch376Err reset();
 
+  // M4c2: примітиви без очікування (для кроків у loop). reset() = resetSend() + пауза kCh376ResetWaitMs + resetFinish().
+  Ch376Err resetSend();        // RESET_ALL на поточній швидкості (відповіді нема); чіп виходить з режиму host
+  Ch376Err resetFinish();      // порт на 9600, очищення RX (викликати після паузи kCh376ResetWaitMs)
+  Ch376Err sendDiskConnect();  // лише відправка DISK_CONNECT; статус забирає викликач (getStatus)
+  Ch376Err sendDiskMount();    // лише відправка DISK_MOUNT; статус забирає викликач (getStatus)
+  bool host() const { return host_; }  // чіп у режимі host (SET_USB_MODE host виконано після останнього скиду); паркувати можна лише його
+
   // CHECK_EXIST: чіп має повернути x XOR kCh376CheckXor.
   Ch376Err checkExist();
 
@@ -96,6 +103,8 @@ class Ch376 {
   uint8_t lastEv_ = 0;
   bool lost_ = false;
   uint32_t recAt_ = 0;
+  bool host_ = false;  // M4c2
   int firstRx_ = -1;  // перший байт останньої readReply
   int setRx_ = -1;    // перший байт відповіді на останній SET_BAUDRATE
 };
+

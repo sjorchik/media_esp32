@@ -8,7 +8,7 @@
 
 - **BT**: A2DP-приймач з AVRCP. Працює.
 - **SD**: MP3 з картки (SdFat, hot-plug, плейлист, shuffle, резюме).
-- **USB**: через CH376S. Повноцінне джерело (M4b4) за `ENABLE_USB_CH376 = 1`: `SRC,usb` відкриває том, скануює, відтворює MP3 (теги, навігація, shuffle, резюме `rsm_usb`). Без цього прапорця `usb` лишається заглушкою. `MEDIA usb=1` лише поки USB активне, том змонтовано й є треки; виявлення вставлення, поки USB неактивне, — окреме завдання (M4c), тож повторне `SRC,usb` пробує відкрити том знову.
+- **USB**: через CH376S. Повноцінне джерело (M4b4) за `ENABLE_USB_CH376 = 1`: `SRC,usb` відкриває том, скануює, відтворює MP3 (теги, навігація, shuffle, резюме `rsm_usb`). Без цього прапорця `usb` лишається заглушкою. `MEDIA usb=1` (M4c2) — флешка вставлена й має підтримувану ФС (швидка перевірка MBR/GPT/BPB), незалежно від активного джерела; зміна видна без `SRC,usb` (чіп «паркується» й сповіщає через INT#). `SRC,usb` без флешки або з чужою ФС дає `STATE,usb,idle` + `ERR,no_media` одразу; відкриття тому йде кроками й не блокує app.
 
 Звук виводиться по I2S на ЦАП. Гучністю, тембром і входом керує лише S3 (TDA7318); цифрове послаблення виходу S3 задає командою `LVL` (M6b); еквалайзера на WROOM немає (видалено в M6c, він на S3). WROOM мʼютить свій ЦАП сам.
 
@@ -44,8 +44,9 @@
 - `esp32dev` — **реліз** (за замовчуванням). `BOOT_TEST_CMDS=0`, `SKIP_TEST_CMDS=0`.
 - `esp32dev_test` — стенд. Успадковує `esp32dev` і додає `-DBOOT_TEST_CMDS=1 -DSKIP_TEST_CMDS=1`. Не для релізу.
 - `esp32dev_usb` — стенд CH376S: успадковує `esp32dev_test` і додає `-DENABLE_USB_CH376=1` та `-DUSE_BLOCK_DEVICE_INTERFACE=1` (M4b3: власний блочний пристрій для SdFat). Не для релізу.
+- `esp32dev_usb_poll` — M4c2: запасний режим присутності (`-DUSB_PRESENCE_MODE=2`: опитування чіпа раз на 3 с замість INT#). Лише якщо експеримент паркування (`hwcheck_M4c2.md`) не пройшов. Не для релізу.
 - `esp32dev_usb1m` — M4b4: стенд вимірів на резервній швидкості 1 Мбод (`-DUSB_FORCE_BAUD_REF=1`: після еталона 2 Мбод не пробуються). Не для релізу.
-- `native` — юніт-тести (`pio test -e native`). Збирає `proto/frame`, `proto/cmd_args`, `media/id3`, `media/shuffle`, `storage/resume_record`, `storage/settings_record`, `storage/boot_guard`, `usb/ch376`, `usb/ch376_fs`, `usb/ch376_file_reader`, `usb/ch376_disk`, `usb/disk_probe`, `usb/ch376_blockdev`, `usb/usb_volume_core`, `media/playlist`, `media/scanner` (тести M4b4: `test_usb_src`).
+- `native` — юніт-тести (`pio test -e native`). Збирає `proto/frame`, `proto/cmd_args`, `media/id3`, `media/shuffle`, `storage/resume_record`, `storage/settings_record`, `storage/boot_guard`, `usb/ch376`, `usb/ch376_fs`, `usb/ch376_file_reader`, `usb/ch376_disk`, `usb/disk_probe`, `usb/ch376_blockdev`, `usb/usb_volume_core`, `usb/usb_bringup`, `usb/usb_presence_core`, `media/playlist`, `media/scanner` (тести M4b4: `test_usb_src`; M4c2: `test_usb_m4c2` — bring-up і відкриття по кроках, автомат присутності).
 
 Команди (COM-порт підставити свій):
 
@@ -65,6 +66,7 @@ pio test -e native
 | `HAVE_DAC` | 1 | Лише для логу: 0 → «DAC відсутній» |
 | `LOG_LEVEL` | 3 | 1=E 2=W 3=I 4=D |
 | `AUTO_RESUME_SOURCE` | 0 | 1: після старту вмикати останнє джерело |
+| `USB_PRESENCE_MODE` | 1 | M4c2 (лише з `ENABLE_USB_CH376=1`): 1 — паркування чіпа + INT#; 2 — опитування раз на 3 с (запасний); 0 — присутність лише від `open()` |
 | `ENABLE_USB_CH376` | 0 | 1: драйвер CH376S, файловий шар і `DBG,usb*` (M4a, M4b1) |
 | `SD_CD_ACTIVE_LOW` | 1 | Полярність card-detect |
 | `BOOT_TEST_CMDS` | 0 | 1: `DBG,boot,crash`, `DBG,boot,set,<n>` |
@@ -176,6 +178,9 @@ SdFat не потокобезпечний: усі виклики серіалі�
 | `DBG,lvl[,<bt\|sd\|usb>,<дБ>]` | Рівні виходу bt/sd/usb, останній активний слот і час рівня на кадр SD/USB / задати рівень (дБ −40…0) |
 | `DBG,usb` | Стан CH376S: запуск, швидкість, флешка, остання помилка і подія (без звернення до чіпа) |
 | `DBG,usb,init[,<бод>\|auto]` | Повна послідовність: скид → CHECK_EXIST → [швидкість] → host → підключення (≤ 3 с) → DISK_CONNECT → DISK_MOUNT, мкс на кожен крок. Без аргументу лишається 9600; `auto` пробує 1000000 → 460800 → 115200 |
+| `DBG,usb,park` / `DBG,usb,wake` | M4c2, експеримент паркування: `park` — повна ініціалізація (host, 2 Мбод) і `Serial2.end()` без скидання чіпа; `wake` — UART2 на збереженій швидкості без нового узгодження, CHECK_EXIST, GET_STATUS, heap і мкс, сміття в RX. Призупиняють фонову присутність |
+| `DBG,usb,int[,reset]` | M4c2: рівень INT# і лічильник спадних фронтів з ISR (працює й при вимкненому UART2) |
+| `DBG,usb,pres[,auto\|init]` | M4c2: стан присутності (absent/present/unsupported/unknown), лічильники подій/перевірок/відкладень; `auto` — відновити фонову присутність, `init` — ініціалізувати чіп знову |
 | `DBG,usb,reset` | Скид чіпа і повернення порту на 9600 |
 | `DBG,usb,ping,<N>` | N× CHECK_EXIST: успіхи, середній і максимальний час, мкс (N ≤ 50) |
 | `DBG,usb,baud` | Перебір дільників з таблиці, відкат на 9600 при невдачі |
@@ -209,7 +214,8 @@ SdFat не потокобезпечний: усі виклики серіалі�
 
 - `tools/m5c1_series.py COMx [серій=20] [read|decode]` — серія `DBG,failnext,1` + `NEXT` через UART0. **Потребує `esp32dev_test`.** Лог: `m5c1_series.log`.
 - `tools/m5c4_frames.py COMx [--only a,b] [--list] [--usb-expected 0|1] [--usb-flash] [--expect-title назва] [--max-next 5]` — перевірка протоколу UART1 (proto_ver = 3, зокрема сценарії `eq_lvl`, `eq_lvl_bad`: лише `LVL`, кадри `EQ` → `unknown_cmd`): PASS/FAIL/SKIP/INFO. Код виходу: 0 — без FAIL, 1 — є FAIL, 2 — порт або передумова.
-- `tools/m5c5_src_stress.py --ctl COMx --dbg COMy [--cycles 100] [--seed 1] [--settle 15] [--no-usb] [--usb-flash] [--no-bt] [--warmup 2]` — стрес SRC (UART1 + UART0). Код виходу: 0 — без FAIL.
+- `tools/m4c2_hotplug.py --ctl COMx [--dbg COMy] [--repeat 3] [--cycles 10] [--unsupported] [--sd] [--bt] [--no-flash-latency]` — M4c2: інтерактивна перевірка присутності флешки (вставлення/виймання, під SD і BT) і затримок SRC/GET під час відкриття USB. Код виходу: 0 — без FAIL.
+- `tools/m5c5_src_stress.py --ctl COMx --dbg COMy [--cycles 100] [--uart0-log файл] [--seed 1] [--settle 15] [--no-usb] [--usb-flash] [--no-bt] [--warmup 2]` — стрес SRC (UART1 + UART0). Код виходу: 0 — без FAIL.
 - `tools/m5c5_src_stress.py --dbg COMy --burst 50` (і `--burst 200`) — пачка рядків у UART0, без `--ctl`. Код виходу 1, якщо є втрати.
 
 Примітка: `m5c5` вимикає DTR/RTS до відкриття UART0, бо відкриття скидає плату.
@@ -238,7 +244,7 @@ SdFat не потокобезпечний: усі виклики серіалі�
 - **Q5:** STOP/PAUSE у стані scan дають `bad_state`.
 - **Q6:** переповнення черги команд — лише лог.
 - **Q10:** порожнє імʼя команди.
-- **USB (M4b4):** джерело працює, але вставлення/виймання, поки USB неактивне чи на паузі, не виявляється (M4c): зникнення відкритого тому помічається при першому читанні. Резюме `rsm_usb` зберігає шлях як `XXXXXXXX|<шлях>` (серійний номер тому, формат блоба без змін), тож діє лише для тієї самої флешки; найдовший шлях — 246 Б. Декодер один для SD і USB; арена PCM має власника `sd` і для USB. Відкриття без флешки блокує app ≈3 с (очікування підключення).
+- **USB (M4b4/M4c2):** присутність флешки визначається у фоні (див. §15); якщо експеримент паркування не пройшов на залізі, діє лише запасний режим 2. Зникнення відкритого тому помічається при першому читанні. Резюме `rsm_usb` зберігає шлях як `XXXXXXXX|<шлях>` (серійний номер тому, формат блоба без змін), тож діє лише для тієї самої флешки; найдовший шлях — 246 Б. Декодер один для SD і USB; арена PCM має власника `sd` і для USB.  Відкриття тому йде кроками в `loop()`: app не блокується (команди — з затримкою ≤ ≈100 мс); без флешки або з чужою ФС `SRC,usb` відповідає одразу.
 - **Консоль UART0:** пачка без втрат до ≈ TBD (вимір, `--burst 200`). Буфер 1472 Б. Відповідь `DBG,*` блокує консоль на TX (≈ 1,4 мс на рядок).
 - Деталі Q3–Q10 не входять до дампів; тут наведено формулювання з переліку обмежень.
 
@@ -272,3 +278,14 @@ SdFat не потокобезпечний: усі виклики серіалі�
 - Консоль (`src/usb/ch376_diag_disk.cpp`): `DBG,usb,part`, `DBG,usb,rawread,<LBA>[,<секторів ≤ 8>]`, `DBG,usb,rawspeed,<LBA>,<КБ>[,<N>]`, `DBG,usb,rawseq,<LBA>[+зсув],<КБ>[,<байт>[,<мс>]]`, `DBG,usb,rawpre,<LBA>,<КБ>,<пакет Б>,<кадрів>`, `DBG,usb,rawcfg[,settle|skip|wait|spc,<значення>]`.
 - `DBG,usb,init,2000000` дозволено (K=FD, не підтверджено на залізі). `DBG,usb,sec` без змін.
 - Значення протоколу з памʼяті про даташит — в `config.h` (блок CH376S M4b2). Перевірка на залізі: `hwcheck_M4b2.md`, результати: `report_M4b2.md`.
+
+## 15. USB: присутність флешки і відкриття по кроках (M4c2)
+
+- Модулі: `src/usb/usb_presence_core.*` (автомат присутності, без Arduino, тестується в `native`), `usb_presence.*` (сервіс-обгортка, єдиний власник прапорця `MEDIA usb`), `usb_chip.h` (інтерфейс чіпа: одна коротка дія на виклик), `usb_chip_uart.*` (його реалізація на Serial2), `usb_bringup.*` (неблокуючий `bringUp`), `UsbOpenSteps` у `usb_volume_core.*` (відкриття по кроках, диференційно перевірене проти блокуючого `usbOpenCore`), `usb_presence_diag.*` (консоль).
+- **Паркування.** Чіп один раз ініціалізується (RESET_ALL → CHECK_EXIST → 2 Мбод, резерв 1 Мбод → host) через `kUsbPresInitDelayMs` після старту й далі живе без UART2: `Serial2.end()` звільняє RX-буфер (≈2,6 КБ разом із драйвером), чіп лишається в host на збереженій швидкості (`Ch376::baud()/host()`), ISR на INT# (спадний фронт) лише рахує фронти. Подію береться рівнем INT# (LOW до GET_STATUS), тож вона не губиться, поки обмін відкладено.
+- **Подія.** INT# LOW → пауза `kUsbPresSettleMs` → wake (`Serial2.begin` на збереженій швидкості, без нового узгодження, CHECK_EXIST) → GET_STATUS: виймання (0x16) — `absent` без читання диска; інакше DISK_CONNECT → DISK_MOUNT → ємність → `probeDisk` (≈1 КБ тимчасово) → `present` / `unsupported` (чужа ФС, немає розділів) → `Serial2.end()`. Помилка обміну — до `kUsbPresRetryMax` повторів, далі «чіп втрачено» й повторна ініціалізація з паузою (до `kUsbPresInitTries` спроб).
+- **Умови.** BT активне і free < `kUsbPresHeapOkBt` (20 КБ; BT з телефоном ≈17 КБ) — обмін з чіпом відкладається (INT# лишається LOW), після виходу з BT подія оброблюється; якщо BT стало активним посеред перевірки — порт віддається, перевірка повторюється потім. SD, USB-у-idle, off — одразу. Поки сесія USB (відкриття/відтворення) або консоль тримають порт, фон не втручається.
+- **Прапорець.** `MEDIA usb` змінюється лише при зміні присутності; його веде `SourceManager::presenceTick`. Знімається також при зникненні відкритого тому. Порожня флешка без mp3 лишається `usb=1` (`ERR,no_media,empty` при скані, як раніше).
+- **`SRC,usb`.** Присутність `absent`/`unsupported` — `STATE,usb,idle` + `ERR,no_media` одразу (без ≈3 с очікування); `present`/невідомо — `STATE,usb,scan` одразу, далі кроки: чекання heap після BT (до `kUsbPreActivateWaitMs`), bring-up 1 Мбод → 2 Мбод із хешем → ємність → розділ → SdFat → скан. Кожен крок — одна коротка дія з таймерами між ними; винятки: відкат після збою CHECK_EXIST (≈0,1–0,4 с), узгодження швидкості (≈50 мс), `probeDisk`, SdFat `begin`. Перемикання на інше джерело перериває відкриття (`UsbVolume::openAbort`) і паркує чіп.
+- **Запасний режим** `USB_PRESENCE_MODE=2` (`esp32dev_usb_poll`): wake → GET_STATUS → park раз на `kUsbPresPollMs` (3 с), лише коли активне не BT. `0` — присутність лише від `open()`.
+- Перевірка на залізі: `hwcheck_M4c2.md`, підсумок: `report_M4c2.md`.

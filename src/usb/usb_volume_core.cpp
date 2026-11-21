@@ -269,6 +269,176 @@ UsbOpenFail usbOpenCore(IUsbOpenHw& hw, uint8_t* scratch, ProbeReport& pr, UsbOp
   return usbPickPartition(hw, scratch, pr, info);
 }
 
+// ============================================================ M4c2: відкриття по кроках
+
+void UsbOpenSteps::begin(IUsbOpenHw& hw, uint8_t* scratch, ProbeReport* pr, UsbOpenInfo& info) {
+  hw_ = &hw;
+  scratch_ = scratch;
+  pr_ = pr;
+  info_ = &info;
+  info = UsbOpenInfo{};
+  ph_ = Ph::Port;
+  started_ = false;
+  refErr_ = Ch376Err::Ok;
+}
+
+void UsbOpenSteps::abort() {
+  if (!active()) return;
+  hw_->bringAbort();
+  ph_ = Ph::Idle;
+}
+
+OpenPoll UsbOpenSteps::bad(UsbOpenFail f, UsbOpenFail& out) {
+  out = f;
+  ph_ = Ph::End;
+  return OpenPoll::Failed;
+}
+
+bool UsbOpenSteps::bring(uint32_t baud, uint32_t now, Ch376Err& e) {
+  if (!started_) {
+    hw_->bringBegin(baud);
+    started_ = true;
+  }
+  if (!hw_->bringStep(now, e)) return false;
+  started_ = false;
+  return true;
+}
+
+OpenPoll UsbOpenSteps::step(uint32_t now, UsbOpenFail& fail) {
+  UsbOpenInfo& info = *info_;
+  Ch376Err e = Ch376Err::Ok;
+  DiskErr d = DiskErr::Ok;
+  switch (ph_) {
+    case Ph::Idle:
+    case Ph::End:
+      return OpenPoll::Pending;
+
+    case Ph::Port:
+      if (!hw_->portBegin()) return bad(UsbOpenFail::NoPort, fail);
+      info.nSteps = 0;
+      info.selfTest = SelfTest::NotRun;
+      ph_ = Ph::Ref;
+      return OpenPoll::Pending;
+
+    case Ph::Ref:  // 1. Еталон: 1 Мбод
+      if (!bring(kUsbBaudRef, now, e)) return OpenPoll::Pending;
+      rec(info, kUsbBaudRef, e);
+      refErr_ = e;
+      if (e == Ch376Err::Ok && hw_->baud() >= kCh376MinPlayBaud) {
+        ph_ = Ph::RefRead;
+      } else if (e != Ch376Err::Ok && noMediaErr(e)) {
+        return bad(UsbOpenFail::NoMedia, fail);  // немає флешки — далі нічого пробувати
+      } else {
+        ph_ = Ph::AltFast;  // еталон недоступний
+      }
+      return OpenPoll::Pending;
+
+    case Ph::RefRead:
+      d = hw_->readSector(0, scratch_);
+      if (d != DiskErr::Ok) {
+        info.diskErr = d;
+        return bad(fromDisk(d), fail);
+      }
+      info.refHash = usbFnv1a(scratch_, kCh376DiskSecBytes);
+#if USB_FORCE_BAUD_REF
+      info.baud = hw_->baud();  // стенд: лишаємось на еталонній швидкості, самоперевірки немає
+      ph_ = Ph::Cap;
+#else
+      ph_ = Ph::Fast;
+#endif
+      return OpenPoll::Pending;
+
+    case Ph::Fast:  // 2. Швидка: 2 Мбод і порівняння хешу сектора 0
+      if (!bring(kUsbBaudFast, now, e)) return OpenPoll::Pending;
+      rec(info, kUsbBaudFast, e);
+      info.selfTest = SelfTest::FastFailed;
+      ph_ = (e == Ch376Err::Ok && hw_->baud() >= kCh376MinPlayBaud) ? Ph::FastRead : Ph::Back;
+      return OpenPoll::Pending;
+
+    case Ph::FastRead:
+      d = hw_->readSector(0, scratch_);
+      if (d == DiskErr::Ok) {
+        info.fastHash = usbFnv1a(scratch_, kCh376DiskSecBytes);
+        if (info.fastHash == info.refHash) {
+          info.selfTest = SelfTest::Passed;
+          info.baud = hw_->baud();
+          ph_ = Ph::Cap;
+          return OpenPoll::Pending;
+        }
+        info.selfTest = SelfTest::Mismatch;
+      } else {
+        info.diskErr = d;
+      }
+      ph_ = Ph::Back;
+      return OpenPoll::Pending;
+
+    case Ph::Back:  // 3. Назад на 1 Мбод
+      if (!bring(kUsbBaudRef, now, e)) return OpenPoll::Pending;
+      rec(info, kUsbBaudRef, e);
+      if (e != Ch376Err::Ok) return bad(noMediaErr(e) ? UsbOpenFail::NoMedia : UsbOpenFail::NoChip, fail);
+      info.baud = hw_->baud();
+      ph_ = Ph::Cap;
+      return OpenPoll::Pending;
+
+    case Ph::AltFast:  // 4. Лише 2 Мбод (без самоперевірки)
+      if (!bring(kUsbBaudFast, now, e)) return OpenPoll::Pending;
+      rec(info, kUsbBaudFast, e);
+      if (e == Ch376Err::Ok && hw_->baud() >= kCh376MinPlayBaud) {
+        ph_ = Ph::AltRead;
+      } else if (noMediaErr(e)) {
+        return bad(UsbOpenFail::NoMedia, fail);
+      } else {
+        ph_ = Ph::Auto;
+      }
+      return OpenPoll::Pending;
+
+    case Ph::AltRead:
+      d = hw_->readSector(0, scratch_);
+      if (d != DiskErr::Ok) {
+        info.diskErr = d;
+        return bad(fromDisk(d), fail);
+      }
+      info.refHash = info.fastHash = usbFnv1a(scratch_, kCh376DiskSecBytes);
+      info.selfTest = SelfTest::RefFailed;
+      info.baud = hw_->baud();
+      ph_ = Ph::Cap;
+      return OpenPoll::Pending;
+
+    case Ph::Auto:  // 5. Діагностика: чи живий чіп на нижчих швидкостях
+      if (!bring(0, now, e)) return OpenPoll::Pending;
+      rec(info, 0, e);
+      if (e == Ch376Err::Ok) {
+        info.baud = hw_->baud();
+        return bad(UsbOpenFail::SlowLink, fail);
+      }
+      return bad(noMediaErr(e) ? UsbOpenFail::NoMedia : UsbOpenFail::NoChip, fail);
+
+    case Ph::Cap: {
+      uint32_t cap = 0;
+      d = hw_->capacity(cap);
+      if (d != DiskErr::Ok || cap == 0) {
+        info.diskErr = d;
+        return bad(d == DiskErr::Ok ? UsbOpenFail::ReadError : fromDisk(d), fail);
+      }
+      info.capacity = cap;
+      ph_ = Ph::Pick;
+      return OpenPoll::Pending;
+    }
+
+    case Ph::Pick: {
+      const UsbOpenFail f = usbPickPartition(*hw_, scratch_, *pr_, info);
+      ph_ = Ph::End;
+      if (f != UsbOpenFail::None) {
+        fail = f;
+        return OpenPoll::Failed;
+      }
+      fail = UsbOpenFail::None;
+      return OpenPoll::Done;
+    }
+  }
+  return OpenPoll::Pending;
+}
+
 UsbOpenFail UsbSession::open(Ch376Link& link, IUsbOpenHw& hw) {
   info_ = UsbOpenInfo{};
   if (bd_) return UsbOpenFail::AlreadyOpen;
@@ -306,5 +476,69 @@ void UsbSession::close() {
   disk_ = nullptr;
 }
 
+// ---- M4c2: відкриття по кроках
+void UsbSession::freeTemp() {
+  delete pr_;
+  delete[] scratch_;
+  pr_ = nullptr;
+  scratch_ = nullptr;
+}
+
+UsbOpenFail UsbSession::openBegin(Ch376Link& link, IUsbOpenHw& hw) {
+  info_ = UsbOpenInfo{};
+  if (bd_ || pending_) return UsbOpenFail::AlreadyOpen;
+  scratch_ = new (std::nothrow) uint8_t[kCh376DiskSecBytes];
+  pr_ = new (std::nothrow) ProbeReport;
+  disk_ = new (std::nothrow) Ch376Disk(link);
+  bd_ = disk_ ? new (std::nothrow) Ch376BlockDev(*disk_) : nullptr;
+  if (!scratch_ || !pr_ || !disk_ || !bd_) {
+    delete bd_;
+    delete disk_;
+    bd_ = nullptr;
+    disk_ = nullptr;
+    freeTemp();
+    return UsbOpenFail::NoMemory;
+  }
+  hw.attach(*disk_);
+  hw_ = &hw;
+  pending_ = true;
+  steps_.begin(hw, scratch_, pr_, info_);
+  return UsbOpenFail::None;
+}
+
+OpenPoll UsbSession::openStep(uint32_t now, UsbOpenFail& fail) {
+  if (!pending_) {
+    fail = UsbOpenFail::None;
+    return bd_ ? OpenPoll::Done : OpenPoll::Failed;
+  }
+  const OpenPoll r = steps_.step(now, fail);
+  if (r == OpenPoll::Pending) return r;
+  pending_ = false;
+  freeTemp();
+  if (r == OpenPoll::Failed) {
+    hw_->portEnd();
+    delete bd_;
+    delete disk_;
+    bd_ = nullptr;
+    disk_ = nullptr;
+    return r;
+  }
+  bd_->setPartition(info_.partStart, info_.partSectors);
+  return r;
+}
+
+void UsbSession::openAbort() {
+  if (!pending_) return;
+  steps_.abort();
+  pending_ = false;
+  freeTemp();
+  hw_->portEnd();
+  delete bd_;
+  delete disk_;
+  bd_ = nullptr;
+  disk_ = nullptr;
+}
+
 #endif  // ENABLE_USB_CH376
+
 

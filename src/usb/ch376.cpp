@@ -54,14 +54,28 @@ Ch376Err Ch376::readReply(const uint8_t* ok, size_t nok, uint32_t tmoMs, uint8_t
   }
 }
 
-Ch376Err Ch376::reset() {
+Ch376Err Ch376::resetSend() {
   sendCmd(kCh376CmdReset, nullptr, 0);  // RESET_ALL іде на поточній швидкості, відповіді нема
-  link_.delayMs(kCh376ResetWaitMs);
+  host_ = false;
+  return Ch376Err::Ok;
+}
+
+Ch376Err Ch376::resetFinish() {
   if (!link_.setBaud(kCh376DefaultBaud)) return Ch376Err::BaudFail;
   link_.flushRx();
   baud_ = kCh376DefaultBaud;
   return Ch376Err::Ok;
 }
+
+Ch376Err Ch376::reset() {
+  resetSend();
+  link_.delayMs(kCh376ResetWaitMs);
+  return resetFinish();
+}
+
+Ch376Err Ch376::sendDiskConnect() { return sendCmd(kCh376CmdDiskConnect, nullptr, 0); }
+
+Ch376Err Ch376::sendDiskMount() { return sendCmd(kCh376CmdDiskMount, nullptr, 0); }
 
 Ch376Err Ch376::checkExist() {
   const uint8_t x = kCh376CheckByte;
@@ -81,6 +95,7 @@ Ch376Err Ch376::setUsbMode(uint8_t mode) {
   if (e != Ch376Err::Ok) return e;
   if (r != kCh376RetSuccess) return Ch376Err::BadReply;
   link_.delayMs(kCh376ModeWaitMs);
+  host_ = (mode == kCh376ModeHost);  // M4c2: лише стійкий host (6); 7 — скид шини, далі має йти 6
   return Ch376Err::Ok;
 }
 
@@ -220,6 +235,7 @@ Ch376Err Ch376::recover(uint32_t tried) {
     link_.setBaud(found);
     baud_ = found;
     sendCmd(kCh376CmdReset, nullptr, 0);
+    host_ = false;
     link_.delayMs(kCh376ResetWaitMs);
     if (!link_.setBaud(kCh376DefaultBaud)) {
       lost_ = true;

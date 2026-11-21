@@ -18,6 +18,9 @@
 #include "usb/ch376.h"
 #include "usb/ch376_sdfat.h"
 #include "usb/ch376_uart.h"
+#include "usb/usb_bringup.h"
+#include "usb/usb_chip_uart.h"
+#include "usb/usb_presence.h"
 #include "util/heap_phases.h"
 #include "util/log.h"
 
@@ -113,14 +116,47 @@ class UartOpenHw final : public IUsbOpenHw {
     return e;
   }
 
+  // M4c2: bringUp по кроках (UsbBringUp над UartChip) — той самий порядок, що в bringUp(), але очікування таймерами.
+  void bringBegin(uint32_t baud) override {
+    {
+      Ch376Fs& fs = ch376_uart::fs();
+      const bool m = fs.useInt();
+      const uint32_t g = fs.gapUs();
+      fs.reset();
+      fs.setUseInt(m);
+      fs.setGapUs(g);
+      ch376_uart::reader().reset();
+    }
+    disk_->reset();
+    disk_->setSecPerCmd(kCh376SectorsPerCmd);
+    reqBaud_ = baud;
+    t0Us_ = micros();
+    bu_.begin(baud);
+  }
+  bool bringStep(uint32_t nowMs, Ch376Err& res) override {
+    if (!bu_.step(nowMs)) return false;
+    res = bu_.err();
+    LOGI(TAG, "open: bringUp %u Бод → %s, порт %u Бод, %u мс", (unsigned)reqBaud_, ch376ErrName(res), (unsigned)ch376_uart::driver().baud(),
+         (unsigned)((micros() - t0Us_) / 1000u));
+    return true;
+  }
+  void bringAbort() override { bu_.abort(); }
+
   uint32_t baud() const override { return ch376_uart::driver().baud(); }
   DiskErr capacity(uint32_t& s) override { return disk_->capacity(s); }
   DiskErr readSector(uint32_t lba, uint8_t* dst) override { return disk_->readSectors(lba, 1, dst); }
   void portEnd() override { stopChip(); }
 
-  // Чіп лишається на узгодженій швидкості: скидаємо його на ній (порт → 9600), інакше наступний open його не знайде.
+  // M4c2: чіп у host — паркуємо (UART2 вимкнено, чіп не скидається, події INT# не губляться; швидкість лишається в драйвері).
+  // Інакше (до host не дійшли) — як раніше: скидаємо чіп на 9600, потім Serial2.end().
   static void stopChip() {
     if (!ch376_uart::started()) return;
+#if USB_PRESENCE_MODE != 0
+    if (ch376_uart::driver().host()) {
+      ch376_uart::park();
+      return;
+    }
+#endif
     Ch376& d = ch376_uart::driver();
     if (d.baud() != kCh376DefaultBaud && d.reset() != Ch376Err::Ok) d.rollback(d.baud());
     ch376_uart::stop();  // Serial2.end(), зняття ISR і семафора
@@ -144,6 +180,8 @@ class UartOpenHw final : public IUsbOpenHw {
   }
 
   Ch376Disk* disk_ = nullptr;
+  UsbBringUp bu_{uartChip()};
+  uint32_t reqBaud_ = 0, t0Us_ = 0;
 };
 
 }  // namespace
@@ -185,13 +223,19 @@ bool UsbVolume::open(UsbVolInfo& out) {
     return false;
   }
   const uint32_t t0 = millis();
-  if (vol_) {
+  if (vol_ || opening_) {
     out.fail = UsbOpenFail::AlreadyOpen;
     LOGW(TAG, "open: %s", usbOpenFailText(out.fail));
     return false;
   }
+  UsbPresence::yield();  // M4c2: чіпом володіємо ми
   UartOpenHw hw;
-  UsbOpenFail f = ses_.open(ch376_uart::link(), hw);
+  const UsbOpenFail f = ses_.open(ch376_uart::link(), hw);
+  return afterSession(f, t0, out);
+}
+
+// Спільний підсумок blocking open() і openStep(): логи кроків, SdFat-том, звільнення при відмові, повідомлення сервісу присутності.
+bool UsbVolume::afterSession(UsbOpenFail f, uint32_t t0, UsbVolInfo& out) {
   HeapPhase::mark(HeapPhase::UsbDrv);  // M4c1: драйвер UART2 і сеанс підняті (або відмова)
   const UsbOpenInfo& in = ses_.info();
   for (uint8_t i = 0; i < in.nSteps; i++)
@@ -224,6 +268,8 @@ bool UsbVolume::open(UsbVolInfo& out) {
   out.openMs = millis() - t0;
   if (f != UsbOpenFail::None) {
     LOGW(TAG, "open: ВІДМОВА (%s): %s", usbOpenFailName(f), usbOpenFailText(f));
+    UsbPresence::openFailed(f);  // M4c2: NoMedia → Absent, чужа ФС → Unsupported
+    UsbPresence::sessionClosed(false);
     return false;
   }
   out.baud = in.baud;
@@ -239,7 +285,68 @@ bool UsbVolume::open(UsbVolInfo& out) {
   const uint8_t want = in.kind == VolKind::ExFat ? 64 : (in.kind == VolKind::Fat32 ? 32 : 16);
   if (out.fsType != want)
     LOGW(TAG, "open: тип ФС SdFat (%u) не збігається з розбором disk_probe (%s)", (unsigned)out.fsType, volKindName(in.kind));
+  UsbPresence::sessionOpened();  // M4c2: флешка є й придатна
   return true;
+}
+
+// ---- M4c2: відкриття по кроках
+bool UsbVolume::openBegin(UsbVolInfo& out) {
+  out = UsbVolInfo{};
+  Lk lk;
+  if (!lk.ok) {
+    out.fail = UsbOpenFail::NoPort;
+    LOGW(TAG, "open: мʼютекс USB зайнятий довше %u мс", (unsigned)kUsbLockWaitMs);
+    return false;
+  }
+  if (vol_ || opening_) {
+    out.fail = UsbOpenFail::AlreadyOpen;
+    LOGW(TAG, "open: %s", usbOpenFailText(out.fail));
+    return false;
+  }
+  UsbPresence::yield();  // сервіс присутності віддає порт, якщо мав його відкритим
+  hw_ = new (std::nothrow) UartOpenHw;
+  if (!hw_) {
+    out.fail = UsbOpenFail::NoMemory;
+    return false;
+  }
+  openT0_ = millis();
+  const UsbOpenFail f = ses_.openBegin(ch376_uart::link(), *hw_);
+  if (f != UsbOpenFail::None) {
+    delete hw_;
+    hw_ = nullptr;
+    out.fail = f;
+    LOGW(TAG, "open: ВІДМОВА (%s): %s", usbOpenFailName(f), usbOpenFailText(f));
+    return false;
+  }
+  opening_ = true;
+  return true;
+}
+
+OpenPoll UsbVolume::openStep(uint32_t nowMs, UsbVolInfo& out) {
+  if (!opening_) {
+    out.fail = vol_ ? UsbOpenFail::None : UsbOpenFail::NoPort;
+    return vol_ ? OpenPoll::Done : OpenPoll::Failed;
+  }
+  Lk lk(0);  // без очікування: мʼютекс чужий (консоль) — спробуємо наступним кроком
+  if (!lk.ok) return OpenPoll::Pending;
+  UsbOpenFail f = UsbOpenFail::None;
+  const OpenPoll r = ses_.openStep(nowMs, f);
+  if (r == OpenPoll::Pending) return r;
+  opening_ = false;
+  delete hw_;  // при Failed сеанс уже викликав portEnd() (паркування)
+  hw_ = nullptr;
+  return afterSession(f, openT0_, out) ? OpenPoll::Done : OpenPoll::Failed;
+}
+
+void UsbVolume::openAbort() {
+  Lk lk;
+  if (!opening_) return;
+  ses_.openAbort();  // bringAbort + portEnd (паркування) + звільнення обʼєктів сеансу
+  delete hw_;
+  hw_ = nullptr;
+  opening_ = false;
+  UsbPresence::sessionClosed(false);  // обрив міг лишити подію в чіпі: її побачить INT#
+  LOGI(TAG, "open: перервано, ресурси звільнено");
 }
 
 void UsbVolume::closeDirs() {
@@ -267,10 +374,18 @@ void UsbVolume::release() {
 
 void UsbVolume::close() {
   Lk lk;  // не вдалось (мʼютекс чужий довше kUsbLockWaitMs) — все одно закриваємо: виклик лише коли читачів немає
+  if (opening_) {  // закриття посеред відкриття = переривання
+    ses_.openAbort();
+    delete hw_;
+    hw_ = nullptr;
+    opening_ = false;
+  }
   if (!vol_ && !ses_.isOpen() && !ch376_uart::started()) return;
+  const bool lost = ses_.isOpen() && ses_.dev() && !ses_.dev()->present();  // флешку вийнято, поки сеанс був відкритий
   HeapPhase::mark(HeapPhase::UsbClose);  // M4c1: до звільнення (пік ресурсів USB)
   release();
-  UartOpenHw::stopChip();
+  UartOpenHw::stopChip();  // M4c2: паркування (чіп лишається в host)
+  UsbPresence::sessionClosed(lost);
   HeapPhase::mark(HeapPhase::UsbClose);  // після: heap має повернутись до бази
 }
 
@@ -590,5 +705,6 @@ bool UsbFileReader::seek(uint32_t p) {
 }
 
 #endif  // ENABLE_USB_CH376
+
 
 

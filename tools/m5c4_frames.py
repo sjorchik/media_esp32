@@ -403,12 +403,20 @@ def sc_get(ctx):
 
 
 def sc_media_usb(ctx):
-    """MEDIA usb=0 у збірці без CH376S (Q1; STUB_USB_PRESENT=0)."""
+    """MEDIA usb: 0 у збірці без CH376S (Q1; STUB_USB_PRESENT=0). M4c2: у esp32dev_usb це присутність флешки (--usb-expected 0|1);
+    фонова ініціалізація чіпа йде через ≈2–3 с після старту, тож до 10 с чекаємо на очікуване значення."""
     exp = str(ctx.args.usb_expected)
     got = ctx.base.get("usb")
+    t0 = time.time()
+    while got != exp and time.time() - t0 < 10.0:
+        time.sleep(1.0)
+        m = [f for f in cmd(ctx, "GET") if f.name == "MEDIA"]
+        if m:
+            got = m[-1].args[1]
+    ctx.base["usb"] = got
     if got == exp:
-        return PASS, "MEDIA usb=%s (як очікувалось для збірки без CH376S)" % got
-    return FAIL, "MEDIA usb=%s, очікувалось %s (перевір STUB_USB_PRESENT=0 у config.h і що прошито нову збірку)" % (got, exp)
+        return PASS, "MEDIA usb=%s (як очікувалось)" % got
+    return FAIL, "MEDIA usb=%s, очікувалось %s (без CH376S — STUB_USB_PRESENT=0; з esp32dev_usb — чи є флешка й чи пройшла фонова ініціалізація: DBG,usb,pres)" % (got, exp)
 
 
 def sc_src_off_idem(ctx):
@@ -420,9 +428,9 @@ def sc_src_off_idem(ctx):
 
 def sc_src_usb(ctx):
     """SRC,usb без носія → STATE,usb,idle + ERR,no_media (Q1); повтор → лише ERR,no_media (Q7)."""
-    if ctx.base.get("usb") == "1":
-        return SKIP, "USB-носій змонтовано (збірка з CH376S?) — сценарій для usb=0"
-    if ctx.args.usb_flash:  # M4b4: збірка esp32dev_usb з флешкою — SRC,usb відкриває том і скануює
+    if ctx.base.get("usb") == "1" and not ctx.args.usb_flash:
+        return SKIP, "MEDIA usb=1 (флешка є?) — сценарій для usb=0; з флешкою запустіть з --usb-flash"
+    if ctx.args.usb_flash:  # M4b4/M4c2: збірка esp32dev_usb з флешкою — MEDIA usb=1 і до, і після (присутність), SRC,usb відкриває том і скануює
         try:
             fr = cmd(ctx, "SRC,usb", first_wait=8.0, quiet=1.5, max_wait=30.0)
             names = [f.name for f in fr]
@@ -438,9 +446,9 @@ def sc_src_usb(ctx):
             send(ctx, "SRC,off")
             time.sleep(2.0)
             media = [f for f in ctx.rx.since(0) if f.name == "MEDIA"][-1].args
-            if media[1] != "0":
-                return FAIL, "після SRC,off очікувалось MEDIA usb=0, отримано " + ",".join(media)
-            return PASS, "SRC,usb з флешкою: STATE,usb,..., MEDIA usb=1 після скану, 0 після SRC,off"
+            if media[1] != "1":  # M4c2: флешка в гнізді, тож після виходу з USB прапорець лишається 1 (раніше падав до 0)
+                return FAIL, "після SRC,off очікувалось MEDIA usb=1 (флешка в гнізді), отримано " + ",".join(media)
+            return PASS, "SRC,usb з флешкою: STATE,usb,..., MEDIA usb=1 і після скану, і після SRC,off (присутність, не «змонтовано»)"
         finally:
             send(ctx, "SRC,off")
             settle(ctx, 1.0)
@@ -733,3 +741,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+

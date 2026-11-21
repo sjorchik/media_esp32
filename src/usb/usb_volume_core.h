@@ -45,6 +45,18 @@ class IUsbOpenHw {
   virtual DiskErr capacity(uint32_t& sectors) = 0;
   virtual DiskErr readSector(uint32_t lba, uint8_t* dst) = 0;  // сирий сектор диска (512 Б)
   virtual void portEnd() = 0;
+
+  // M4c2: неблокуючий варіант bringUp для кроків у loop. Типово — один блокуючий bringUp() у першому ж bringStep().
+  // bringStep повертає true, коли послідовність завершено (res — результат як у bringUp), інакше false (викликати ще).
+  virtual void bringBegin(uint32_t baud) { asyncBaud_ = baud; }
+  virtual bool bringStep(uint32_t /*nowMs*/, Ch376Err& res) {
+    res = bringUp(asyncBaud_);
+    return true;
+  }
+  virtual void bringAbort() {}
+
+ protected:
+  uint32_t asyncBaud_ = 0;
 };
 
 // Результат самоперевірки 2 Мбод.
@@ -83,6 +95,33 @@ struct UsbOpenInfo {
 
 uint32_t usbFnv1a(const uint8_t* d, size_t n);
 
+// M4c2. Результат кроку неблокуючого відкриття.
+enum class OpenPoll : uint8_t { Pending, Done, Failed };
+
+// Автомат usbOpenCore по кроках (те саме дерево рішень: еталон 1 Мбод → 2 Мбод із хешем → відкат → ємність → розділ), але
+// кожен step() — одна коротка дія; очікування чіпа йдуть через hw.bringBegin/bringStep. Чистий C++, тестується в native
+// (диференціально проти usbOpenCore). scratch (512 Б) і pr — від викликача, мають жити до кінця.
+class UsbOpenSteps {
+ public:
+  void begin(IUsbOpenHw& hw, uint8_t* scratch, ProbeReport* pr, UsbOpenInfo& info);
+  OpenPoll step(uint32_t nowMs, UsbOpenFail& fail);
+  void abort();  // hw.bringAbort(); порт закриває викликач
+  bool active() const { return ph_ != Ph::Idle && ph_ != Ph::End; }
+
+ private:
+  enum class Ph : uint8_t { Idle, Port, Ref, RefRead, Fast, FastRead, Back, AltFast, AltRead, Auto, Cap, Pick, End };
+  OpenPoll bad(UsbOpenFail f, UsbOpenFail& out);
+  bool bring(uint32_t baud, uint32_t now, Ch376Err& e);  // стартує при першому виклику фази; true — bringUp завершено
+
+  IUsbOpenHw* hw_ = nullptr;
+  uint8_t* scratch_ = nullptr;
+  ProbeReport* pr_ = nullptr;
+  UsbOpenInfo* info_ = nullptr;
+  Ph ph_ = Ph::Idle;
+  bool started_ = false;  // bringBegin для поточної фази виконано
+  Ch376Err refErr_ = Ch376Err::Ok;
+};
+
 // Швидкість: еталон 1 Мбод (хеш сектора 0) → 2 Мбод (хеш) → збіг: лишаємось; ні: повернення на 1 Мбод. Кожна швидкість
 // нижча за kCh376MinPlayBaud — відмова SlowLink. scratch — 512 Б від викликача. Повертає None і фінальну швидкість у info.baud.
 UsbOpenFail usbNegotiate(IUsbOpenHw& hw, uint8_t* scratch, UsbOpenInfo& info);
@@ -106,6 +145,12 @@ class UsbSession {
   UsbSession& operator=(const UsbSession&) = delete;
 
   UsbOpenFail open(Ch376Link& link, IUsbOpenHw& hw);
+  // M4c2: неблокуюче відкриття. openBegin виділяє обʼєкти (як open); openStep — один короткий крок; openAbort звільняє все
+  // (hw.bringAbort + hw.portEnd). Після Done/Failed обʼєкти вже у стані як після open().
+  UsbOpenFail openBegin(Ch376Link& link, IUsbOpenHw& hw);  // None — автомат запущено
+  OpenPoll openStep(uint32_t nowMs, UsbOpenFail& fail);
+  void openAbort();
+  bool opening() const { return steps_.active() || pending_; }
   void close();  // звільняє обʼєкти; порт чіпа закриває викликач; ідемпотентно
 
   bool isOpen() const { return bd_ != nullptr; }
@@ -114,8 +159,16 @@ class UsbSession {
   const UsbOpenInfo& info() const { return info_; }
 
  private:
+  void freeTemp();
+
   Ch376Disk* disk_ = nullptr;
   Ch376BlockDev* bd_ = nullptr;
   UsbOpenInfo info_;
+  uint8_t* scratch_ = nullptr;  // M4c2: тимчасові буфери відкриття по кроках
+  ProbeReport* pr_ = nullptr;
+  IUsbOpenHw* hw_ = nullptr;
+  UsbOpenSteps steps_;
+  bool pending_ = false;
 };
+
 

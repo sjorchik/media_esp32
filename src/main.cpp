@@ -13,6 +13,7 @@
 #include "media/sd_media.h"
 #if ENABLE_USB_CH376
 #include "media/usb_media.h"
+#include "usb/usb_presence.h"
 #endif
 #include "proto/link.h"
 #include "sources/sd_source.h"
@@ -69,6 +70,9 @@ void setup() {
   AudioTask::begin(g_audio);
 
   Events::ready();  // READY,<fw>,1; початковий стан src=off, state=idle, DAC замʼючений
+#if ENABLE_USB_CH376
+  UsbPresence::begin(millis());  // M4c2: фонова ініціалізація чіпа CH376S через kUsbPresInitDelayMs — READY/HB і інші джерела не чекають
+#endif
   Diag::logHeap("boot-no-bt");
   g_bt.startStack();  // BT-стек піднімається один раз; після цього лишається ініціалізованим
   Diag::logHeap("boot");
@@ -97,5 +101,6 @@ void loop() {
   StorageDbg::service();     // DBG boot/settings виконує loopTask
   Diag::tick(now);
 }
+
 
 

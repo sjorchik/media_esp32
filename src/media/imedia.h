@@ -55,7 +55,16 @@ class IMedia {
   // scanEnd() — після завершення АБО переривання скану (ідемпотентно); у відтворенні ресурсів скану немає. SD: no-op.
   virtual void scanBegin() {}
   virtual void scanEnd() {}
+  // M4c2. Неблокуюче монтування (USB: відкриття по кроках у loop). mountBegin() стартує (false — відмова одразу, див. lastFail у USB),
+  // mountStep() — один короткий крок: Pending / Done (mounted()==true) / Failed; mountAbort() — перервати й звільнити (ідемпотентно).
+  // Типово (SD): mount() блокуючий, тож Done/Failed одразу за mounted().
+  enum class MountPoll : uint8_t { Pending, Done, Failed };
+  virtual bool mountBegin() { return true; }
+  virtual MountPoll mountStep(uint32_t /*nowMs*/) { return mounted() ? MountPoll::Done : MountPoll::Failed; }
+  virtual void mountAbort() {}
+  virtual bool mounting() const { return false; }
 #endif
 };
+
 
 

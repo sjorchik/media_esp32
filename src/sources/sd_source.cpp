@@ -5,6 +5,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#if ENABLE_USB_CH376
+#include "esp_heap_caps.h"
+#include "usb/usb_presence.h"
+#endif
 #include "audio/pcm_arena.h"
 #include "config.h"
 #include "core/app.h"
@@ -89,7 +93,16 @@ Res SdSource::activate() {
   active_ = true;
   scanRetry_ = 0;
 #if ENABLE_USB_CH376
-  if (prof_.ownsMount && !media_.mounted()) pol_.mountResult(media_.mount());  // USB: відкрити том (до ≈3 с без флешки)
+  if (prof_.ownsMount && !media_.mounted()) {  // USB (M4c2): без блокування app
+    const UsbPres p = UsbPresence::stateForOpen();
+    if (p == UsbPres::Absent || p == UsbPres::Unsupported) {  // присутність відома: без відкриття й без очікування 3 с
+      st_ = PlayState::Idle;
+      LOGI(TAG, "activate: флешки немає (присутність: %s)", usbPresName(p));
+      return Res::NoMedia;
+    }
+    startOpen();  // Present/Unknown: STATE,usb,scan одразу, відкриття — кроками в loop()
+    return Res::Ok;
+  }
 #endif
   if (!media_.mounted()) {
     st_ = PlayState::Idle;
@@ -129,6 +142,12 @@ void SdSource::loop(uint32_t now) {
   StallWatch::disarm();  // M5c6: app повернулась у loop — сторож зависання після скану знято
   service(now);
   if (!active_) return;
+#if ENABLE_USB_CH376
+  if (open_ != Open::None) {  // M4c2: відкриття USB по кроках
+    openStep(now);
+    return;
+  }
+#endif
   if (sus_ != Sus::None) {  // M5c3: чекаємо Removed; скан/відтворення не рухаємо
     susStep(now);
     return;
@@ -177,7 +196,10 @@ void SdSource::onMedia(MediaEvent ev) {
   }
 #if ENABLE_USB_CH376
   if (prof_.ownsMount) {
-    applyStep(pol_.removed(), false);  // MEDIA піде з onMediaChanged(); том і драйвер закриваємо тут — сесії вже нема
+    UsbPresence::volumeLost();  // M4c2: присутність → Absent; MEDIA піде з onMediaChanged() (тому прапорець оновлюємо тут)
+    bool f = false;
+    if (UsbPresence::takeChange(f)) DeviceState::setUsb(f);
+    applyStep(pol_.removed(), false);  // том і драйвер закриваємо тут — сесії вже нема
     media_.unmount();
   } else {
     DeviceState::setSd(ins);
@@ -203,29 +225,89 @@ Res SdSource::refreshMedia() {
 }
 
 #if ENABLE_USB_CH376
-// M4b4: виконує крок політики USB-носія. emit=false, коли MEDIA надішле менеджер (onMediaChanged).
-void SdSource::applyStep(const MediaStep& s, bool emit) {
-  if (s.flagChanged) {
-    DeviceState::setUsb(s.flag);
-    if (emit) Events::media(DeviceState::sd(), DeviceState::usb());
-  }
+// M4b4/M4c2: крок політики USB-носія. Прапорець MEDIA usb тепер веде UsbPresence (присутність, а не «змонтовано з треками»),
+// тож політика лише вирішує, чи закривати том.
+void SdSource::applyStep(const MediaStep& s, bool) {
   if (s.release) media_.unmount();
 }
 
-// Повторне SRC,usb для активного джерела без тому (Q7: без носія команда дає лише ERR,no_media, але новий том ловимо тут,
-// бо виявлення вставлення, поки USB неактивний, — завдання M4c). Ok → скан розпочато, менеджер пошле STATE.
+// M4c2: повторне SRC,usb для активного джерела без тому (idle). Absent/Unsupported — як раніше лише ERR,no_media; інакше
+// відкриття стартує (Ok → менеджер пошле STATE,usb,scan).
 Res SdSource::retryMedia() {
   if (!prof_.ownsMount || !active_) return Res::NoMedia;
-  if (st_ != PlayState::Idle) return Res::Ok;  // скан або відтворення вже йдуть
-  pol_.mountResult(media_.mount());
-  if (!media_.mounted()) return Res::NoMedia;
+  if (st_ != PlayState::Idle) return Res::Ok;  // скан, відкриття або відтворення вже йдуть
+  const UsbPres p = UsbPresence::stateForOpen();
+  if (p == UsbPres::Absent || p == UsbPres::Unsupported) return Res::NoMedia;
   scanRetry_ = 0;
-  startScan();
+  startOpen();
   return Res::Ok;
+}
+
+void SdSource::startOpen() {
+  st_ = PlayState::Scan;
+  scanRetry_ = 0;
+  open_ = Open::WaitHeap;
+  openT0_ = millis();
+  openFree0_ = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  openSteps_ = openMaxMs_ = 0;
+  LOGI(TAG, "відкриття USB розпочато (кроками), free %u Б", (unsigned)openFree0_);
+}
+
+// Один короткий крок відкриття. Очікування вільного heap після BT (≥ kUsbPreActivateFreeHeap, до kUsbPreActivateWaitMs) — теж
+// без блокування: STATE,usb,scan уже віддано, команди обробляються.
+void SdSource::openStep(uint32_t now) {
+  if (open_ == Open::WaitHeap) {
+    const uint32_t fr = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    if (fr < kUsbPreActivateFreeHeap && (uint32_t)(now - openT0_) < kUsbPreActivateWaitMs) return;
+    LOGI(TAG, "відкриття: чекав heap %u мс (free %u → %u Б)", (unsigned)(now - openT0_), (unsigned)openFree0_, (unsigned)fr);
+    if (!media_.mountBegin()) {
+      open_ = Open::None;
+      pol_.mountResult(false);
+      st_ = PlayState::Idle;
+      g_sources.publishNow();  // STATE,usb,idle раніше за ERR
+      Events::err(proto::errc::kNoMedia);
+      return;
+    }
+    open_ = Open::Mounting;
+    openT0_ = now;
+    return;
+  }
+  const uint32_t t0 = millis();
+  const IMedia::MountPoll r = media_.mountStep(now);
+  const uint32_t dt = millis() - t0;
+  openSteps_++;
+  if (dt > openMaxMs_) openMaxMs_ = dt;
+  if (dt > kUsbOpenStepWarnMs) LOGW(TAG, "крок відкриття %u мс (> %u мс)", (unsigned)dt, (unsigned)kUsbOpenStepWarnMs);
+  if (r == IMedia::MountPoll::Pending) return;
+  open_ = Open::None;
+  LOGI(TAG, "відкриття USB завершено за %u мс: кроків %u, найдовший %u мс", (unsigned)(now - openT0_), (unsigned)openSteps_, (unsigned)openMaxMs_);
+  if (r == IMedia::MountPoll::Done) {
+    pol_.mountResult(true);
+    startScan();
+    return;
+  }
+  pol_.mountResult(false);
+  st_ = PlayState::Idle;
+  LOGI(TAG, "відкриття: носія немає");
+  g_sources.publishNow();  // STATE,usb,idle раніше за ERR,no_media
+  Events::err(proto::errc::kNoMedia);
+}
+
+void SdSource::abortOpen() {
+  if (open_ == Open::None) return;
+  const uint32_t t0 = millis();
+  const uint32_t f0 = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  if (open_ == Open::Mounting) media_.mountAbort();
+  open_ = Open::None;
+  LOGI(TAG, "відкриття USB перервано, ресурси звільнено за %u мс; heap free %u → %u Б", (unsigned)(millis() - t0), (unsigned)f0,
+       (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
 }
 #endif
 
 void SdSource::stopJobs() {
+#if ENABLE_USB_CH376
+  abortOpen();  // M4c2: відкриття USB переривається першим (звільняє порт чіпа)
+#endif
   const bool wasScan = scanner_.state() == Scanner::St::Running;
   scanner_.abort();  // закриває каталоги, звільняє пул імен підкаталогів
 #if ENABLE_USB_CH376
@@ -1275,5 +1357,6 @@ void SdSource::dbgResume(bool clear) {
     LOGI(TAG, "resume: зараз #%u зсув=%u Б час=%u мс, останній запис зсув=%u Б", (unsigned)cur_ + 1, (unsigned)off, (unsigned)ms,
          (unsigned)rsmLastOff_);
 }
+
 
 

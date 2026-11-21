@@ -81,7 +81,15 @@ class UsbVolume {
   // Запуск драйвера (2 Мбод з самоперевіркою, інакше 1 Мбод), розбір розділу, монтування. false — причина в out.fail
   // (і окремим логом). Після відмови все звільнено, порт закрито.
   bool open(UsbVolInfo& out);
-  // Закрити файл, розмонтувати, звільнити обʼєкти, скинути чіп на 9600 і Serial2.end(). Ідемпотентно.
+  // M4c2: те саме по кроках для app (без блокування). openBegin — виділення і старт (false: відмова одразу, причина в out.fail);
+  // openStep — один короткий крок: Pending / Done (том змонтовано, out заповнено) / Failed (все звільнено, чіп запарковано).
+  // openAbort — перервати (звільняє все й паркує чіп за ≈ один крок). Кожен крок бере мʼютекс без очікування.
+  bool openBegin(UsbVolInfo& out);
+  OpenPoll openStep(uint32_t nowMs, UsbVolInfo& out);
+  void openAbort();
+  bool opening() const { return opening_; }
+  // Закрити файл, розмонтувати, звільнити обʼєкти і ПАРКУВАТИ чіп (UART2 вимкнено, чіп лишається в host; M4c2). Якщо чіп до host
+  // не дійшов — як раніше: скид на 9600 і Serial2.end(). Ідемпотентно.
   void close();
 
   bool isOpen() const { return vol_ != nullptr; }
@@ -131,6 +139,7 @@ class UsbVolume {
   UsbVolume();
   void release();
   void closeDirs();
+  bool afterSession(UsbOpenFail f, uint32_t t0, UsbVolInfo& out);  // SdFat-етап і підсумок open()/openStep()
 
   UsbSession ses_;
   Ch376SdDevice* dev_ = nullptr;
@@ -142,11 +151,15 @@ class UsbVolume {
   uint32_t base0_[3] = {0, 0, 0};  // BlockDevStats (calls, sectors, cmds) на початок скану
   bool mp3Only_ = false;           // M4c1: dirNext не читає довге імʼя файлів із суфіксом 8.3 ≠ MP3 (лише під час скану)
   UsbFileReader rd_;
+  IUsbOpenHw* hw_ = nullptr;  // M4c2: апаратура відкриття по кроках (heap лише на час відкриття)
+  bool opening_ = false;
+  uint32_t openT0_ = 0;
 };
 
 // Статична памʼять (поза FsVolume/FsFile на heap): має лишатись у межах завдання (≤ 0,3 КБ).
 static_assert(sizeof(UsbOpenInfo) <= 160, "UsbOpenInfo завеликий для статичної памʼяті");
 
 #endif  // ENABLE_USB_CH376
+
 
 

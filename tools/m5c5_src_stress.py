@@ -74,13 +74,15 @@ def open_port(name, baud):
 class Dbg(threading.Thread):
     """Читає рядки UART0, шукає банер перезавантаження, дає query() для DBG,*."""
 
-    def __init__(self, ser):
+    def __init__(self, ser, rawlog=None):
         super().__init__(daemon=True)
         self.ser = ser
+        self.rawlog = rawlog  # M4c2: файл для повного запису UART0 з часовими мітками (--uart0-log)
         self.lock = threading.Lock()
         self.lines = []  # (t, текст)
         self.boots = 0
         self.stop_flag = False
+        self.t0 = time.monotonic()
 
     def run(self):
         buf = b""
@@ -96,6 +98,12 @@ class Dbg(threading.Thread):
             while b"\n" in buf:
                 raw, buf = buf.split(b"\n", 1)
                 s = raw.decode("utf-8", "replace").strip("\r")
+                if self.rawlog:
+                    try:
+                        self.rawlog.write("%s +%.3f %s\n" % (time.strftime("%H:%M:%S"), now - self.t0, s))
+                        self.rawlog.flush()
+                    except Exception:  # noqa: BLE001
+                        pass
                 with self.lock:
                     self.lines.append((now, s))
                     if "[I][main] медіамодуль WROOM" in s:
@@ -789,7 +797,8 @@ def run_stress(args):
         return 2
     rx = Rx(ser)
     rx.start()
-    dbg = Dbg(dser)
+    raw = open(args.uart0_log, "w", encoding="utf-8") if args.uart0_log else None
+    dbg = Dbg(dser, raw)
     dbg.start()
     logf = open(args.log, "w", encoding="utf-8") if args.log else None
     st = Stress(ser, rx, dbg, args, pool, logf)
@@ -829,6 +838,8 @@ def run_stress(args):
         dbg.join(1.0)
         ser.close()
         dser.close()
+        if raw:
+            raw.close()
         if logf:
             logf.close()
 
@@ -881,6 +892,7 @@ def main(argv=None):
     ap.add_argument("--burst-repeat", type=int, default=3)
     ap.add_argument("--ctl-baud", type=int, default=921600)
     ap.add_argument("--dbg-baud", type=int, default=460800)
+    ap.add_argument("--uart0-log", help="M4c2: файл для повного запису UART0 з часовими мітками (для розбору кроків відкриття USB, присутності, free heap)")
     args = ap.parse_args(argv)
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -900,4 +912,5 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+
 

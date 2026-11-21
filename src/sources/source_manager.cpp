@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #if ENABLE_USB_CH376
 #include "esp_heap_caps.h"
+#include "usb/usb_presence.h"
 #endif
 
 #include "core/device_state.h"
@@ -64,7 +65,13 @@ void SourceManager::emitErr(Res r, const char* detail) { Events::err(resCode(r),
 Res SourceManager::select(SrcId id) {
   if (id == cur_) {  // ідемпотентно
     LOGI(TAG, "джерело %s вже активне", srcName(id));
-    if (mediaMissing(id)) {  // Q7: кожна команда без носія → ERR,no_media (STATE не дублюється)
+#if ENABLE_USB_CH376
+    // M4c2: прапорець usb = присутність флешки, тож USB у idle (флешка без mp3, збій скану) теж пробує відкритися знову
+    const bool usbIdle = id == SrcId::USB && src_[(int)id] && src_[(int)id]->status().state == PlayState::Idle;
+#else
+    const bool usbIdle = false;
+#endif
+    if (mediaMissing(id) || usbIdle) {  // Q7: кожна команда без носія → ERR,no_media (STATE не дублюється)
       ISource* s = src_[(int)id];
       if (s && s->retryMedia() == Res::Ok) {  // M4b4: USB — том з'явився (або скан уже йде): без ERR, STATE пошле publish
         publish(false);
@@ -78,7 +85,6 @@ Res SourceManager::select(SrcId id) {
   LOGI(TAG, "перемикання %s -> %s", srcName(cur_), srcName(id));
   const uint32_t t0 = millis();  // M4c1: тривалість перемикання (скан USB має переривалось швидко)
   audio_->mute();  // тиша до зупинки попереднього джерела
-  const SrcId prevId = cur_;
   ISource* prev = src_[(int)cur_];
   if (prev) {
     LOGI(TAG, "deactivate %s", srcName(cur_));
@@ -87,20 +93,8 @@ Res SourceManager::select(SrcId id) {
     HeapPhase::mark(HeapPhase::Deact);
   }
   const uint32_t tDeact = millis() - t0;
-#if ENABLE_USB_CH376
-  // M4c1: розрив BT асинхронний — його памʼять звільняється лише ≈1,5 с після deactivate. Відкриття USB (драйвер, том, кеш скану) у цей час
-  // лишає heap на 2–6 КБ. Чекаємо звільнення (без змін у BT), не довше kUsbPreActivateWaitMs; команди тим часом стоять у черзі.
-  if (id == SrcId::USB && prevId == SrcId::BT) {
-    const uint32_t w0 = millis();
-    uint32_t fr = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_8BIT);
-    const uint32_t fr0 = fr;
-    while (fr < kUsbPreActivateFreeHeap && millis() - w0 < kUsbPreActivateWaitMs) {
-      delay(50);
-      fr = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_8BIT);
-    }
-    LOGI(TAG, "BT→USB: чекав звільнення памʼяті BT %u мс (free %u → %u Б)", (unsigned)(millis() - w0), (unsigned)fr0, (unsigned)fr);
-  }
-#endif
+  // M4c2: очікування звільнення памʼяті BT перед відкриттям USB (≥ kUsbPreActivateFreeHeap, до kUsbPreActivateWaitMs) переїхало у
+  // SdSource::openStep(): воно неблокуюче, STATE,usb,scan уже віддано, команди обробляються.
   cur_ = id;
   Res r = Res::Ok;
   ISource* nx = src_[(int)id];
@@ -122,6 +116,24 @@ Res SourceManager::select(SrcId id) {
   LOGI(TAG, "перемикання %s завершено за %u мс (deactivate %u мс)", srcName(id), (unsigned)(millis() - t0), (unsigned)tDeact);
   return r;
 }
+
+void SourceManager::publishNow() { publish(false); }
+
+#if ENABLE_USB_CH376
+// M4c2: фонова присутність флешки. BT активне і heap малий (BT з телефоном ≈17 КБ) — обмін з чіпом відкладається до виходу з BT.
+void SourceManager::presenceTick(uint32_t nowMs) {
+  // Heap потрібен лише для порога BT: поза BT не чіпаємо блокування купи щоітерації loop (аудіозадача алокує паралельно).
+  const bool bt = cur_ == SrcId::BT;
+  const uint32_t fr = bt ? (uint32_t)heap_caps_get_free_size(MALLOC_CAP_8BIT) : 0xFFFFFFFFu;
+  UsbPresence::tick(nowMs, bt, fr);
+  bool f = false;
+  if (UsbPresence::takeChange(f)) {  // MEDIA лише при зміні (як для SD)
+    DeviceState::setUsb(f);
+    Events::media(DeviceState::sd(), f);
+    LOGI(TAG, "MEDIA usb → %d (присутність флешки: %s)", f ? 1 : 0, usbPresName(UsbPresence::state()));
+  }
+}
+#endif
 
 void SourceManager::publish(bool force) {
   ISource* s = src_[(int)cur_];
@@ -216,7 +228,11 @@ void SourceManager::loop(uint32_t nowMs) {
   }
   ISource* s = src_[(int)cur_];
   if (s) s->loop(nowMs);
+#if ENABLE_USB_CH376
+  presenceTick(nowMs);
+#endif
   publish(false);  // STATE після TRACK/FOLDER/META/TIME, які породив loop()
 }
+
 
 

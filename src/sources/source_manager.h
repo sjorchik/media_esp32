@@ -15,6 +15,7 @@ class SourceManager {
   void resumeLast();                 // для AUTO_RESUME_SOURCE
   void onMediaChanged();
   void emitFullState();              // STATE, MEDIA, BT, [TRACK, FOLDER, META, TIME]
+  void publishNow();                 // M4c2: надіслати STATE зараз (джерело змінило стан у loop() і хоче STATE раніше за свій ERR)
 
   SrcId current() const { return cur_; }
   PlayState state() const;
@@ -28,6 +29,9 @@ class SourceManager {
  private:
   void publish(bool force);          // STATE при зміні + політика мʼюту DAC
   void emitErr(Res r, const char* detail);
+#if ENABLE_USB_CH376
+  void presenceTick(uint32_t nowMs);  // M4c2: фонова присутність USB-флешки і MEDIA usb при зміні
+#endif
   void saveLast(SrcId id);
   void persist();                    // set_v1: last_src + shuf + rep (лише якщо змінилось)
 
@@ -42,4 +46,5 @@ class SourceManager {
   uint8_t pubRep_ = 0;
   uint8_t lastSaved_ = 0;
 };
+
 

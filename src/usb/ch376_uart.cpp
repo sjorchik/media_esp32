@@ -16,7 +16,10 @@
 
 namespace {
 
-SemaphoreHandle_t s_sem = nullptr;  // сигнал від ISR на INT# (двійковий)
+SemaphoreHandle_t s_sem = nullptr;  // сигнал від ISR на INT# (двійковий); існує лише поки порт відкрито
+volatile uint32_t s_edges = 0;      // M4c2: спадні фронти INT# (ISR працює й при паркуванні, heap не коштує)
+bool s_isrOn = false;
+portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 uint32_t s_sleepAt = 0;             // коли востаннє віддавали процесор на 1 тік у спіні
 
 // Трасування: запис = байт | 0x100 («до чіпа», T) | 0x200 (відкинутий flushRx, F); без прапорців — прийнятий (R).
@@ -31,8 +34,10 @@ inline void trPush(uint16_t v) {
 
 // INT# CH376S: активний LOW, тримається до GET_STATUS. Фронт falling лише будить задачу; істина — рівень піна.
 void IRAM_ATTR intIsr() {
+  s_edges = s_edges + 1;
   BaseType_t w = pdFALSE;
-  if (s_sem) xSemaphoreGiveFromISR(s_sem, &w);
+  SemaphoreHandle_t sem = s_sem;
+  if (sem) xSemaphoreGiveFromISR(sem, &w);
   if (w == pdTRUE) portYIELD_FROM_ISR();
 }
 
@@ -202,22 +207,36 @@ void traceDump() {
   s_trN = s_trLost = 0;
 }
 
+void intWatch() {
+  if (CH_INT_PIN < 0 || s_isrOn) return;
+  pinMode(CH_INT_PIN, INPUT_PULLUP);
+  attachInterrupt(CH_INT_PIN, intIsr, FALLING);
+  s_isrOn = true;
+}
+
+void releaseSem() {
+  portENTER_CRITICAL(&s_mux);
+  SemaphoreHandle_t t = s_sem;
+  s_sem = nullptr;  // ISR більше не бачить семафор
+  portEXIT_CRITICAL(&s_mux);
+  if (t) vSemaphoreDelete(t);
+}
+
 bool begin() {
   if (s_started) return true;
+  const uint32_t baud = s_drv.baud();  // M4c2: швидкість чіпа (9600 після скиду; після park() — та, на якій він лишився)
   Serial2.setRxBufferSize(kCh376RxBuf);  // RX-буфер виділяється в heap тут
-  Serial2.begin(kCh376DefaultBaud, SERIAL_8N1, PIN_CH_RX, PIN_CH_TX);
+  Serial2.begin(baud, SERIAL_8N1, PIN_CH_RX, PIN_CH_TX);
   if (CH_INT_PIN >= 0) {
-    pinMode(CH_INT_PIN, INPUT_PULLUP);
-    s_sem = xSemaphoreCreateBinary();  // ≈ 100 Б heap; не вдалось — waitIntLow опитує пін
-    if (s_sem) attachInterrupt(CH_INT_PIN, intIsr, FALLING);
+    intWatch();
+    if (!s_sem) s_sem = xSemaphoreCreateBinary();  // ≈ 100 Б heap; не вдалось — waitIntLow опитує пін
   }
   if (CH_RST_PIN >= 0) {
     pinMode(CH_RST_PIN, OUTPUT);
     digitalWrite(CH_RST_PIN, kCh376RstActiveHigh ? LOW : HIGH);
   }
   s_sleepAt = micros();
-  s_drv.setBaudState(kCh376DefaultBaud);
-  s_link.setBaudValue(kCh376DefaultBaud);
+  s_link.setBaudValue(baud);
   s_fs.reset();
   s_rd.reset();
   s_started = true;
@@ -226,21 +245,24 @@ bool begin() {
 
 bool started() { return s_started; }
 
-void stop() {
+void park() {
   if (!s_started) return;
-  if (CH_INT_PIN >= 0) detachInterrupt(CH_INT_PIN);
-  if (s_sem) {
-    vSemaphoreDelete(s_sem);
-    s_sem = nullptr;
-  }
+  releaseSem();
   trace(false);
   Serial2.end();  // звільняє RX-буфер
   s_started = false;
-  s_drv.setBaudState(kCh376DefaultBaud);
-  s_link.setBaudValue(kCh376DefaultBaud);
   s_fs.reset();
   s_rd.reset();
 }
+
+void stop() {
+  if (!s_started) return;
+  park();
+  s_drv.setBaudState(kCh376DefaultBaud);  // чіп вважається скинутим на 9600
+  s_link.setBaudValue(kCh376DefaultBaud);
+}
+
+uint32_t intEdges() { return s_edges; }
 
 int intLevel() {
   if (!s_started || CH_INT_PIN < 0) return -1;
@@ -255,3 +277,4 @@ Ch376Link& link() { return s_link; }
 }  // namespace ch376_uart
 
 #endif  // ENABLE_USB_CH376
+

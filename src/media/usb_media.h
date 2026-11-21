@@ -17,6 +17,11 @@ class UsbMedia final : public IMedia {
   MediaEvent poll(uint32_t nowMs) override;
   bool mount() override;      // UsbVolume::open(): 2 Мбод із самоперевіркою, відкат 1 Мбод; false — причина в логу й lastFail()
   void unmount() override;    // закрити файл/том/драйвер (ідемпотентно)
+  // M4c2: відкриття по кроках (UsbVolume::openBegin/openStep/openAbort); mount() лишається блокуючим (DBG,usb,mount).
+  bool mountBegin() override;
+  MountPoll mountStep(uint32_t nowMs) override;
+  void mountAbort() override;
+  bool mounting() const override { return UsbVolume::get().opening(); }
   bool mounted() const override { return mounted_; }
   bool present() const override { return mounted_; }
   int openDir(const char* path) override;
@@ -45,4 +50,5 @@ class UsbMedia final : public IMedia {
 };
 
 #endif  // ENABLE_USB_CH376
+
 
